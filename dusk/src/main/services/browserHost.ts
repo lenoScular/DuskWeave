@@ -1,0 +1,2115 @@
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { assertAllowedCdpMethod } from '@shared/browser/cdpPolicy';
+import {
+  type BrowserAnnotationPinSpec,
+  type BrowserElementSnapshot,
+  type BrowserPickedElementRef,
+  DESIGN_CSS_TARGET_ATTRIBUTE,
+  type DesignCssSnapshot,
+  type DesignTopLeftRect,
+  type DesignXyRect,
+  designAnnotationPinsFor,
+  elementCropBounds,
+  parseBrowserElementSnapshot,
+} from '@shared/browser/designAnnotation';
+import { parseDesignBinding, sanitizeUiElementPayload } from '@shared/browser/designMode';
+import { assertDevtoolsIdle } from '@shared/browser/devtools';
+import { pickFaviconUrl } from '@shared/browser/favicon';
+import {
+  DESIGN_MODE_BINDING,
+  PAGE_COMPONENT_PROBE_SCRIPT,
+  PAGE_DESIGN_MODE_COMPOSE_SCRIPT,
+  PAGE_DESIGN_MODE_DISABLE_SCRIPT,
+  PAGE_DESIGN_MODE_HIDE_SCRIPT,
+  PAGE_LOCK_OVERLAY_SCRIPT,
+  PAGE_SETTLE_FRAMES_SCRIPT,
+  PAGE_SNAPSHOT_SCRIPT,
+  PAGE_UNLOCK_OVERLAY_SCRIPT,
+  pageBoundingBoxScript,
+  pageClickScript,
+  pageClickXyScript,
+  pageDesignModeShowFrozenScript,
+  pageDesignRuntimeCallScript,
+  pageDragPointsScript,
+  pageHighlightScript,
+  pageLockOverlayDisplayScript,
+  pagePressKeyScript,
+  pageScrollScript,
+  pageSelectOptionScript,
+  pageTypeScript,
+} from '@shared/browser/pageScripts';
+import {
+  type BrowserSnapshot,
+  isKnownRef,
+  parseSnapshotEntries,
+  renderSnapshot,
+} from '@shared/browser/snapshot';
+import {
+  dropPersistedTabsForSession,
+  type PersistedBrowserTab,
+  parsePersistedBrowserTabs,
+  serializePersistedBrowserTabs,
+} from '@shared/browser/tabPersist';
+import { assertAllowedUrl } from '@shared/browser/urlPolicy';
+import type { BrowserViewport } from '@shared/browser/viewport';
+import { mergeBrowserSearchTabs } from '@shared/searchAnything';
+import type { BrowserOp } from '@shared/types/agent';
+import type {
+  BrowserClearKind,
+  BrowserDesignModeEvent,
+  BrowserDesignMoveDirection,
+  BrowserOpenPinResult,
+  BrowserSelectionDescription,
+  BrowserTabState,
+} from '@shared/types/browser';
+import type { BrowserWindow, Session, WebContents } from 'electron';
+import { app, session, WebContentsView } from 'electron';
+import { getWorkbenchView, raiseWindowCover } from '../windows/createAppWindow';
+import { pinnedWorkbenchBounds } from '../windows/win32Restore';
+import { assertBrowserUrl, resolveLocalCwdForBrowser } from './browserFileRoot';
+import { isBrowserPartition, partitionName } from './browserPartition';
+import {
+  BROWSER_TAB_CLOSED_NOTICE,
+  BROWSER_TAKEOVER_NOTICE,
+  type BrowserActor,
+  BrowserTabClaims,
+  browserTabBusyMessage,
+} from './browserTabClaims';
+
+export { isBrowserPartition, partitionName };
+
+/**
+ * 内嵌浏览器宿主：guest 页只活在 Main。独立 persist session，与编辑器 defaultSession 切开。
+ * 第一刀无头：view 不挂窗口，导航 / 快照 / 点 / 填 / 截图全走 webContents。
+ * 不 import ipcMain；协议入口在 ipc/agent.ts。
+ */
+
+const NAVIGATE_TIMEOUT_MS = 30_000;
+const MAX_HEADLESS_TABS = 4;
+/** 会话不在看的 Browser 进程，闲置这么久就卸掉（URL 仍落盘） */
+const IDLE_MS = 5 * 60 * 1000;
+const IDLE_TICK_MS = 30_000;
+const SCREENSHOT_MAX_WIDTH = 1280;
+/**
+ * 无头 tab 的布局 viewport。contentView 的子视图全画在 renderer 之上，无头只能
+ * `setVisible(false)`；但隐藏后 view 尺寸归零，页面布局全是 0×0（快照抓不到块级
+ * 元素、截图为空），所以再用 CDP `Emulation.setDeviceMetricsOverride` 撑出尺寸。
+ */
+const HEADLESS_BOUNDS = { width: 1280, height: 800 };
+
+export type PageScreenshotClip = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  scale: number;
+};
+
+/** CDP `Page.captureScreenshot` 入参。冻帧必须拍当前合成视口，否则 fixed 顶栏会丢。 */
+export function pageScreenshotCdpParams(
+  clip?: PageScreenshotClip,
+  opts?: { captureBeyondViewport?: boolean }
+): {
+  format: 'png';
+  captureBeyondViewport: boolean;
+  fromSurface?: true;
+  clip?: PageScreenshotClip;
+} {
+  if (opts?.captureBeyondViewport === false) {
+    return clip
+      ? { format: 'png', captureBeyondViewport: false, fromSurface: true, clip }
+      : { format: 'png', captureBeyondViewport: false, fromSurface: true };
+  }
+  return { format: 'png', captureBeyondViewport: true, clip };
+}
+
+/** 隐藏 tab 仍要有 layout 尺寸，并假装 focused，避免后台 rAF / 动画被掐。 */
+export function hiddenTabCdpCommands(): Array<{ method: string; params: Record<string, unknown> }> {
+  return [
+    {
+      method: 'Emulation.setDeviceMetricsOverride',
+      params: {
+        width: HEADLESS_BOUNDS.width,
+        height: HEADLESS_BOUNDS.height,
+        deviceScaleFactor: 0,
+        mobile: false,
+      },
+    },
+    { method: 'Emulation.setFocusEmulationEnabled', params: { enabled: true } },
+  ];
+}
+
+export function shownTabCdpCommands(): Array<{ method: string; params: Record<string, unknown> }> {
+  return [
+    { method: 'Emulation.clearDeviceMetricsOverride', params: {} },
+    { method: 'Emulation.setFocusEmulationEnabled', params: { enabled: false } },
+  ];
+}
+
+export type BrowserMouseInputEvent = {
+  type: 'mouseDown' | 'mouseMove' | 'mouseUp';
+  x: number;
+  y: number;
+  button: 'left';
+  clickCount?: number;
+};
+
+/** HTML5 DnD 需要可信指针序列；合成 MouseEvent 页面不认。 */
+export function dragInputEvents(
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  steps = 10
+): BrowserMouseInputEvent[] {
+  const x0 = Math.round(from.x);
+  const y0 = Math.round(from.y);
+  const x1 = Math.round(to.x);
+  const y1 = Math.round(to.y);
+  const count = Math.max(8, steps);
+  const events: BrowserMouseInputEvent[] = [
+    { type: 'mouseDown', x: x0, y: y0, button: 'left', clickCount: 1 },
+  ];
+  const dist = Math.hypot(x1 - x0, y1 - y0) || 1;
+  events.push({
+    type: 'mouseMove',
+    x: Math.round(x0 + ((x1 - x0) / dist) * 8),
+    y: Math.round(y0 + ((y1 - y0) / dist) * 8),
+    button: 'left',
+  });
+  for (let i = 1; i <= count; i++) {
+    const t = i / count;
+    events.push({
+      type: 'mouseMove',
+      x: Math.round(x0 + (x1 - x0) * t),
+      y: Math.round(y0 + (y1 - y0) * t),
+      button: 'left',
+    });
+  }
+  events.push({ type: 'mouseUp', x: x1, y: y1, button: 'left', clickCount: 1 });
+  return events;
+}
+
+interface Tab {
+  id: string;
+  view: WebContentsView;
+  /** 官方 DevTools 前端；懒创建 */
+  devtools?: WebContentsView;
+  ownerSessionId: string;
+  createdAt: number;
+  lastSnapshot?: BrowserSnapshot;
+  locked: boolean;
+  /** webContents 首次 dom-ready 前 debugger.attach 会让 Main 段错误 */
+  ready: boolean;
+  devtoolsOpen: boolean;
+  designMode: boolean;
+  favicon: string | null;
+  /** 已在本 tab 的 debugger 上挂过标注消息监听（每个 tab 只挂一次，断开重连不重置） */
+  designBinding?: boolean;
+  annotationPins?: { pageKey: string; pins: BrowserAnnotationPinSpec[] };
+  pickSeq: number;
+  /** 正在发合成输入（drag / CDP Input.*），input-event 不算用户接管 */
+  synthetic: number;
+  /** 上一个占用该 tab 的成员会话；换人后旧快照的 ref 作废 */
+  lastHolder?: string;
+  /** CDP 截图改过页面视图尺寸，下次显示时要按容器重新对齐 */
+  refit?: boolean;
+}
+
+const EMPTY_STATE: BrowserTabState = {
+  tabId: null,
+  url: '',
+  title: '',
+  favicon: null,
+  loading: false,
+  canGoBack: false,
+  canGoForward: false,
+  locked: false,
+  devtoolsOpen: false,
+  designMode: false,
+  holder: null,
+};
+
+interface PageInfo {
+  url: string;
+  title: string;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+
+const paramString = (params: unknown, key: string): string => {
+  const value = isRecord(params) ? params[key] : undefined;
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${key} is required`);
+  return value;
+};
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** 会改页面或改 ref 标记的动作：成员第一次做就占用该标签 */
+const CLAIMING_OPS = new Set<BrowserOp>([
+  'navigate',
+  'snapshot',
+  'click',
+  'type',
+  'fill',
+  'press_key',
+  'scroll',
+  'select_option',
+  'click_xy',
+  'drag',
+  'cdp',
+  'close',
+  'lock',
+]);
+
+const USER_INPUT = new Set(['mouseDown', 'rawKeyDown', 'keyDown']);
+
+export class BrowserHost {
+  private readonly tabs = new Map<string, Tab>();
+  private readonly currentBySession = new Map<string, string>();
+  private readonly tabClaims = new BrowserTabClaims({
+    onChange: (tabId) => {
+      const tab = this.tabs.get(tabId);
+      if (tab) this.emitState(tab.ownerSessionId, tabId);
+    },
+  });
+  private counter = 0;
+  private guestSession?: Session;
+  private hostWindow: () => BrowserWindow | null = () => null;
+
+  /** 渲染层当前展示的 dock tab 与面板矩形 */
+  /** covered：renderer 有浮层压在网页上，guest 要沉到 workbench 之下透洞显示 */
+  /** 模态浮层开着：不等 rAF 上报矩形，直接不抬升任何 guest */
+  private overlayActive = false;
+  private shown: {
+    tabId: string;
+    sessionId: string;
+    viewport: BrowserViewport;
+    covered: boolean;
+  } | null = null;
+  private shownDevtools: {
+    tabId: string;
+    sessionId: string;
+    viewport: BrowserViewport;
+    covered: boolean;
+  } | null = null;
+  private readonly stateListeners = new Set<
+    (sessionId: string, tabId: string, state: BrowserTabState) => void
+  >();
+  private readonly revealListeners = new Set<(sessionId: string, tabId: string) => void>();
+  private readonly closeListeners = new Set<(sessionId: string, tabId: string) => void>();
+  private readonly designListeners = new Set<(event: BrowserDesignModeEvent) => void>();
+  /** renderer 还没报矩形前先不关 tab，避免回合结束跑赢面板挂载 */
+  private readonly pendingReveal = new Set<string>();
+  /** 用户见过的 tab：切走 Terminal / 重启后仍恢复 */
+  private readonly userTabs = new Set<string>();
+  private persisted: Record<string, PersistedBrowserTab> = {};
+  private persistedLoaded = false;
+  private disposing = false;
+  private readonly lastSeen = new Map<string, number>();
+  private idleTimer: ReturnType<typeof setInterval> | undefined;
+
+  /** guest view 需要挂在某扇窗口上才有 viewport；由 main/index.ts 注入主窗口获取器。 */
+  setHostWindow(provider: () => BrowserWindow | null): void {
+    this.hostWindow = provider;
+  }
+
+  onState(
+    listener: (sessionId: string, tabId: string, state: BrowserTabState) => void
+  ): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+
+  onReveal(listener: (sessionId: string, tabId: string) => void): () => void {
+    this.revealListeners.add(listener);
+    return () => this.revealListeners.delete(listener);
+  }
+
+  onTabClosed(listener: (sessionId: string, tabId: string) => void): () => void {
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
+  }
+
+  onDesignMode(listener: (event: BrowserDesignModeEvent) => void): () => void {
+    this.designListeners.add(listener);
+    return () => this.designListeners.delete(listener);
+  }
+
+  private requestReveal(sessionId: string, tabId?: string): void {
+    const tab =
+      (tabId ? this.tabs.get(tabId) : this.tabFor(sessionId)) ?? this.createTab(sessionId);
+    this.pendingReveal.add(sessionId);
+    this.userTabs.add(tab.id);
+    for (const listener of this.revealListeners) listener(sessionId, tab.id);
+  }
+
+  state(tabId: string): BrowserTabState {
+    const tab = this.tabs.get(tabId) ?? this.tabFor(tabId);
+    if (!tab) return EMPTY_STATE;
+    return this.stateOf(tab);
+  }
+
+  private stateOf(tab: Tab): BrowserTabState {
+    const contents = tab.view.webContents;
+    const holder = this.tabClaims.holder(tab.id);
+    return {
+      tabId: tab.id,
+      url: contents.getURL(),
+      title: contents.getTitle(),
+      favicon: tab.favicon,
+      loading: contents.isLoading(),
+      canGoBack: contents.navigationHistory.canGoBack(),
+      canGoForward: contents.navigationHistory.canGoForward(),
+      locked: tab.locked,
+      devtoolsOpen: tab.devtoolsOpen,
+      designMode: tab.designMode,
+      holder: holder ? { conversationId: holder.sessionId, name: holder.name } : null,
+    };
+  }
+
+  private emitState(sessionId: string, tabId?: string): void {
+    const tab = (tabId ? this.tabs.get(tabId) : undefined) ?? this.tabFor(sessionId);
+    const state = tab ? this.stateOf(tab) : EMPTY_STATE;
+    if (tab && this.userTabs.has(tab.id) && state.url.startsWith('http')) {
+      this.rememberTab(tab.id, {
+        url: state.url,
+        title: state.title,
+        conversationId: tab.ownerSessionId,
+        at: Date.now(),
+      });
+    }
+    if (tab && state.url.startsWith('file:')) this.forgetTab(tab.id);
+    for (const listener of this.stateListeners) listener(sessionId, tab?.id ?? '', state);
+  }
+
+  /** 渲染层：某个 dock tab 可见时报矩形；null = 该 tab 隐藏 */
+  setViewport(
+    tabId: string,
+    sessionId: string,
+    viewport: BrowserViewport | null,
+    covered = false
+  ): BrowserTabState {
+    if (viewport) {
+      if (!this.tabs.has(tabId)) void this.restoreTab(tabId, sessionId);
+      this.currentBySession.set(sessionId, tabId);
+      this.userTabs.add(tabId);
+      this.pendingReveal.delete(sessionId);
+      this.shown = { tabId, sessionId, viewport, covered };
+      this.touch(tabId);
+    } else if (this.shown?.tabId === tabId) {
+      this.shown = null;
+    }
+    this.layout();
+    return this.state(tabId);
+  }
+
+  /** 渲染层有模态浮层（Dialog / 全屏预览等）时，所有 guest 立刻沉到 workbench 之下 */
+  setOverlayActive(active: boolean): void {
+    if (this.overlayActive === active) return;
+    this.overlayActive = active;
+    this.layout();
+  }
+
+  /**
+   * 上报方（renderer）崩溃 / 重载 / 不再上报：覆盖状态是「最后一次上报」而不是持久事实，
+   * 沉下去的闩锁会把 guest 永久变成不可交互。没有活着的上报方就回落到「没被盖住」。
+   */
+  resetOverlayReports(): void {
+    this.overlayActive = false;
+    if (this.shown?.covered) this.shown = { ...this.shown, covered: false };
+    if (this.shownDevtools?.covered) {
+      this.shownDevtools = { ...this.shownDevtools, covered: false };
+    }
+    this.layout();
+  }
+
+  setDevTools(tabId: string, open: boolean): BrowserTabState {
+    const tab = this.tabs.get(tabId);
+    if (!tab) return EMPTY_STATE;
+    if (open && tab.designMode) void this.setDesignMode(tabId, false);
+    tab.devtoolsOpen = open;
+    if (open) {
+      this.detachDebugger(tab);
+      this.ensureDevTools(tab);
+    } else {
+      this.teardownDevTools(tab);
+      this.shownDevtools = null;
+    }
+    this.layout();
+    this.emitState(tab.ownerSessionId, tab.id);
+    return this.stateOf(tab);
+  }
+
+  setDevToolsViewport(
+    tabId: string,
+    sessionId: string,
+    viewport: BrowserViewport | null,
+    covered = false
+  ): BrowserTabState {
+    const tab = this.tabs.get(tabId);
+    if (viewport && tab?.devtoolsOpen) {
+      this.shownDevtools = { tabId, sessionId, viewport, covered };
+    } else if (this.shownDevtools?.tabId === tabId) {
+      this.shownDevtools = null;
+    }
+    this.layout();
+    return this.state(tabId);
+  }
+
+  private ensureWorkbenchOnTop(window: BrowserWindow): void {
+    const workbench = getWorkbenchView(window);
+    if (!workbench) return;
+    const bounds = pinnedWorkbenchBounds(window);
+    if (bounds) workbench.setBounds(bounds);
+    window.contentView.addChildView(workbench);
+  }
+
+  /**
+   * 层级：workbench（renderer）是一整块 NSView，透明像素照样吃掉 hit-test，
+   * 所以 guest 平时必须叠在 workbench 之上才能被用户点；只有 renderer 浮层
+   * 压到网页区域时才沉到 index 0，让菜单 / Dialog 透洞盖在网页上。
+   */
+  private layout(): void {
+    const window = this.hostWindow();
+    if (!window || window.isDestroyed()) return;
+    const { contentView } = window;
+    const raise: WebContentsView[] = [];
+    for (const tab of this.tabs.values()) {
+      const onTop = Boolean(this.shown && tab.id === this.shown.tabId);
+      if (!contentView.children.includes(tab.view)) contentView.addChildView(tab.view, 0);
+      if (tab.devtools && !contentView.children.includes(tab.devtools)) {
+        contentView.addChildView(tab.devtools, 0);
+      }
+      if (onTop && this.shown) {
+        if (tab.refit) {
+          tab.refit = false;
+          tab.view.setBounds({ ...this.shown.viewport, height: this.shown.viewport.height + 1 });
+        }
+        tab.view.setBounds(this.shown.viewport);
+        tab.view.setBorderRadius(this.shown.viewport.radius ?? 0);
+        tab.view.setVisible(true);
+        if (!this.shown.covered && !this.overlayActive) raise.push(tab.view);
+        if (!tab.devtoolsOpen) {
+          for (const cmd of shownTabCdpCommands()) void this.cdp(tab, cmd.method, cmd.params);
+        }
+      } else {
+        tab.view.setVisible(false);
+        if (!tab.devtoolsOpen) {
+          for (const cmd of hiddenTabCdpCommands()) void this.cdp(tab, cmd.method, cmd.params);
+        }
+      }
+      const dtOnTop = Boolean(
+        tab.devtools && tab.devtoolsOpen && this.shownDevtools?.tabId === tab.id
+      );
+      if (tab.devtools) {
+        if (dtOnTop && this.shownDevtools) {
+          tab.devtools.setBounds(this.shownDevtools.viewport);
+          tab.devtools.setBorderRadius(this.shownDevtools.viewport.radius ?? 0);
+          tab.devtools.setVisible(true);
+          if (!this.shownDevtools.covered && !this.overlayActive) raise.push(tab.devtools);
+        } else {
+          tab.devtools.setVisible(false);
+        }
+      }
+    }
+    this.ensureWorkbenchOnTop(window);
+    for (const view of raise) contentView.addChildView(view);
+    raiseWindowCover(window);
+  }
+
+  /** host 内白名单 CDP；模型永远摸不到 */
+  private detachDebugger(tab: Tab): void {
+    const contents = tab.view.webContents;
+    if (contents.isDestroyed()) return;
+    const dbg = contents.debugger;
+    if (dbg.isAttached()) {
+      try {
+        dbg.detach();
+      } catch {}
+    }
+  }
+
+  private ensureDevTools(tab: Tab): void {
+    const contents = tab.view.webContents;
+    if (contents.isDestroyed()) return;
+    if (!tab.devtools) {
+      tab.devtools = new WebContentsView({
+        webPreferences: {
+          sandbox: true,
+          contextIsolation: true,
+          nodeIntegration: false,
+        },
+      });
+      tab.devtools.setBackgroundColor('#202124');
+    }
+    const dt = tab.devtools.webContents;
+    if (dt.isDestroyed()) return;
+    try {
+      contents.setDevToolsWebContents(dt);
+    } catch {}
+    // detach：不在 guest 自己身上再拆一条 dock，前端只画在我们给的 view 里
+    contents.openDevTools({ mode: 'detach', activate: false });
+  }
+
+  private teardownDevTools(tab: Tab): void {
+    const contents = tab.view.webContents;
+    if (!contents.isDestroyed() && contents.isDevToolsOpened()) contents.closeDevTools();
+    if (tab.devtools) {
+      this.detach(tab.devtools);
+      tab.devtools.setVisible(false);
+    }
+  }
+
+  private async cdp(tab: Tab, method: string, params: Record<string, unknown>): Promise<unknown> {
+    if (tab.devtoolsOpen) return undefined;
+    const contents = tab.view.webContents;
+    if (!tab.ready || contents.isDestroyed()) return undefined;
+    const dbg = contents.debugger;
+    if (!dbg.isAttached()) {
+      // 与 sendCommand 失败同样按「无结果」处理：layout() 等处是 void 调用，抛出会成为未处理的 rejection
+      try {
+        dbg.attach('1.3');
+      } catch (error) {
+        console.warn(
+          `[browser] ${method} failed: debugger attach: ${error instanceof Error ? error.message : error}`
+        );
+        return undefined;
+      }
+    }
+    return dbg.sendCommand(method, params).catch((error: unknown) => {
+      console.warn(`[browser] ${method} failed: ${error instanceof Error ? error.message : error}`);
+      return undefined;
+    });
+  }
+
+  private fileRootFor(sessionId: string): string | undefined {
+    return resolveLocalCwdForBrowser(sessionId) ?? undefined;
+  }
+
+  private allowUrl(raw: string, sessionId: string): URL {
+    return assertBrowserUrl(raw, this.fileRootFor(sessionId));
+  }
+
+  /** 面板地址栏 / 按钮 */
+  async userNavigate(tabId: string, sessionId: string, raw: string): Promise<void> {
+    const existing = this.tabs.get(tabId);
+    if (existing && existing.ownerSessionId !== sessionId)
+      throw new Error('Browser tab owner mismatch.');
+    if (!existing) this.createTab(sessionId, tabId);
+    this.tabClaims.userTookOver(tabId);
+    this.currentBySession.set(sessionId, tabId);
+    this.userTabs.add(tabId);
+    const url = this.allowUrl(raw, sessionId);
+    const tab = this.tabs.get(tabId);
+    if (!tab) return;
+    tab.lastSnapshot = undefined;
+    await Promise.race([
+      tab.view.webContents.loadURL(url.href),
+      sleep(NAVIGATE_TIMEOUT_MS).then(() => {
+        throw new Error(`Navigation to ${url.href} timed out`);
+      }),
+    ]);
+  }
+
+  goBack(tabId: string): void {
+    const tab = this.tabs.get(tabId);
+    if (tab?.view.webContents.navigationHistory.canGoBack()) {
+      const history = tab.view.webContents.navigationHistory;
+      const entry = history.getEntryAtIndex(history.getActiveIndex() - 1);
+      if (!entry || !this.canNavigate(tab, entry.url)) return;
+      this.tabClaims.userTookOver(tabId);
+      history.goBack();
+    }
+  }
+
+  goForward(tabId: string): void {
+    const tab = this.tabs.get(tabId);
+    if (tab?.view.webContents.navigationHistory.canGoForward()) {
+      const history = tab.view.webContents.navigationHistory;
+      const entry = history.getEntryAtIndex(history.getActiveIndex() + 1);
+      if (!entry || !this.canNavigate(tab, entry.url)) return;
+      this.tabClaims.userTookOver(tabId);
+      history.goForward();
+    }
+  }
+
+  private canNavigate(tab: Tab, raw: string): boolean {
+    try {
+      this.allowUrl(raw, tab.ownerSessionId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  reload(tabId: string): void {
+    const tab = this.tabs.get(tabId);
+    if (!tab || !this.canNavigate(tab, tab.view.webContents.getURL())) return;
+    this.tabClaims.userTookOver(tabId);
+    tab.view.webContents.reload();
+  }
+
+  async closeTab(tabId: string): Promise<void> {
+    const tab = this.tabs.get(tabId);
+    if (!tab) return;
+    this.userTabs.delete(tabId);
+    this.forgetTab(tabId);
+    await this.destroyTab(tab);
+    for (const listener of this.closeListeners) listener(tab.ownerSessionId, tabId);
+  }
+
+  async closeSession(sessionId: string): Promise<void> {
+    const live = [...this.tabs.values()].filter((tab) => tab.ownerSessionId === sessionId);
+    for (const tab of live) await this.closeTab(tab.id);
+    this.loadPersisted();
+    const next = dropPersistedTabsForSession(this.persisted, sessionId);
+    if (Object.keys(next).length !== Object.keys(this.persisted).length) {
+      this.persisted = next;
+      this.writePersisted();
+    }
+    this.currentBySession.delete(sessionId);
+  }
+
+  /**
+   * 加锁只作用于当前 tab；释放要覆盖会话下全部 tab，否则切过 tab 会留下永远锁死的孤儿。
+   * 不带 target 的释放来自面板「接管」；成员自己加 / 解锁只动它在用的 tab。
+   */
+  async setLocked(sessionId: string, locked: boolean, target?: Tab): Promise<void> {
+    const current = target ?? this.mustTab(sessionId);
+    if (locked) {
+      if (current.designMode) await this.setDesignMode(current.id, false);
+      current.locked = true;
+      await this.syncLockOverlay(current);
+      this.emitState(sessionId, current.id);
+      return;
+    }
+    for (const tab of target ? [target] : this.tabs.values()) {
+      if (tab.ownerSessionId !== sessionId) continue;
+      if (!target && tab.locked) this.tabClaims.userTookOver(tab.id);
+      // 遮罩没真删掉就不谎报 unlocked，用户可以再按一次
+      if (await this.removeLockOverlay(tab)) tab.locked = false;
+      this.emitState(tab.ownerSessionId, tab.id);
+    }
+  }
+
+  async setDesignMode(tabId: string, enabled: boolean): Promise<BrowserTabState> {
+    const tab = this.tabs.get(tabId);
+    if (!tab) return EMPTY_STATE;
+    if (enabled && (tab.locked || tab.devtoolsOpen)) return this.stateOf(tab);
+    if (!enabled) {
+      tab.designMode = false;
+      tab.pickSeq += 1;
+      tab.annotationPins = undefined;
+      await this.callDesignRuntime(tab, 'designStop');
+      await this.runGuest(tab, PAGE_DESIGN_MODE_DISABLE_SCRIPT);
+      this.emitState(tab.ownerSessionId, tab.id);
+      return this.stateOf(tab);
+    }
+    await this.ensureDesignBinding(tab);
+    tab.designMode = true;
+    await this.syncDesignRuntimeOnPage(tab);
+    this.emitState(tab.ownerSessionId, tab.id);
+    return this.stateOf(tab);
+  }
+
+  private async syncDesignRuntimeOnPage(tab: Tab): Promise<void> {
+    if (!tab.designMode) return;
+    await this.ensureDesignBinding(tab);
+    await this.runGuest(tab, PAGE_COMPONENT_PROBE_SCRIPT);
+    await this.callDesignRuntime(tab, 'designStart');
+    if (tab.annotationPins) {
+      const url = tab.view.webContents.getURL();
+      const matching = designAnnotationPinsFor(url, tab.annotationPins);
+      await this.callDesignRuntime(tab, 'designPins', [matching]);
+    }
+  }
+
+  private async callDesignRuntime(
+    tab: Tab,
+    method: string,
+    args: readonly unknown[] = []
+  ): Promise<unknown> {
+    return this.runGuest(tab, pageDesignRuntimeCallScript(method, args));
+  }
+
+  private emitDesign(event: BrowserDesignModeEvent): void {
+    for (const listener of this.designListeners) listener(event);
+  }
+
+  private async runGuest(tab: Tab, script: string): Promise<unknown> {
+    const contents = tab.view.webContents;
+    if (contents.isDestroyed() || !tab.ready) return undefined;
+    return contents.executeJavaScript(script, true).catch(() => undefined);
+  }
+
+  private async ensureDesignBinding(tab: Tab): Promise<void> {
+    const contents = tab.view.webContents;
+    if (contents.isDestroyed() || !tab.ready) return;
+    const dbg = contents.debugger;
+    if (!dbg.isAttached()) {
+      try {
+        dbg.attach('1.3');
+      } catch {
+        return;
+      }
+    }
+    // debugger 对象随 webContents 终身不变，断开重连后监听仍在；断开时重挂会让同一条消息被处理多次。
+    // 重连后丢失的是页面侧 binding，由下面每次都执行的 addBinding 补上。
+    if (!tab.designBinding) {
+      dbg.on('message', (_event, method, params) => {
+        if (method !== 'Runtime.bindingCalled') return;
+        const name = isRecord(params) ? params.name : undefined;
+        const payload = isRecord(params) ? params.payload : undefined;
+        if (name !== DESIGN_MODE_BINDING || typeof payload !== 'string') return;
+        void this.onDesignBinding(tab, payload);
+      });
+      tab.designBinding = true;
+    }
+    await this.cdp(tab, 'Runtime.enable', {});
+    await this.cdp(tab, 'Runtime.addBinding', { name: DESIGN_MODE_BINDING });
+  }
+
+  private async onDesignBinding(tab: Tab, raw: string): Promise<void> {
+    if (!tab.designMode) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const msg = parseDesignBinding(parsed);
+    if (!msg) return;
+    if (msg.type === 'cancelled') {
+      await this.setDesignMode(tab.id, false);
+      this.emitDesign({ type: 'cancelled', conversationId: tab.ownerSessionId, tabId: tab.id });
+      return;
+    }
+    if (msg.type === 'drawing') {
+      this.emitDesign({
+        type: 'drawing',
+        conversationId: tab.ownerSessionId,
+        tabId: tab.id,
+        drawing: msg.drawing,
+      });
+      return;
+    }
+    if (msg.type === 'pins') {
+      this.emitDesign({
+        type: 'pins',
+        conversationId: tab.ownerSessionId,
+        tabId: tab.id,
+        ids: msg.ids,
+      });
+      return;
+    }
+    if (msg.type === 'pin-click') {
+      const pin = await this.openAnnotationPin(tab.id, msg.id, false);
+      this.emitDesign({
+        type: 'pin-click',
+        conversationId: tab.ownerSessionId,
+        tabId: tab.id,
+        id: msg.id,
+        pin,
+      });
+      return;
+    }
+    if (msg.type === 'select') {
+      const seq = ++tab.pickSeq;
+      const description = await this.describeSelection(tab.id, msg.region ?? undefined);
+      if (seq !== tab.pickSeq) return;
+      this.emitDesign({
+        type: 'select',
+        conversationId: tab.ownerSessionId,
+        tabId: tab.id,
+        elements: msg.elements,
+        region: msg.region,
+        addToChat: msg.addToChat,
+        viewportWidth: msg.viewportWidth,
+        description,
+      });
+      return;
+    }
+    if (msg.type === 'freeze-request') {
+      await this.runGuest(tab, PAGE_DESIGN_MODE_HIDE_SCRIPT);
+      try {
+        const shot = await this.screenshotClip(tab, undefined, { captureBeyondViewport: false });
+        await this.runGuest(tab, pageDesignModeShowFrozenScript(shot.data));
+      } catch {
+        await this.runGuest(tab, pageDesignModeShowFrozenScript(''));
+      }
+      return;
+    }
+    if (msg.type === 'annotated') {
+      const seq = ++tab.pickSeq;
+      const composed = await this.runGuest(tab, PAGE_DESIGN_MODE_COMPOSE_SCRIPT);
+      if (seq !== tab.pickSeq) return;
+      const data = typeof composed === 'string' ? composed : '';
+      if (!data) return;
+      await this.setDesignMode(tab.id, false);
+      this.emitDesign({
+        type: 'annotated',
+        conversationId: tab.ownerSessionId,
+        tabId: tab.id,
+        payload: { label: 'annotation', path: 'scribble', text: '' },
+        image: { data, mimeType: 'image/png' },
+      });
+      return;
+    }
+    if (msg.type !== 'picked') return;
+    const payload = sanitizeUiElementPayload(msg.payload);
+    if (!payload) return;
+    const seq = ++tab.pickSeq;
+    await this.runGuest(tab, PAGE_DESIGN_MODE_HIDE_SCRIPT);
+    let image: { data: string; mimeType: string } | undefined;
+    try {
+      image = await this.screenshotRect(tab, payload.rect);
+    } catch {}
+    if (seq !== tab.pickSeq) return;
+    await this.setDesignMode(tab.id, false);
+    this.emitDesign({
+      type: 'picked',
+      conversationId: tab.ownerSessionId,
+      tabId: tab.id,
+      payload,
+      ...(image ? { image } : {}),
+    });
+  }
+
+  async describeSelection(
+    tabId: string,
+    crop?: DesignXyRect
+  ): Promise<BrowserSelectionDescription> {
+    const tab = this.tabs.get(tabId);
+    if (!tab) return { elements: [], image: null };
+    await this.runGuest(tab, PAGE_COMPONENT_PROBE_SCRIPT);
+    let elements: BrowserElementSnapshot[] = [];
+    let regionAnchor: BrowserElementSnapshot | undefined;
+    const rawViewport = await this.callDesignRuntime(tab, 'viewport');
+    const viewport =
+      isRecord(rawViewport) &&
+      typeof rawViewport.width === 'number' &&
+      typeof rawViewport.height === 'number' &&
+      rawViewport.width > 0 &&
+      rawViewport.height > 0
+        ? { width: rawViewport.width, height: rawViewport.height }
+        : { width: HEADLESS_BOUNDS.width, height: HEADLESS_BOUNDS.height };
+
+    if (crop === undefined) {
+      const rawElements = await this.callDesignRuntime(tab, 'designDescribe');
+      if (Array.isArray(rawElements)) {
+        elements = rawElements
+          .map(parseBrowserElementSnapshot)
+          .filter((item): item is BrowserElementSnapshot => item !== null);
+      }
+    } else {
+      const rawAnchor = await this.callDesignRuntime(tab, 'designRegionAnchor', [
+        {
+          x: crop.x + crop.width / 2,
+          y: crop.y + crop.height / 2,
+        },
+      ]);
+      regionAnchor = parseBrowserElementSnapshot(rawAnchor) ?? undefined;
+    }
+
+    await this.callDesignRuntime(tab, 'captureChrome', [false]);
+    let frame: { data: string; mimeType: string } | undefined;
+    let croppedImage: BrowserSelectionDescription['image'] = null;
+    try {
+      frame = await this.screenshotClip(tab, undefined, { captureBeyondViewport: false });
+      const targetCrop =
+        crop !== undefined
+          ? crop
+          : elements.length > 0
+            ? elementCropBounds(elements, 1, viewport)
+            : null;
+      if (targetCrop && targetCrop.width >= 1 && targetCrop.height >= 1) {
+        const shot = await this.screenshotClip(
+          tab,
+          {
+            x: Math.max(0, Math.round(targetCrop.x)),
+            y: Math.max(0, Math.round(targetCrop.y)),
+            width: Math.max(1, Math.round(targetCrop.width)),
+            height: Math.max(1, Math.round(targetCrop.height)),
+            scale: 1,
+          },
+          { captureBeyondViewport: false }
+        );
+        croppedImage = {
+          data: shot.data,
+          mimeType: shot.mimeType,
+          name: elements.length > 0 ? 'design-element.png' : 'design-annotation.png',
+          width: Math.max(1, Math.round(targetCrop.width)),
+          height: Math.max(1, Math.round(targetCrop.height)),
+        };
+      }
+    } catch {
+      // 忽略截图竞态
+    } finally {
+      await this.callDesignRuntime(tab, 'captureChrome', [true]);
+    }
+
+    return {
+      elements,
+      ...(regionAnchor ? { regionAnchor } : {}),
+      image: croppedImage,
+      ...(frame ? { frame } : {}),
+    };
+  }
+
+  async moveSelection(
+    tabId: string,
+    direction: BrowserDesignMoveDirection
+  ): Promise<{
+    elements: BrowserPickedElementRef[];
+    description: BrowserSelectionDescription;
+  }> {
+    const tab = this.tabs.get(tabId);
+    if (!tab?.designMode) {
+      return { elements: [], description: { elements: [], image: null } };
+    }
+    const raw = await this.callDesignRuntime(tab, 'designMove', [direction]);
+    const elements: BrowserPickedElementRef[] = Array.isArray(raw)
+      ? raw.filter(
+          (item): item is BrowserPickedElementRef =>
+            isRecord(item) &&
+            typeof item.tag === 'string' &&
+            typeof item.component === 'string' &&
+            typeof item.uid === 'string' &&
+            typeof item.hueIndex === 'number' &&
+            isRecord(item.rect)
+        )
+      : [];
+    const description = await this.describeSelection(tabId);
+    return { elements, description };
+  }
+
+  async clearSelection(tabId: string): Promise<boolean> {
+    const tab = this.tabs.get(tabId);
+    if (!tab) return false;
+    tab.pickSeq += 1;
+    await this.callDesignRuntime(tab, 'designPinOpen', [null, false]);
+    const cleared = await this.callDesignRuntime(tab, 'designClear');
+    return cleared === true;
+  }
+
+  async setAnnotationPins(
+    tabId: string,
+    pageKey: string,
+    pins: BrowserAnnotationPinSpec[]
+  ): Promise<boolean> {
+    const tab = this.tabs.get(tabId);
+    if (!tab) return false;
+    tab.annotationPins = { pageKey, pins };
+    if (!tab.designMode) return false;
+    const matching = designAnnotationPinsFor(tab.view.webContents.getURL(), tab.annotationPins);
+    const res = await this.callDesignRuntime(tab, 'designPins', [matching]);
+    return res === true;
+  }
+
+  async openAnnotationPin(
+    tabId: string,
+    pinId: string | null,
+    reveal = false
+  ): Promise<BrowserOpenPinResult | null> {
+    const tab = this.tabs.get(tabId);
+    if (!tab?.designMode) return null;
+    const raw = await this.callDesignRuntime(tab, 'designPinOpen', [pinId, reveal]);
+    if (
+      !isRecord(raw) ||
+      typeof raw.top !== 'number' ||
+      typeof raw.left !== 'number' ||
+      typeof raw.detached !== 'boolean' ||
+      typeof raw.rulerInset !== 'number' ||
+      typeof raw.viewportWidth !== 'number'
+    ) {
+      return null;
+    }
+    return {
+      top: raw.top,
+      left: raw.left,
+      detached: raw.detached,
+      rulerInset: raw.rulerInset,
+      viewportWidth: raw.viewportWidth,
+    };
+  }
+
+  async readDesignCss(tabId: string, uid: string): Promise<DesignCssSnapshot | null> {
+    const tab = this.tabs.get(tabId);
+    if (!tab?.designMode) return null;
+    const token = `css-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const marked = await this.callDesignRuntime(tab, 'markCss', [uid, token]);
+      if (marked !== true) return null;
+      const matched = await this.readMatchedCssStylesForSelector(
+        tab,
+        `[${DESIGN_CSS_TARGET_ATTRIBUTE}="${token}"]`
+      ).catch(() => null);
+      const raw = await this.callDesignRuntime(tab, 'readCss', [
+        uid,
+        matched ?? { blocks: [], variableNames: [] },
+      ]);
+      if (
+        !isRecord(raw) ||
+        typeof raw.rendersText !== 'boolean' ||
+        !isRecord(raw.values) ||
+        !Array.isArray(raw.authored) ||
+        !isRecord(raw.variables) ||
+        !isRecord(raw.rect)
+      ) {
+        return null;
+      }
+      return raw as unknown as DesignCssSnapshot;
+    } finally {
+      await this.callDesignRuntime(tab, 'unmarkCss', [token]).catch(() => undefined);
+    }
+  }
+
+  private async readMatchedCssStylesForSelector(
+    tab: Tab,
+    selector: string
+  ): Promise<{
+    blocks: {
+      userAgent: boolean;
+      declarations: { name: string; value: string; important: boolean }[];
+    }[];
+    variableNames: string[];
+  } | null> {
+    await this.cdp(tab, 'DOM.enable', {});
+    await this.cdp(tab, 'CSS.enable', {});
+    try {
+      const doc = (await this.cdp(tab, 'DOM.getDocument', { depth: 0 })) as {
+        root?: { nodeId?: number };
+      };
+      const rootNodeId = doc?.root?.nodeId;
+      if (typeof rootNodeId !== 'number') return null;
+      const q = (await this.cdp(tab, 'DOM.querySelector', {
+        nodeId: rootNodeId,
+        selector,
+      })) as { nodeId?: number };
+      if (typeof q?.nodeId !== 'number' || !q.nodeId) return null;
+      const styles = (await this.cdp(tab, 'CSS.getMatchedStylesForNode', {
+        nodeId: q.nodeId,
+      })) as {
+        matchedCSSRules?: {
+          rule: {
+            origin?: string;
+            startingStyles?: unknown[];
+            style?: {
+              cssProperties?: {
+                name: string;
+                value: string;
+                disabled?: boolean;
+                parsedOk?: boolean;
+                important?: boolean;
+              }[];
+            };
+          };
+        }[];
+        attributesStyle?: {
+          cssProperties?: {
+            name: string;
+            value: string;
+            disabled?: boolean;
+            parsedOk?: boolean;
+            important?: boolean;
+          }[];
+        };
+        inlineStyle?: {
+          cssProperties?: {
+            name: string;
+            value: string;
+            disabled?: boolean;
+            parsedOk?: boolean;
+            important?: boolean;
+          }[];
+        };
+        inherited?: {
+          matchedCSSRules?: {
+            rule: {
+              startingStyles?: unknown[];
+              style?: {
+                cssProperties?: {
+                  name: string;
+                  value: string;
+                  disabled?: boolean;
+                  parsedOk?: boolean;
+                }[];
+              };
+            };
+          }[];
+          inlineStyle?: {
+            cssProperties?: {
+              name: string;
+              value: string;
+              disabled?: boolean;
+              parsedOk?: boolean;
+            }[];
+          };
+        }[];
+      };
+      type CssStyleEntry = {
+        cssProperties?: {
+          name: string;
+          value: string;
+          disabled?: boolean;
+          parsedOk?: boolean;
+          important?: boolean;
+        }[];
+      };
+      const applying = (style?: CssStyleEntry) =>
+        style?.cssProperties?.filter(
+          (prop) => !prop.disabled && prop.parsedOk !== false && prop.value !== ''
+        ) ?? [];
+      const rulesInEffect = (
+        matches?: { rule: { origin?: string; startingStyles?: unknown[]; style?: CssStyleEntry } }[]
+      ) =>
+        (matches ?? []).filter(({ rule }) => !rule.startingStyles?.length).map(({ rule }) => rule);
+
+      const rules = rulesInEffect(styles.matchedCSSRules);
+      const isUserAgent = (rule: { origin?: string }) => rule.origin === 'user-agent';
+      const blocks = [
+        ...rules.filter(isUserAgent).map((r) => ({ userAgent: true, style: r.style })),
+        { userAgent: false, style: styles.attributesStyle },
+        ...rules.filter((r) => !isUserAgent(r)).map((r) => ({ userAgent: false, style: r.style })),
+        { userAgent: false, style: styles.inlineStyle },
+      ]
+        .map(({ userAgent, style }) => ({
+          userAgent,
+          declarations: applying(style)
+            .filter((prop) => !prop.name.startsWith('--'))
+            .map((prop) => ({
+              name: prop.name,
+              value: prop.value,
+              important: prop.important === true,
+            })),
+        }))
+        .filter((b) => b.declarations.length > 0);
+
+      const variableNames = new Set<string>();
+      const rootFirst = [...(styles.inherited ?? [])].reverse();
+      for (const entry of [...rootFirst, styles]) {
+        for (const style of [
+          ...rulesInEffect(entry.matchedCSSRules).map((r) => r.style),
+          entry.inlineStyle,
+        ]) {
+          for (const prop of applying(style)) {
+            if (prop.name.startsWith('--')) variableNames.add(prop.name);
+          }
+        }
+      }
+      return { blocks, variableNames: [...variableNames] };
+    } finally {
+      await this.cdp(tab, 'CSS.disable', {}).catch(() => undefined);
+    }
+  }
+
+  async previewDesignCss(
+    tabId: string,
+    slot: 'queue' | 'draft',
+    spec: Record<string, Record<string, string | null>>
+  ): Promise<DesignTopLeftRect | null> {
+    const tab = this.tabs.get(tabId);
+    if (!tab?.designMode) return null;
+    const raw = await this.callDesignRuntime(tab, 'previewCss', [slot, spec]);
+    if (
+      !isRecord(raw) ||
+      typeof raw.top !== 'number' ||
+      typeof raw.left !== 'number' ||
+      typeof raw.width !== 'number' ||
+      typeof raw.height !== 'number'
+    ) {
+      return null;
+    }
+    return { top: raw.top, left: raw.left, width: raw.width, height: raw.height };
+  }
+
+  private async screenshotRect(
+    tab: Tab,
+    rect?: { x: number; y: number; width: number; height: number }
+  ): Promise<{ data: string; mimeType: string }> {
+    if (
+      rect &&
+      Number.isFinite(rect.width) &&
+      Number.isFinite(rect.height) &&
+      rect.width >= 1 &&
+      rect.height >= 1
+    ) {
+      return this.screenshotClip(tab, {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+        scale: 1,
+      });
+    }
+    return this.screenshot(tab);
+  }
+
+  /** 返回 guest 页是否已对齐到目标状态。 */
+  private async syncLockOverlay(tab: Tab, locked = tab.locked): Promise<boolean> {
+    const contents = tab.view.webContents;
+    // 页面已销毁 / 还没 ready：没有文档就没有遮罩，解锁视为已达成
+    if (contents.isDestroyed() || !tab.ready) return !locked;
+    const script = locked ? PAGE_LOCK_OVERLAY_SCRIPT : PAGE_UNLOCK_OVERLAY_SCRIPT;
+    const result = await contents.executeJavaScript(script, true).catch(() => undefined);
+    return result === 'ok';
+  }
+
+  /** 导航竞态会让一次 executeJavaScript 直接拒绝，重试几次再判定失败。 */
+  private async removeLockOverlay(tab: Tab): Promise<boolean> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (await this.syncLockOverlay(tab, false)) return true;
+      await sleep(50);
+    }
+    return false;
+  }
+
+  getSession(): Session {
+    if (!this.guestSession) {
+      const name = partitionName(app.isPackaged);
+      this.guestSession = session.fromPartition(name);
+      void import('./proxyConfig').then(({ getProxyConfig }) =>
+        getProxyConfig().attachSession(this.guestSession as Session)
+      );
+      // guest 页拿不到摄像头 / 通知 / 地理位置等；只放剪贴板写
+      this.guestSession.setPermissionRequestHandler((_wc, permission, callback) =>
+        callback(permission === 'clipboard-sanitized-write')
+      );
+      this.guestSession.setPermissionCheckHandler(
+        (_wc, permission) => permission === 'clipboard-sanitized-write'
+      );
+      // 同时覆盖子 frame、子资源、重新加载以及走网络的历史记录加载。
+      this.guestSession.webRequest.onBeforeRequest(
+        { urls: ['file://*/*'] },
+        (details, callback) => {
+          const tab = [...this.tabs.values()].find(
+            (entry) => entry.view.webContents.id === details.webContentsId
+          );
+          try {
+            if (!tab) throw new Error('Unknown file request owner');
+            this.allowUrl(details.url, tab.ownerSessionId);
+            callback({ cancel: false });
+          } catch {
+            callback({ cancel: true });
+          }
+        }
+      );
+    }
+    return this.guestSession;
+  }
+
+  /** actor：共享浏览器里的成员会话，按标签页加锁；不传则沿用会话独占的旧行为 */
+  async invoke(
+    sessionId: string,
+    op: BrowserOp,
+    params: unknown,
+    actor?: BrowserActor
+  ): Promise<unknown> {
+    if (!actor) return this.run(sessionId, op, params, () => this.mustTab(sessionId));
+    if (this.tabClaims.takeClosed(actor.sessionId)) throw new Error(BROWSER_TAB_CLOSED_NOTICE);
+    if (op === 'tabs')
+      return this.handleTabs(
+        sessionId,
+        isRecord(params) && typeof params.action === 'string' ? params.action : 'list',
+        isRecord(params) && typeof params.index === 'number' ? params.index : undefined,
+        actor,
+        isRecord(params) && typeof params.tabId === 'string' && params.tabId.trim()
+          ? params.tabId.trim()
+          : undefined
+      );
+    const pointed = this.tabClaims.pointer(actor.sessionId);
+    const newTab = op === 'navigate' && isRecord(params) && params.newTab === true;
+    let tab = newTab
+      ? undefined
+      : ((pointed ? this.tabs.get(pointed) : undefined) ?? this.tabFor(sessionId));
+    if (!tab && op === 'navigate') tab = this.createTab(sessionId);
+    if (!tab) throw new Error('No browser tab is open. Call browser_navigate first.');
+    const target = tab;
+    let notice = false;
+    if (CLAIMING_OPS.has(op)) {
+      const claim = this.tabClaims.claim(target.id, actor);
+      if (!claim.ok) throw new Error(browserTabBusyMessage(claim.holder.name));
+      if (target.lastHolder !== actor.sessionId) target.lastSnapshot = undefined;
+      target.lastHolder = actor.sessionId;
+      if (claim.tookOver) {
+        target.lastSnapshot = undefined;
+        if (op !== 'snapshot') throw new Error(BROWSER_TAKEOVER_NOTICE);
+        notice = true;
+      }
+    } else {
+      this.tabClaims.point(actor.sessionId, target.id);
+    }
+    if (op === 'lock') {
+      await this.setLocked(sessionId, !(isRecord(params) && params.release === true), target);
+      return { locked: target.locked };
+    }
+    const result = await this.run(sessionId, op, params, () => target, target);
+    if (op === 'close') this.tabClaims.takeClosed(actor.sessionId);
+    return notice && typeof result === 'string'
+      ? `${BROWSER_TAKEOVER_NOTICE}\n\n${result}`
+      : result;
+  }
+
+  private async run(
+    sessionId: string,
+    op: BrowserOp,
+    params: unknown,
+    mustTab: () => Tab,
+    navigateTab?: Tab
+  ): Promise<unknown> {
+    switch (op) {
+      case 'navigate':
+        return this.navigate(
+          sessionId,
+          paramString(params, 'url'),
+          isRecord(params) && params.newTab === true,
+          navigateTab
+        );
+      case 'snapshot':
+        return this.snapshot(mustTab());
+      case 'click':
+        return this.click(mustTab(), paramString(params, 'ref'));
+      case 'type': {
+        const text = isRecord(params) && typeof params.text === 'string' ? params.text : '';
+        const submit = isRecord(params) && params.submit === true;
+        return this.type(mustTab(), paramString(params, 'ref'), text, submit);
+      }
+      case 'fill':
+        return this.type(
+          mustTab(),
+          paramString(params, 'ref'),
+          isRecord(params) && typeof params.value === 'string'
+            ? params.value
+            : isRecord(params) && typeof params.text === 'string'
+              ? params.text
+              : '',
+          false
+        );
+      case 'press_key':
+        return this.runPage(mustTab(), pagePressKeyScript(paramString(params, 'key')));
+      case 'scroll':
+        return this.runPage(
+          mustTab(),
+          pageScrollScript({
+            ...(isRecord(params) && typeof params.ref === 'string' ? { ref: params.ref } : {}),
+            ...(isRecord(params) && typeof params.direction === 'string'
+              ? { direction: params.direction }
+              : {}),
+            ...(isRecord(params) && typeof params.amount === 'number'
+              ? { amount: params.amount }
+              : {}),
+          })
+        );
+      case 'select_option': {
+        const values =
+          isRecord(params) && Array.isArray(params.values)
+            ? params.values.filter((v): v is string => typeof v === 'string')
+            : isRecord(params) && typeof params.value === 'string'
+              ? [params.value]
+              : [];
+        return this.selectOption(mustTab(), paramString(params, 'ref'), values);
+      }
+      case 'click_xy': {
+        const x = isRecord(params) ? Number(params.x) : Number.NaN;
+        const y = isRecord(params) ? Number(params.y) : Number.NaN;
+        if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('x and y are required');
+        return this.runPage(mustTab(), pageClickXyScript(x, y));
+      }
+      case 'drag':
+        return this.drag(mustTab(), params);
+      case 'highlight':
+        return this.runPage(
+          mustTab(),
+          pageHighlightScript(paramString(params, 'ref')),
+          paramString(params, 'ref')
+        );
+      case 'bounding_box':
+        return this.boundingBox(mustTab(), paramString(params, 'ref'));
+      case 'screenshot':
+        return this.screenshot(
+          mustTab(),
+          isRecord(params) && typeof params.ref === 'string' ? params.ref : undefined
+        );
+      case 'cdp':
+        return this.cdpCommand(
+          mustTab(),
+          paramString(params, 'method'),
+          isRecord(params) && isRecord(params.params) ? params.params : {}
+        );
+      case 'close': {
+        const tab = mustTab();
+        await this.destroyTab(tab);
+        return { closed: tab.id };
+      }
+      case 'tabs':
+        return this.handleTabs(
+          sessionId,
+          isRecord(params) && typeof params.action === 'string' ? params.action : 'list',
+          isRecord(params) && typeof params.index === 'number' ? params.index : undefined,
+          undefined,
+          isRecord(params) && typeof params.tabId === 'string' && params.tabId.trim()
+            ? params.tabId.trim()
+            : undefined
+        );
+      case 'lock': {
+        const locked = !(isRecord(params) && params.release === true);
+        await this.setLocked(sessionId, locked);
+        // 解锁可能失败（遮罩没删掉），如实回报真实状态
+        return { locked: mustTab().locked };
+      }
+    }
+  }
+
+  private tabsForSession(sessionId: string): Tab[] {
+    return [...this.tabs.values()]
+      .filter((tab) => tab.ownerSessionId === sessionId)
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  private async handleTabs(
+    sessionId: string,
+    action: string,
+    index?: number,
+    actor?: BrowserActor,
+    tabId?: string
+  ): Promise<unknown> {
+    const list = () => {
+      const current =
+        (actor && this.tabClaims.pointer(actor.sessionId)) ?? this.currentBySession.get(sessionId);
+      return this.tabsForSession(sessionId).map((tab, tabIndex) => ({
+        index: tabIndex,
+        ...this.stateOf(tab),
+        active: tab.id === current,
+      }));
+    };
+    if (action === 'new') {
+      const tab = this.createTab(sessionId);
+      if (actor) this.tabClaims.claim(tab.id, actor);
+      this.userTabs.add(tab.id);
+      this.requestReveal(sessionId, tab.id);
+      return { opened: tab.id, tabs: list() };
+    }
+    if (action === 'select') {
+      const tabs = this.tabsForSession(sessionId);
+      let tab: Tab | undefined;
+      if (tabId !== undefined) {
+        tab = tabs.find((t) => t.id === tabId);
+        if (!tab) throw new Error(`No browser tab with tabId ${tabId}`);
+      } else {
+        if (index === undefined || !Number.isInteger(index)) {
+          throw new Error('index is required for select');
+        }
+        tab = tabs[index];
+        if (!tab) throw new Error(`No browser tab at index ${index}`);
+      }
+      this.currentBySession.set(sessionId, tab.id);
+      if (actor) this.tabClaims.point(actor.sessionId, tab.id);
+      this.requestReveal(sessionId, tab.id);
+      return { selected: tab.id, tabs: list() };
+    }
+    if (action === 'close') {
+      const tabs = this.tabsForSession(sessionId);
+      const pointed = actor ? this.tabClaims.pointer(actor.sessionId) : undefined;
+      const tab =
+        tabId !== undefined
+          ? tabs.find((t) => t.id === tabId)
+          : index === undefined
+            ? ((pointed ? this.tabs.get(pointed) : undefined) ?? this.tabFor(sessionId))
+            : tabs[index];
+      if (!tab) throw new Error('No browser tab to close');
+      if (actor) {
+        const claim = this.tabClaims.claim(tab.id, actor);
+        if (!claim.ok) throw new Error(browserTabBusyMessage(claim.holder.name));
+      }
+      await this.closeTab(tab.id);
+      if (actor) this.tabClaims.takeClosed(actor.sessionId);
+      return { closed: tab.id, tabs: list() };
+    }
+    return { tabs: list() };
+  }
+
+  async navigate(sessionId: string, raw: string, newTab = false, target?: Tab): Promise<PageInfo> {
+    const url = assertAllowedUrl(raw);
+    const tab =
+      target ??
+      (newTab ? this.createTab(sessionId) : (this.tabFor(sessionId) ?? this.createTab(sessionId)));
+    const contents = tab.view.webContents;
+    tab.lastSnapshot = undefined;
+    await Promise.race([
+      contents.loadURL(url.href),
+      sleep(NAVIGATE_TIMEOUT_MS).then(() => {
+        throw new Error(`Navigation to ${url.href} timed out`);
+      }),
+    ]);
+    this.requestReveal(sessionId, tab.id);
+    return this.pageInfo(contents);
+  }
+
+  private async snapshot(tab: Tab): Promise<string> {
+    const contents = tab.view.webContents;
+    const raw: unknown = await contents.executeJavaScript(PAGE_SNAPSHOT_SCRIPT, true);
+    const entries = parseSnapshotEntries(raw);
+    if (!entries) throw new Error('Page snapshot returned an unexpected shape.');
+    tab.lastSnapshot = renderSnapshot(this.pageInfo(contents), entries);
+    return tab.lastSnapshot.text;
+  }
+
+  private async click(tab: Tab, ref: string): Promise<PageInfo> {
+    this.assertRef(tab, ref);
+    const outcome: unknown = await tab.view.webContents.executeJavaScript(
+      pageClickScript(ref),
+      true
+    );
+    const error = interpretPageAction(ref, outcome);
+    if (error) throw error;
+    return this.pageInfo(tab.view.webContents);
+  }
+
+  private async type(tab: Tab, ref: string, text: string, submit: boolean): Promise<PageInfo> {
+    this.assertRef(tab, ref);
+    const outcome: unknown = await tab.view.webContents.executeJavaScript(
+      pageTypeScript(ref, text, submit),
+      true
+    );
+    const error = interpretPageAction(ref, outcome);
+    if (error) throw error;
+    return this.pageInfo(tab.view.webContents);
+  }
+
+  private async runPage(tab: Tab, script: string, ref?: string): Promise<PageInfo> {
+    if (ref) this.assertRef(tab, ref);
+    const outcome: unknown = await tab.view.webContents.executeJavaScript(script, true);
+    const error = interpretPageAction(ref ?? '', outcome);
+    if (error) throw error;
+    return this.pageInfo(tab.view.webContents);
+  }
+
+  private async selectOption(tab: Tab, ref: string, values: string[]): Promise<PageInfo> {
+    this.assertRef(tab, ref);
+    const outcome: unknown = await tab.view.webContents.executeJavaScript(
+      pageSelectOptionScript(ref, values),
+      true
+    );
+    if (outcome === 'stale') throw staleRef(ref);
+    if (outcome !== 'ok') throw new Error(`Could not select option on ${ref}`);
+    return this.pageInfo(tab.view.webContents);
+  }
+
+  private async boundingBox(tab: Tab, ref: string): Promise<unknown> {
+    this.assertRef(tab, ref);
+    const box: unknown = await tab.view.webContents.executeJavaScript(
+      pageBoundingBoxScript(ref),
+      true
+    );
+    if (!box) throw staleRef(ref);
+    return box;
+  }
+
+  private async drag(tab: Tab, params: unknown): Promise<PageInfo> {
+    const fromRef =
+      isRecord(params) && typeof params.fromRef === 'string' ? params.fromRef : undefined;
+    const toRef = isRecord(params) && typeof params.toRef === 'string' ? params.toRef : undefined;
+    const fromX = isRecord(params) ? Number(params.fromX) : Number.NaN;
+    const fromY = isRecord(params) ? Number(params.fromY) : Number.NaN;
+    const toX = isRecord(params) ? Number(params.toX) : Number.NaN;
+    const toY = isRecord(params) ? Number(params.toY) : Number.NaN;
+    const from = fromRef ? { ref: fromRef } : { x: fromX, y: fromY };
+    const to = toRef ? { ref: toRef } : { x: toX, y: toY };
+    if (fromRef) this.assertRef(tab, fromRef);
+    if (toRef) this.assertRef(tab, toRef);
+    const contents = tab.view.webContents;
+    await contents.executeJavaScript(pageLockOverlayDisplayScript(true), true);
+    try {
+      const raw: unknown = await contents.executeJavaScript(pageDragPointsScript(from, to), true);
+      if (raw === 'stale' || !isRecord(raw) || !isRecord(raw.from) || !isRecord(raw.to)) {
+        throw new Error('Drag source or target ref is stale.');
+      }
+      const startX = Number(raw.from.x);
+      const startY = Number(raw.from.y);
+      const endX = Number(raw.to.x);
+      const endY = Number(raw.to.y);
+      if (![startX, startY, endX, endY].every(Number.isFinite)) throw new Error('Drag failed.');
+      for (const event of dragInputEvents({ x: startX, y: startY }, { x: endX, y: endY })) {
+        tab.synthetic += 1;
+        try {
+          contents.sendInputEvent(event);
+        } finally {
+          tab.synthetic -= 1;
+        }
+        await sleep(16);
+      }
+      await sleep(40);
+    } finally {
+      await contents.executeJavaScript(pageLockOverlayDisplayScript(false), true);
+      await contents.executeJavaScript(PAGE_SETTLE_FRAMES_SCRIPT, true);
+    }
+    return this.pageInfo(tab.view.webContents);
+  }
+
+  private async cdpCommand(
+    tab: Tab,
+    method: string,
+    params: Record<string, unknown>
+  ): Promise<unknown> {
+    assertDevtoolsIdle(tab.devtoolsOpen);
+    assertAllowedCdpMethod(method);
+    tab.synthetic += 1;
+    const result = await this.cdp(tab, method, params).finally(() => {
+      tab.synthetic -= 1;
+      if (method === 'Page.captureScreenshot') this.refitGuest(tab);
+    });
+    if (result === undefined) {
+      throw new Error(`CDP method ${method} returned no result`);
+    }
+    return result;
+  }
+
+  /**
+   * 被 renderer 盖住的 view `capturePage` 会报 UnknownVizError（合成器不出帧）。
+   * 走 CDP `Page.captureScreenshot` + captureBeyondViewport 强制 Blink 离屏渲染。
+   * debugger 只在 host 内用，模型摸不到。
+   */
+  private async screenshot(tab: Tab, ref?: string): Promise<{ data: string; mimeType: string }> {
+    assertDevtoolsIdle(tab.devtoolsOpen);
+    let clip: PageScreenshotClip;
+    if (ref) {
+      this.assertRef(tab, ref);
+      const box = (await tab.view.webContents.executeJavaScript(
+        pageBoundingBoxScript(ref),
+        true
+      )) as { x: number; y: number; width: number; height: number } | null;
+      if (!box) throw staleRef(ref);
+      clip = {
+        x: box.x,
+        y: box.y,
+        width: Math.max(1, box.width),
+        height: Math.max(1, box.height),
+        scale: 1,
+      };
+    } else {
+      const bounds = tab.view.getBounds();
+      const width = bounds.width || HEADLESS_BOUNDS.width;
+      const height = bounds.height || HEADLESS_BOUNDS.height;
+      const scale = width > SCREENSHOT_MAX_WIDTH ? SCREENSHOT_MAX_WIDTH / width : 1;
+      clip = { x: 0, y: 0, width, height, scale };
+    }
+    return this.screenshotClip(tab, clip);
+  }
+
+  private async screenshotClip(
+    tab: Tab,
+    clip?: PageScreenshotClip,
+    opts?: { captureBeyondViewport?: boolean }
+  ): Promise<{ data: string; mimeType: string }> {
+    assertDevtoolsIdle(tab.devtoolsOpen);
+    const shot = (await this.cdp(
+      tab,
+      'Page.captureScreenshot',
+      pageScreenshotCdpParams(clip, opts)
+    ).finally(() => this.refitGuest(tab))) as { data?: unknown } | undefined;
+    if (typeof shot?.data !== 'string' || !shot.data) {
+      throw new Error('Screenshot is empty; the page has not painted yet.');
+    }
+    return { data: shot.data, mimeType: 'image/png' };
+  }
+
+  /**
+   * Page.captureScreenshot 会把页面视图 SetSize 成截图尺寸，截完还原成开始时的旧尺寸。
+   * Windows（Aura）上页面视图只在容器尺寸变化时跟随，截图期间 bounds 变过或同尺寸再显示
+   * 就卡在旧尺寸，下方残留旧帧 / 白底。容器尺寸弹一下让它重新对齐；不走 layout，免得清掉 agent 的仿真。
+   */
+  private refitGuest(tab: Tab): void {
+    if (this.shown?.tabId !== tab.id) {
+      tab.refit = true;
+      return;
+    }
+    const { viewport } = this.shown;
+    tab.view.setBounds({ ...viewport, height: viewport.height + 1 });
+    tab.view.setBounds(viewport);
+  }
+
+  private assertRef(tab: Tab, ref: string): void {
+    if (!isKnownRef(tab.lastSnapshot, ref)) throw staleRef(ref);
+  }
+
+  private pageInfo(contents: WebContents): PageInfo {
+    return { url: contents.getURL(), title: contents.getTitle() };
+  }
+
+  private tabFor(sessionId: string): Tab | undefined {
+    const id = this.currentBySession.get(sessionId);
+    return id ? this.tabs.get(id) : undefined;
+  }
+
+  private mustTab(sessionId: string): Tab {
+    const tab = this.tabFor(sessionId);
+    if (!tab) throw new Error('No browser tab is open. Call browser_navigate first.');
+    return tab;
+  }
+
+  private createTab(sessionId: string, tabId?: string): Tab {
+    this.evictIfNeeded();
+    const view = new WebContentsView({
+      webPreferences: {
+        session: this.getSession(),
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false,
+        backgroundThrottling: false,
+      },
+    });
+    // 默认透明会透过无边框窗口看到桌面；导航空白帧要垫一层不透明底
+    view.setBackgroundColor('#ffffff');
+    const id = tabId ?? `browser:${++this.counter}-${Date.now().toString(36)}`;
+    const tab: Tab = {
+      id,
+      view,
+      ownerSessionId: sessionId,
+      createdAt: Date.now(),
+      locked: false,
+      ready: false,
+      devtoolsOpen: false,
+      designMode: false,
+      favicon: null,
+      pickSeq: 0,
+      synthetic: 0,
+    };
+    const contents = view.webContents;
+    const push = () => this.emitState(sessionId, id);
+    // 用户本人点 / 敲进页面：不受锁限制，但占用者下一次操作要知道
+    contents.on('input-event', (_event, input) => {
+      if (tab.synthetic === 0 && USER_INPUT.has(input.type)) this.tabClaims.userTookOver(id);
+    });
+    contents.on('did-start-loading', push);
+    contents.on('did-stop-loading', push);
+    contents.on('did-navigate-in-page', push);
+    contents.on('page-title-updated', push);
+    // 页内链接 / 重定向也过同一道 URL 门
+    const guard = (event: { preventDefault(): void }, url: string) => {
+      try {
+        this.allowUrl(url, sessionId);
+      } catch {
+        event.preventDefault();
+      }
+    };
+    contents.on('will-navigate', guard);
+    contents.on('will-frame-navigate', (event) => guard(event, event.url));
+    contents.on('will-redirect', guard);
+    contents.on('page-favicon-updated', (_event, urls) => {
+      tab.favicon = pickFaviconUrl(urls);
+      push();
+    });
+    let wasFilePage = false;
+    contents.on('did-navigate', () => {
+      const isFilePage = contents.getURL().startsWith('file:');
+      // 工作区或符号链接变化后，file 条目绝不能从 Chromium 的前进/后退缓存恢复。
+      // 纯 HTTP 浏览保留历史记录。
+      if (wasFilePage || isFilePage) contents.navigationHistory.clear();
+      wasFilePage = isFilePage;
+      tab.lastSnapshot = undefined;
+      tab.favicon = null;
+      tab.pickSeq += 1;
+      if (tab.designMode) {
+        this.emitDesign({
+          type: 'drawing',
+          conversationId: tab.ownerSessionId,
+          tabId: tab.id,
+          drawing: false,
+        });
+      }
+      push();
+    });
+    contents.on('did-finish-load', () => {
+      // 始终对齐：history / BFCache 带回来的残留遮罩也要清掉
+      void this.syncLockOverlay(tab);
+      if (tab.designMode) void this.syncDesignRuntimeOnPage(tab);
+    });
+    contents.on('did-navigate-in-page', () => {
+      if (tab.designMode) void this.syncDesignRuntimeOnPage(tab);
+    });
+    contents.on('dom-ready', () => {
+      const firstReady = !tab.ready;
+      tab.ready = true;
+      if (firstReady) this.layout();
+      if (tab.locked) void this.syncLockOverlay(tab);
+      if (tab.designMode) void this.syncDesignRuntimeOnPage(tab);
+    });
+    // window.open / target=_blank：本 tab 内导航，不弹系统浏览器
+    contents.setWindowOpenHandler(({ url }) => {
+      try {
+        void contents.loadURL(this.allowUrl(url, sessionId).href).catch(() => {});
+      } catch {}
+      return { action: 'deny' };
+    });
+    contents.on('destroyed', () => {
+      // destroyTab 已先摘表，等 flush 期间同 id 可能被重建：旧页面销毁只清理仍是自己的那条
+      if (this.tabs.get(id) !== tab) return;
+      this.tabs.delete(id);
+      this.tabClaims.closeTab(id);
+      if (this.currentBySession.get(sessionId) === id) this.currentBySession.delete(sessionId);
+      this.emitState(sessionId, id);
+    });
+    this.tabs.set(id, tab);
+    this.currentBySession.set(sessionId, id);
+    this.layout();
+    this.emitState(sessionId, id);
+    return tab;
+  }
+
+  private detach(view: WebContentsView): void {
+    const window = this.hostWindow();
+    if (!window || window.isDestroyed()) return;
+    if (window.contentView.children.includes(view)) window.contentView.removeChildView(view);
+  }
+
+  private evictIfNeeded(): void {
+    if (this.tabs.size < MAX_HEADLESS_TABS) return;
+    const oldest = [...this.tabs.values()]
+      .filter(
+        (tab) =>
+          !tab.locked &&
+          tab.id !== this.shown?.tabId &&
+          !this.userTabs.has(tab.id) &&
+          !this.tabClaims.holder(tab.id)
+      )
+      .sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (oldest) void this.destroyTab(oldest);
+  }
+
+  /** 回合结束：未锁、用户没在看的 tab 关掉（页面不留后台） */
+  async closeForSession(sessionId: string, opts: { force?: boolean } = {}): Promise<void> {
+    const tab = this.tabFor(sessionId);
+    if (!tab) return;
+    if (
+      !opts.force &&
+      (tab.locked ||
+        this.shown?.sessionId === sessionId ||
+        this.pendingReveal.has(sessionId) ||
+        (tab && this.userTabs.has(tab.id)))
+    ) {
+      return;
+    }
+    await this.destroyTab(tab);
+  }
+
+  private async destroyTab(tab: Tab, opts?: { keepPersist?: boolean }): Promise<void> {
+    this.tabs.delete(tab.id);
+    this.tabClaims.closeTab(tab.id);
+    if (this.currentBySession.get(tab.ownerSessionId) === tab.id) {
+      this.currentBySession.delete(tab.ownerSessionId);
+    }
+    if (!this.disposing && !opts?.keepPersist && !this.userTabs.has(tab.id)) {
+      this.forgetTab(tab.id);
+    }
+    await this.flush();
+    this.teardownDevTools(tab);
+    if (this.shownDevtools?.tabId === tab.id) this.shownDevtools = null;
+    if (tab.devtools) {
+      this.detach(tab.devtools);
+      if (!tab.devtools.webContents.isDestroyed()) tab.devtools.webContents.close();
+      tab.devtools = undefined;
+    }
+    this.detach(tab.view);
+    if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
+    this.emitState(tab.ownerSessionId, tab.id);
+  }
+
+  async flush(): Promise<void> {
+    if (!this.guestSession) return;
+    await this.guestSession.cookies.flushStore().catch(() => {});
+    await this.guestSession.flushStorageData();
+  }
+
+  async clearData(kind: BrowserClearKind): Promise<void> {
+    const guest = this.getSession();
+    if (!isBrowserPartition(partitionName(app.isPackaged))) throw new Error('Refusing to clear');
+    if (kind === 'cookies' || kind === 'all') {
+      await guest.clearStorageData({ storages: ['cookies'] });
+    }
+    if (kind === 'cache' || kind === 'all') await guest.clearCache();
+    if (kind === 'all') {
+      await guest.clearStorageData({
+        storages: ['localstorage', 'indexdb', 'serviceworkers', 'cachestorage', 'filesystem'],
+      });
+    }
+  }
+
+  private persistPath(): string {
+    return join(app.getPath('userData'), 'browser-tabs.json');
+  }
+
+  private loadPersisted(): void {
+    if (this.persistedLoaded) return;
+    this.persistedLoaded = true;
+    try {
+      if (!existsSync(this.persistPath())) return;
+      this.persisted = parsePersistedBrowserTabs(
+        JSON.parse(readFileSync(this.persistPath(), 'utf8')) as unknown
+      );
+    } catch {
+      this.persisted = {};
+    }
+  }
+
+  private writePersisted(): void {
+    try {
+      writeFileSync(this.persistPath(), serializePersistedBrowserTabs(this.persisted));
+    } catch {}
+  }
+
+  private rememberTab(sessionId: string, tab: PersistedBrowserTab): void {
+    this.loadPersisted();
+    this.persisted[sessionId] = tab;
+    this.writePersisted();
+  }
+
+  private forgetTab(sessionId: string): void {
+    this.loadPersisted();
+    if (!(sessionId in this.persisted)) return;
+    delete this.persisted[sessionId];
+    this.writePersisted();
+  }
+
+  private touch(tabId: string): void {
+    this.lastSeen.set(tabId, Date.now());
+    if (this.idleTimer) return;
+    this.idleTimer = setInterval(() => void this.hibernateIdleTabs(), IDLE_TICK_MS);
+  }
+
+  private async hibernateIdleTabs(): Promise<void> {
+    const now = Date.now();
+    for (const tab of [...this.tabs.values()]) {
+      if (tab.locked || tab.id === this.shown?.tabId || this.tabClaims.holder(tab.id)) continue;
+      const seen = this.lastSeen.get(tab.id) ?? tab.createdAt;
+      if (now - seen < IDLE_MS) continue;
+      const state = this.stateOf(tab);
+      if (state.url.startsWith('http')) {
+        this.rememberTab(tab.id, {
+          url: state.url,
+          title: state.title,
+          conversationId: tab.ownerSessionId,
+          at: seen,
+        });
+      }
+      if (state.url.startsWith('file:')) continue;
+      await this.destroyTab(tab, { keepPersist: true });
+    }
+    if (this.tabs.size === 0 && this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+  }
+
+  private async restoreTab(tabId: string, sessionId?: string): Promise<void> {
+    this.loadPersisted();
+    if (this.tabs.has(tabId)) return;
+    const saved = this.persisted[tabId];
+    const owner = saved?.conversationId ?? sessionId ?? tabId;
+    const tab = this.createTab(owner, tabId);
+    this.userTabs.add(tab.id);
+    if (!saved?.url) return;
+    try {
+      assertAllowedUrl(saved.url);
+    } catch {
+      return;
+    }
+    await tab.view.webContents.loadURL(saved.url).catch(() => {});
+  }
+
+  async restorePersistedTabs(): Promise<void> {
+    this.loadPersisted();
+  }
+
+  listSearchableTabs(): import('@shared/searchAnything').BrowserSearchTab[] {
+    this.loadPersisted();
+    const live: import('@shared/searchAnything').BrowserSearchTab[] = [];
+    for (const tab of this.tabs.values()) {
+      if (!this.userTabs.has(tab.id)) continue;
+      const state = this.stateOf(tab);
+      if (!state.url.startsWith('http')) continue;
+      live.push({
+        tabId: tab.id,
+        conversationId: tab.ownerSessionId,
+        title: state.title,
+        url: state.url,
+        at: this.lastSeen.get(tab.id) ?? tab.createdAt,
+        live: true,
+      });
+    }
+    const persisted = Object.entries(this.persisted).flatMap(([tabId, saved]) => {
+      if (!saved.url) return [];
+      return [
+        {
+          tabId,
+          conversationId: saved.conversationId ?? tabId,
+          title: saved.title,
+          url: saved.url,
+          at: saved.at,
+        },
+      ];
+    });
+    return mergeBrowserSearchTabs(live, persisted);
+  }
+
+  /** 成员本轮结束 / 被停止：放掉它占着的标签 */
+  releaseActor(actorSessionId: string): void {
+    this.tabClaims.release(actorSessionId);
+  }
+
+  forgetActor(actorSessionId: string): void {
+    this.tabClaims.forget(actorSessionId);
+  }
+
+  /** 进托盘：关掉所有 guest renderer，HTTP 用户 tab 的 URL 留在 persist 里。 */
+  async hibernateAll(): Promise<void> {
+    this.shown = null;
+    this.shownDevtools = null;
+    this.overlayActive = false;
+    this.pendingReveal.clear();
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+    for (const tab of [...this.tabs.values()]) {
+      const state = this.stateOf(tab);
+      if (state.url.startsWith('http')) {
+        this.rememberTab(tab.id, {
+          url: state.url,
+          title: state.title,
+          conversationId: tab.ownerSessionId,
+          at: this.lastSeen.get(tab.id) ?? tab.createdAt,
+        });
+      }
+      await this.destroyTab(tab, { keepPersist: true });
+    }
+  }
+
+  /** 退出前：flush 后关掉全部 tab。 */
+  async dispose(): Promise<void> {
+    this.disposing = true;
+    if (this.idleTimer) {
+      clearInterval(this.idleTimer);
+      this.idleTimer = undefined;
+    }
+    for (const tab of [...this.tabs.values()]) await this.destroyTab(tab);
+  }
+}
+
+const staleRef = (ref: string) =>
+  new Error(`Ref ${ref} is stale or unknown. Call browser_snapshot again and use a fresh ref.`);
+
+export function interpretPageAction(ref: string, outcome: unknown): Error | null {
+  if (outcome === 'ok' || outcome === undefined) return null;
+  if (outcome === 'covered') {
+    return new Error(
+      `Element ${ref} is covered or not hittable. Call browser_snapshot again and use a fresh ref.`
+    );
+  }
+  if (outcome === 'stale') return staleRef(ref);
+  if (outcome === 'not-editable') return new Error(`Element ${ref} is not editable.`);
+  if (typeof outcome === 'string') return new Error(`browser action failed: ${outcome}`);
+  return staleRef(ref);
+}
+
+export const browserHost = new BrowserHost();

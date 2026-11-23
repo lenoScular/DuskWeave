@@ -1,0 +1,124 @@
+/* dockview 主题变量重映射到语义令牌：它自带主题写死 #1e1e1e 等色值，
+   不跟随我们的 light/dark/sync-terminal，也绕过背景图透明化。
+   底色全部置透，由宿主 <aside> 的 bg-background 刷一层（避免多层叠色）。 */
+.enso-side-dock .dv-dockview {
+  --dv-group-view-background-color: transparent;
+  --dv-tabs-and-actions-container-background-color: transparent;
+  --dv-activegroup-visiblepanel-tab-background-color: transparent;
+  --dv-activegroup-hiddenpanel-tab-background-color: transparent;
+  --dv-inactivegroup-visiblepanel-tab-background-color: transparent;
+  --dv-inactivegroup-hiddenpanel-tab-background-color: transparent;
+  --dv-floating-titlebar-background-color: var(--color-popover);
+  --dv-context-menu-background-color: var(--color-popover);
+  --dv-icon-hover-background-color: var(--color-accent);
+  --dv-separator-border: var(--color-border);
+  --dv-tab-divider-color: transparent;
+  --dv-paneview-header-border-color: var(--color-border);
+  --dv-drag-over-background-color: var(--color-accent);
+  --dv-drag-over-border-color: var(--color-ring);
+  --dv-tabs-container-scrollbar-color: var(--color-border);
+  --dv-activegroup-visiblepanel-tab-color: var(--color-foreground);
+  --dv-activegroup-hiddenpanel-tab-color: var(--color-muted-foreground);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--color-foreground);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--color-muted-foreground);
+}
+/* 全局插件常驻层整体不接事件，只有 iframe 接；dockview 拖拽时会给所有 iframe 内联 pointer-events:none */
+.enso-global-plugin-layer iframe {
+  pointer-events: auto;
+}
+/* 占位块所在的 always 浮层（z-index:1）叠在常驻层之上，必须透传点击 */
+.enso-side-dock .dv-render-overlay:has([data-global-plugin-slot]) {
+  pointer-events: none;
+}
+/* 浮层类元素（溢出下拉、键盘提示）不能全透，否则压在内容上看不清 */
+.enso-side-dock .dv-tabs-overflow-container,
+.enso-side-dock .dv-keyboard-docking-hint {
+  background-color: var(--color-popover);
+}
+
+/* 压掉 dockview 默认 VS 风 tab 条,只留我们自己的 chip */
+.enso-side-dock,
+.enso-side-dock .dv-dockview,
+.enso-side-dock .dv-groupview {
+  background: transparent;
+}
+
+.enso-side-dock .dv-tabs-and-actions-container {
+  /* 必须走 --color-* 映射层：背景图模式下注入通用面板 alpha */
+  background: var(--color-background);
+  border-bottom: 1px solid var(--color-border);
+  height: auto;
+  min-height: 0;
+  align-items: center;
+  padding: 0.25rem 0.5rem;
+}
+
+/* 面板 tab 条升进顶栏行：与顶栏同高、透明落在画布上，下方卡片面与对话卡片连成一片。
+   tab 做成与 Code/Bot 切换一致的胶囊：激活项是浮起的卡片底色。 */
+[data-title-row] .enso-side-dock .dv-tabs-and-actions-container,
+[data-title-row] .enso-side-dock-header {
+  height: 44px;
+  padding-block: 0;
+  background: transparent;
+  border-bottom: 0;
+  /* 面板 tab 条升进顶栏行、与窗口顶栏同高：那一段视觉上就是顶栏，
+     空白处必须能拖动窗口，否则用户按着「顶栏」拖不动。 */
+  -webkit-app-region: drag;
+}
+/* tab / 按钮 / 可交互元素豁免，否则点击会被当成拖窗口 */
+[data-title-row] .enso-side-dock [data-side-tab],
+[data-title-row] .enso-side-dock button,
+[data-title-row] .enso-side-dock [role="button"] {
+  -webkit-app-region: no-drag;
+}
+[data-title-row] .enso-side-dock [data-side-tab] {
+  height: 1.75rem;
+  border-radius: 0.5rem;
+  padding-inline: 0.625rem;
+  background: transparent;
+}
+[data-title-row] .enso-side-dock [data-side-tab]:hover {
+  background: color-mix(in oklab, var(--color-foreground) 5%, transparent);
+}
+[data-title-row] .enso-side-dock [data-side-tab][data-active] {
+  background: var(--color-background);
+  box-shadow: 0 1px 2px color-mix(in oklab, var(--color-foreground) 8%, transparent);
+}
+
+.enso-side-dock .dv-tabs-container {
+  height: auto;
+  align-items: center;
+}
+
+.enso-side-dock .dv-tab {
+  display: flex;
+  align-items: center;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  margin: 0 2px 0 0 !important;
+  padding: 0 !important;
+  height: auto !important;
+}
+
+.enso-side-dock .dv-default-tab,
+.enso-side-dock .dv-default-tab-action {
+  display: none;
+}
+
+.enso-side-dock .dv-separator {
+  background: var(--color-border);
+}
+
+/* 拖拽幽灵会 portal 到 body,不在 .enso-side-dock 内;去掉默认白底描边框 */
+.dv-tab-ghost-drag {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+.dv-tab-ghost-drag::after {
+  content: none !important;
+  outline: none !important;
+}
+.dv-tab.dv-tab-dragging {
+  background: transparent !important;
+}

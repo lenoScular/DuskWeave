@@ -1,0 +1,137 @@
+appId: com.lenoscular.duskweave
+productName: 暮色
+directories:
+  buildResources: build
+extraResources:
+  # 配合 files 里的 sqlite-vec-windows-x64：from/to 拷进来的文件不吃 asarUnpack，
+  # 而 loadExtension 读不了 asar 内的 dll，真实文件放到 app.asar.unpacked
+  - from: node_modules/.pnpm/sqlite-vec-windows-x64@0.1.9/node_modules/sqlite-vec-windows-x64
+    to: app.asar.unpacked/node_modules/sqlite-vec-windows-x64
+  - from: build/trayTemplate.png
+    to: trayTemplate.png
+  - from: build/trayTemplate@2x.png
+    to: trayTemplate@2x.png
+  - from: build/icons/32x32.png
+    to: tray-icon.png
+  # Windows BrowserWindow/taskbar: multi-size ICO (BMP ≤128). PNG alone → square plate.
+  - from: build/icon.ico
+    to: icon.ico
+  - from: build/icon-win.png
+    to: icon-win.png
+files:
+  - out/**
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
+  # 动态 import，收集器可能漏掉；pnpm symlink 也要跟进拷进包
+  - from: node_modules/@rahularya01/pi-cursor
+    to: node_modules/@rahularya01/pi-cursor
+  - from: node_modules/@bufbuild/protobuf
+    to: node_modules/@bufbuild/protobuf
+  - from: node_modules/quickjs-wasi
+    to: node_modules/quickjs-wasi
+  # node-datachannel 平台包是 optional 兄弟目录，收集器只打 JS；不显式拷贝则
+  # require('@node-datachannel/<platform>') 在安装包里找不到（Windows 直连会降级中继）
+  - from: node_modules/.pnpm/node-datachannel@0.33.2/node_modules/@node-datachannel
+    to: node_modules/@node-datachannel
+  # koffi 同理：绑定在 optional 兄弟包 @koromix/koffi-<platform>-<arch>，
+  # koffi 按 require('@koromix/...') 与 node_modules/@koromix 相对路径查找
+  - from: node_modules/.pnpm/koffi@3.3.1/node_modules/@koromix
+    to: node_modules/@koromix
+  # 头文件、C++ 源码、文档与安装脚本；运行时只用 index/indirect 与 src/koffi 下的 js
+  - '!node_modules/koffi/{vendor,lib,doc}/**'
+  - '!node_modules/koffi/cnoke.cjs'
+  - '!node_modules/koffi/src/koffi/src/trampolines.cjs'
+  - '!node_modules/koffi/src/**/*.{cc,hh,inc,def,S,asm,txt}'
+  # 收集器在 Windows 上不跟进 pnpm junction，漏掉 sqlite-vec 平台包（向量检索退回扫 BLOB）；
+  # 直接拷真实目录供 require.resolve 定位（dll 本体见 extraResources），其他平台没有该目录时跳过
+  - from: node_modules/.pnpm/sqlite-vec-windows-x64@0.1.9/node_modules/sqlite-vec-windows-x64
+    to: node_modules/sqlite-vec-windows-x64
+  # node-llama-cpp 平台预编译全部按需下载（含 CPU / Metal / CUDA / Vulkan）
+  - '!node_modules/@node-llama-cpp/**'
+  - '!node_modules/.pnpm/@node-llama-cpp+*/**'
+  # renderer 已打进 out/；生产 node_modules 里这些是死重
+  - '!**/*.map'
+  - '!**/node_modules/*/{CHANGELOG.md,README.md,readme.md}'
+  - '!**/node_modules/**/{test,tests,__tests__,powered-test,example,examples,demo,docs}/**'
+  - '!**/node_modules/**/*.{d.ts,d.mts,d.cts}'
+  # getLlama({ build: 'never' })，源码 bundle 只给本机编译用
+  - '!node_modules/node-llama-cpp/llama/gitRelease.bundle'
+  # chord 只在 bundler 入口用 esbuild；agent-core 走 chord/context
+  - '!node_modules/esbuild/**'
+  - '!node_modules/@esbuild/**'
+  - '!node_modules/.pnpm/esbuild@*/**'
+  - '!node_modules/.pnpm/@esbuild+*/**'
+  - '!node_modules/better-sqlite3/deps/**'
+  - '!node_modules/better-sqlite3/src/**'
+  # 从未打 musl 目标；darwin/win/linux 预编译必须留在全局 files，不能放到 mac.files
+  # —— 平台 files 若只含 !excludes，electron-builder 会当成默认 matcher 并塞入 **/*，整仓进 asar
+  - '!node_modules/better-sqlite3/prebuilds/linuxmusl*'
+  # pi TUI 剪贴板；loadClipboardNative 缺失即 null。产品剪贴板走 Electron
+  - '!node_modules/@mariozechner/clipboard/**'
+  - '!node_modules/@mariozechner/clipboard-*/**'
+  - '!node_modules/.pnpm/@mariozechner+clipboard*/**'
+electronLanguages:
+  - en
+  - en-US
+  - zh
+  - zh-CN
+  - zh_CN
+  - zh-TW
+  - zh_TW
+# sqlite-vec 是 dlopen 的动态库，留在 asar 内无法加载（db.ts 会回退到 app.asar.unpacked）
+asarUnpack:
+  - node_modules/sqlite-vec-*/**
+  # onnxruntime-node 的 .node 绑定与 bin/ 下的 ORT 动态库同样不能从 asar 内加载（onnx.ts 动态 require）
+  - node_modules/onnxruntime-node/**/*.node
+  - node_modules/onnxruntime-node/bin/**
+  # koffi 绑定在 @koromix 平台包内
+  - node_modules/@koromix/**/*.node
+  # node-datachannel 平台预编译；asar 内 dlopen 失败
+  - node_modules/@node-datachannel/**/*.node
+  # ripgrep 二进制不能从 asar 内执行
+  - node_modules/@vscode/ripgrep/bin/**
+mac:
+  category: public.app-category.developer-tools
+  extraResources:
+    - from: build/bin/enso
+      to: bin/enso
+    - from: build/finder
+      to: finder
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  # 公证与 staple 由 scripts/after-sign.mjs 负责，staple 断网可重试
+  notarize: false
+  # electron-builder 默认三项 + Apple Events
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  extendInfo:
+    NSAppleEventsUsageDescription: 暮色使用 Apple Events 为桌面操作工具切换到指定窗口。
+    CFBundleDocumentTypes:
+      - CFBundleTypeName: Folder
+        CFBundleTypeRole: Viewer
+        LSHandlerRank: Alternate
+        LSItemContentTypes:
+          - public.folder
+  target:
+    - dmg
+    - zip
+win:
+  target:
+    - nsis
+  extraResources:
+    - from: build/bin/enso.cmd
+      to: bin/enso.cmd
+nsis:
+  artifactName: ${productName}-Setup-${version}.exe
+linux:
+  target:
+    - AppImage
+    - deb
+npmRebuild: false
+# 聚合 hook 仍会先调用 src/tooling/stripPackagedNatives.mjs，再放入目标架构 RTK。
+afterPack: ./scripts/after-pack.mjs
+afterSign: ./scripts/after-sign.mjs
+# 暮色首版不关联 EnsoCode 的正式更新和发布渠道。
+publish: null

@@ -1,0 +1,391 @@
+import { describe, expect, it } from 'vitest';
+import { getTranslation, normalizeLocale, translate, zhTranslations } from './i18n';
+import { BUILTIN_TOOLS } from './types/builtinTools';
+
+/** 间接映射表里的 t() key。删孤儿时漏看这些会把正在用的词条删掉。 */
+const MAPPED_I18N_KEYS = [
+  // ModelPicker.LEVEL_LABEL_KEYS + StatsLine.THINKING_LEVEL_SHORT_KEYS
+  'Min',
+  'Low',
+  'Med',
+  'High',
+  'Extra',
+  'Max',
+  // StatsLine.THINKING_LEVEL_FULL_KEYS（medium 档用 'Medium'，xhigh 用 'Extra High'）
+  'Medium',
+  'Extra High',
+  // StatsLine.SEGMENT_LABEL_KEYS
+  'Model',
+  'Approval mode',
+  'Working directory',
+  'Session name',
+  'Coworkers',
+  'Tokens',
+  'Cache hit rate',
+  'Context window',
+  'Turns',
+  'Speed',
+  'Duration',
+  'Session time',
+  'Subscription usage',
+  // StatsLine.APPROVAL_LABEL_KEYS + ApprovalModePicker.MODE_META.labelKey
+  'Supervised',
+  'Auto-accept edits',
+  'Full access',
+  'Assistant approval',
+  'Assistant reviewing…',
+  // ApprovalModePicker.MODE_META.descKey
+  'Approve every command and file change',
+  'Edits run freely; commands and MCP still ask',
+  'Run everything without asking',
+  'A configured model reviews each action first',
+  'Select an assistant approval model in Settings first',
+  // StatusLineSettings.PRESET_LABEL_KEYS
+  'Minimal',
+  'Default',
+  'Full',
+  // ProviderModelRow.BADGE_LABEL_KEYS + tri-state / number inherit labels
+  'Overridden',
+  'Catalog',
+  'Inherit',
+  'On',
+  'Off',
+  'Thinking level',
+  'Context',
+  'Max tokens',
+  // GeneralSettings.ACTION_LABEL_KEYS
+  'Toggle sidebar',
+  'Toggle side panel',
+  'Toggle side panel fullscreen',
+  'Open settings',
+  'Switch model',
+  'Focus chat input',
+  'Find in conversation',
+  'Only when the chat input is focused',
+  'Send message',
+  'New conversation',
+  'Next coworker tab',
+  'Previous coworker tab',
+  'New terminal tab',
+  'New terminal when the side panel is focused; otherwise new conversation',
+  'New Btw tab',
+  'Open a Btw tab in the side panel',
+  'Close terminal tab',
+  // fileTreeMenu.revealLabel()：按平台返回其一，t() 的实参不是字面量
+  'Reveal in Finder',
+  'Open Containing Folder',
+  'Reveal in File Explorer',
+  // RtkToolStatsBar.STATUS_LABELS
+  'Compressed',
+  'Unchanged',
+  'Background task started',
+  'Bypassed',
+  'Unavailable',
+  // SubagentResult.STATUS
+  'Queued',
+  'running',
+  'awaiting input',
+  'validating',
+  'succeeded',
+  'failed',
+  'cancelled',
+  'interrupted',
+  'creating',
+  'idle',
+  'parked',
+  'closed',
+] as const;
+
+const MODEL_CENTER_ENSO_I18N_KEYS = [
+  // Unified provider setup and OAuth hosts
+  'Add model or provider',
+  'Choose a provider first. You will select subscription or API Key next.',
+  'Choose how to connect',
+  'Provider subscription',
+  'ChatGPT (PI login)',
+  'Authorization failed',
+  'Authorizing {{provider}}',
+  'Enter this code in your browser',
+  'Open authorization page again',
+  'Cancel authorization',
+  'Subscription authorization',
+  'No subscription account connected',
+  'Connect subscription',
+  'Add another account',
+  'Import from Codex',
+  'Codex login not found. Sign in to Codex Desktop or CLI first.',
+  'Codex is not signed in with a ChatGPT account.',
+  'This ChatGPT account is already connected.',
+  'Resets {{time}}',
+  'Could not load subscription providers',
+  'Target',
+  'Provider',
+  'Account',
+  'Name',
+  'Coworker',
+  // Default model
+  'Default model',
+  'Used for new conversations.',
+  'No default model',
+  'No usable models',
+  'Default model changed: {{previous}} → {{next}}',
+  'Subscription credentials could not be loaded: {{error}}',
+  // Typed Agent recipient, child TAB, and parent notifications
+  'Type @ to choose a file or Agent',
+  'Create or select a project to start a conversation',
+  'Agents',
+  'Files',
+  'System',
+  'Built-in',
+  'Custom',
+  'Locked',
+  'Recipient',
+  'Remove Agent recipient',
+  'Message the selected Agent…',
+  'Send only to the selected Agent',
+  'This Agent name is reserved',
+  'Dispatched to',
+  'Completed',
+  'Failed',
+  // Receipt outcomes
+  'succeeded',
+  'denied',
+  'failed',
+  'unavailable',
+  'cancelled',
+  // Capacity and exact ready handshake failures surfaced in the current TAB
+  'Coworker limit reached (active or reserved).',
+  'Agent worker exited before ready.',
+  'Agent session was rejected before ready.',
+  'Agent session ready handshake timed out.',
+  'Parent ready model did not match the bound model.',
+  'Child ready identity mismatch.',
+  'Child ready profile or model mismatch.',
+] as const;
+
+describe('normalizeLocale', () => {
+  it('zh 开头的一律归为中文', () => {
+    expect(normalizeLocale('zh')).toBe('zh');
+    expect(normalizeLocale('zh-CN')).toBe('zh');
+    expect(normalizeLocale('ZH-Hant')).toBe('zh');
+  });
+
+  it('其余一律英文', () => {
+    expect(normalizeLocale('en-US')).toBe('en');
+    expect(normalizeLocale('ja')).toBe('en');
+    expect(normalizeLocale(undefined)).toBe('en');
+    expect(normalizeLocale('')).toBe('en');
+  });
+});
+
+describe('mapped i18n keys', () => {
+  it('间接映射表用到的词条都在字典里，且中文不是原文回退', () => {
+    for (const key of MAPPED_I18N_KEYS) {
+      expect(zhTranslations[key], `missing mapped key: ${key}`).toBeTypeOf('string');
+      expect(getTranslation('zh', key)).not.toBe(key);
+    }
+  });
+});
+
+describe('model center and Enso i18n keys', () => {
+  it('关键向导、Enso 与 ASK key 唯一且都有中文映射', () => {
+    MODEL_CENTER_ENSO_I18N_KEYS.forEach((key, index) => {
+      expect(MODEL_CENTER_ENSO_I18N_KEYS.indexOf(key), `duplicate feature key: ${key}`).toBe(index);
+    });
+    for (const key of MODEL_CENTER_ENSO_I18N_KEYS) {
+      expect(zhTranslations, `missing feature key: ${key}`).toHaveProperty(key);
+      expect(zhTranslations[key], `empty feature translation: ${key}`).not.toBe('');
+      expect(getTranslation('zh', key), `untranslated feature key: ${key}`).not.toBe(key);
+    }
+  });
+});
+
+describe('workspace branch i18n keys', () => {
+  it('分支搜索、占用、安全阻止与创建提示均有中文映射，英文原样可用', () => {
+    const keys = [
+      'Switch branch',
+      'Back to workspaces',
+      'Local branches',
+      'Search local branches',
+      'Switching branches affects all conversations in this workspace.',
+      'Create branch from HEAD…',
+      'Create branch',
+      'Create and switch',
+      'Branch name',
+      'Detached HEAD',
+      'No matching local branches.',
+      'Failed to load branches',
+      'Failed to switch branch',
+      'Creates a branch from the current HEAD and switches every conversation in this workspace to it.',
+      'Create a commit before creating a branch from HEAD.',
+      'Stop running conversations and coworkers in this workspace before switching branches.',
+      'Commit or stash uncommitted changes before switching branches.',
+      'This workspace is busy. Try again when its conversations are ready.',
+      'Branch is checked out in another worktree.',
+      'Enter a valid Git branch name.',
+      'A branch with this name already exists.',
+      'This branch no longer exists. Refresh the branch list.',
+      'This workspace is already on that branch.',
+      'Branches are not available for this workspace.',
+      'Git could not switch branches.',
+      'Wait for the workspace operation to finish before saving.',
+    ];
+    for (const key of keys) {
+      expect(getTranslation('en', key)).toBe(key);
+      expect(getTranslation('zh', key), key).not.toBe(key);
+    }
+  });
+});
+
+describe('getTranslation', () => {
+  it('中文返回译文', () => {
+    expect(getTranslation('zh', 'Settings')).toBe('设置');
+  });
+
+  it('英文原样返回 key', () => {
+    expect(getTranslation('en', 'Settings')).toBe('Settings');
+  });
+
+  it('缺翻译时回退到英文原文而不是报错', () => {
+    expect(getTranslation('zh', 'Some Untranslated Text')).toBe('Some Untranslated Text');
+  });
+});
+
+describe('translate', () => {
+  it('替换插值占位符', () => {
+    expect(translate('zh', '{{count}} models', { count: 3 })).toBe('3 个模型');
+    expect(translate('en', '{{count}} models', { count: 3 })).toBe('3 models');
+  });
+
+  it('支持一个模板里多个占位符', () => {
+    expect(
+      translate('en', 'Saving overwrites {{path}} directly — {{source}} will pick up the change.', {
+        path: '/a/b',
+        source: 'Factory',
+      })
+    ).toBe('Saving overwrites /a/b directly — Factory will pick up the change.');
+  });
+
+  it('缺少的参数保留原占位符，不会渲染成 undefined', () => {
+    expect(translate('en', '{{count}} models', {})).toBe('{{count}} models');
+  });
+
+  it('不传参数时原样返回模板', () => {
+    expect(translate('zh', 'Settings')).toBe('设置');
+  });
+
+  it('数字参数正确转成字符串', () => {
+    expect(translate('zh', 'Connected ({{ms}}ms)', { ms: 128 })).toBe('连接成功(128ms)');
+  });
+});
+
+describe('模块级常量的 i18n key（#5）', () => {
+  const alertLabels = ['Note', 'Tip', 'Important', 'Warning', 'Caution'] as const;
+  const taskNoteKeys = ['(log unavailable)', 'Loading…', '(no log available)'] as const;
+
+  it('内置工具说明存英文 key，中文表有对应译文', () => {
+    for (const tool of BUILTIN_TOOLS) {
+      expect(tool.description).not.toMatch(/[\u4e00-\u9fff]/);
+      expect(zhTranslations[tool.description]).toBeDefined();
+      expect(translate('en', tool.description)).toBe(tool.description);
+      expect(translate('zh', tool.description)).not.toBe(tool.description);
+    }
+  });
+
+  it('GitHub alert 标题与 task-note 占位文案两边 locale 都能解析', () => {
+    for (const key of [...alertLabels, ...taskNoteKeys]) {
+      expect(translate('en', key)).toBe(key);
+      expect(zhTranslations[key]).toBeDefined();
+      expect(translate('zh', key)).toBe(zhTranslations[key]);
+    }
+  });
+});
+
+describe('秘书派活卡片文案', () => {
+  it('卡片上的每个状态与按钮都有中文译文', () => {
+    for (const key of [
+      'Dispatch',
+      'Confirm dispatch',
+      'Reject',
+      'Isolated worktree',
+      'Project checkout',
+      'Waiting for your confirmation',
+      'Creating the session…',
+      'Session created',
+      'Failed',
+      'Rejected',
+      'Expired',
+    ]) {
+      expect(getTranslation('en', key)).toBe(key);
+      expect(getTranslation('zh', key), key).not.toBe(key);
+    }
+  });
+});
+
+describe('秘书初次设置与设置页文案', () => {
+  it('欢迎页、档案表单、配置卡片与设置页的每个词条都有中文译文', () => {
+    for (const key of [
+      'The secretary is not part of any project. It watches your projects, dispatches sessions and reports results back. It never reads or writes code itself.',
+      'Set up with a form',
+      'One page: name, avatar, visible projects and patrol. Every field has a default.',
+      'Set up by chatting',
+      'The secretary asks a few questions and hands you a profile card to confirm.',
+      'Use all defaults and start',
+      'Could not start the secretary. Try again.',
+      'Avatar color',
+      'Visible projects',
+      'All projects',
+      'Selected projects',
+      'Running dispatches at most',
+      'Watch running sessions automatically',
+      'While anything is running the secretary checks it and only reports an anomaly: a goal session idle for 3 minutes with an unfinished goal and no live background task, idle for 20 minutes with a background task that never woke it, or running for 30 minutes without any event. Every hour it also reports background tasks left running in finished sessions; nothing is killed. Nothing is sent when all is well.',
+      'Patrol on',
+      'Patrol off',
+      'Clean up without asking',
+      "Off by default. When on, this secretary's cleanup deletes immediately, with no confirmation card: merged local branches and their worktrees. Sessions are only archived, never deleted. Unmerged branches, branches in use, feat/secretary-agent, main, the current branch and worktrees with uncommitted changes are still refused or skipped.",
+      'Cleanup without confirmation',
+      'Cleanup asks first',
+      'Up to {{n}} at a time',
+      'Concurrent dispatch limit',
+      'The most dispatched sessions the secretary may run at the same time. Once the limit is reached, new dispatches are refused.',
+      'Confirm',
+      'Edit here',
+      'Profile saved',
+      'Saving the profile…',
+      'Secretary profile',
+      'Name, avatar, visible projects and patrol.',
+      'Upload image',
+      'Remove image',
+      'The secretary has not been set up yet.',
+      'Style and interruptions',
+      'What it calls you, reply language, style and system notifications.',
+      'What to call you',
+      'Optional',
+      'Reply language',
+      'Follow the interface language',
+      'Chinese',
+      'English',
+      'Communication style',
+      'Concise',
+      'Detailed',
+      'System notifications',
+      'Only what needs you',
+      'Include finished work',
+      'Daily brief time',
+      'Persona',
+      'Scheduled tasks',
+      'Nothing scheduled',
+      'Daily brief, to-do reminders and one-off or recurring prompts.',
+      'Reset the secretary and start over',
+      'Sessions and dispatch history are kept either way.',
+      'Saved',
+      'Could not save the secretary profile. Try again.',
+      'Could not reset the secretary. Try again.',
+      'Also delete the secretary private memory',
+      'Secretary settings',
+    ]) {
+      expect(getTranslation('en', key)).toBe(key);
+      expect(getTranslation('zh', key), key).not.toBe(key);
+    }
+  });
+});

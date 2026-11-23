@@ -1,0 +1,30 @@
+{
+	"version": 1,
+	"mode": "app",
+	"input": {
+		"brief": "A conversation-first desktop workspace called 暮色. Users invite autonomous named Legends and large role-based agent collectives into a shared session. The dusk bridge and river from the project's origin story are the visual source, while the UI remains productive. The design will be reviewed before the application is implemented.",
+		"screens": [
+			"会话 · 桥边初会",
+			"邀请传奇与集群",
+			"名册 · 集群与传奇"
+		],
+		"keep": [],
+		"avoid": [],
+		"product": "desktop"
+	},
+	"seed": 852323881,
+	"at": "2026-11-19T02:02:27.005Z",
+	"options": [],
+	"choice": null,
+	"allow": [],
+	"redraws": [],
+	"intent": {
+		"stated": {
+			"emphasis": "会话是主场；传奇与集群可以进入同一个会话；首版从简；先设计原型再由用户确认",
+			"goAhead": true
+		},
+		"questions": [],
+		"answers": null
+	},
+	"proposals": []
+}

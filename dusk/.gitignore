@@ -1,0 +1,53 @@
+node_modules/
+out/
+dist/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.env
+.env.local
+.env.*.local
+.env.harbor
+coverage/
+*.pem
+thumbs.db
+dist*/
+build/cer.p12
+.omc/
+.worktrees
+.claude/
+.serena/
+
+# 设计文档不入库
+docs/plans/
+
+# Playwright MCP 输出
+.playwright-mcp/
+
+# zvec-grep 本地语义索引
+.zvec-grep/
+
+# 误配 store-dir 时落在仓库里的 pnpm 缓存
+.pnpm-store/
+
+# agent 与调查的 scratch 产物（约定：temp/<工作标识>/），不进版本库也不进门禁
+temp/
+.bce-tool/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# 下载并校验的 RTK 官方二进制（manifest / 许可文件保留）
+resources/rtk/*/rtk
+resources/rtk/*/rtk.exe
+resources/rtk/*/rtk.tmp-*
+
+# 本地开发用插件（不入库）
+local-plugins/
+*.tsbuildinfo

@@ -1,0 +1,765 @@
+export const IPC_CHANNELS = {
+  // 设置持久化
+  SETTINGS_READ: 'settings:read',
+  SETTINGS_WRITE: 'settings:write',
+  SETTINGS_WRITE_KEY: 'settings:write-key',
+  SETTINGS_CHANGED: 'settings:changed',
+  /** main → 主界面 renderer：其他主界面（远程浏览器/桌面）改动的会话元数据补丁 */
+  CONVERSATIONS_PATCH: 'conversations:patch',
+  /** 主界面 renderer 读整份会话记录，同时重置自己的会话账本 */
+  CONVERSATIONS_READ: 'conversations:read',
+  /** 用户明确删除这些会话：Main 按 id 删行并推补丁，不经写回的整表删除守卫 */
+  CONVERSATIONS_REMOVE: 'conversations:remove',
+  /** 主界面新建根会话：Main 按权威登记这一行并立即推给其它主界面，不等整表写回 */
+  CONVERSATIONS_REGISTER: 'conversations:register',
+  /** 把会话改挂到另一个项目：改权威 projectId，并补丁 persist 行 */
+  CONVERSATIONS_MOVE: 'conversations:move',
+  CONVERSATIONS_IMPORT_PROJECT: 'conversations:import-project',
+  /** 整项目导入前的预览：源目录是否还在、已复制过几次 */
+  CONVERSATIONS_IMPORT_PROJECT_PREVIEW: 'conversations:import-project-preview',
+  /** 只把已无会话的项目移出列表，不删任何文件 */
+  PROJECT_REMOVE_EMPTY: 'projects:remove-empty',
+  /** main → 主界面 renderer：它的会话写回被拒收，需重新读会话 */
+  CONVERSATIONS_RESYNC: 'conversations:resync',
+  /** 秘书：工作台与聊天卡片读的同一份 Main 状态 */
+  SECRETARY_GET_STATE: 'secretary:get-state',
+  /** main → 主界面 renderer：秘书状态变化 */
+  SECRETARY_STATE_CHANGED: 'secretary:state-changed',
+  /** 秘书：确认或拒绝提案 */
+  SECRETARY_RESOLVE_PROPOSAL: 'secretary:resolve-proposal',
+  /** 秘书：用户把会话点名叫给秘书 */
+  SECRETARY_REFERENCE_CONVERSATIONS: 'secretary:reference-conversations',
+  /** 秘书：界面编辑、删除、派出待办 */
+  SECRETARY_TODO_MUTATE: 'secretary:todo-mutate',
+  /** 秘书：用户点过工作台结果卡的「知道了」，这条结果不再占需要你处理 */
+  SECRETARY_DISMISS_RESULT: 'secretary:dismiss-result',
+  /** 秘书：用户手动把一条派发记录标记完成，或撤销这个标记放回进行中 */
+  SECRETARY_MARK_RESULT: 'secretary:mark-result',
+  /** 秘书：停掉一条派发记录里遗留的后台任务（常驻服务、卡死的命令） */
+  SECRETARY_STOP_TASKS: 'secretary:stop-tasks',
+  /** 秘书：派出会话的目标由 Main 续跑，界面只发指令 */
+  SECRETARY_GOAL_ACTION: 'secretary:goal-action',
+  /** 秘书：全部定时（含系统生成的每日简报与待办提醒） */
+  SECRETARY_SCHEDULES_LIST: 'secretary:schedules-list',
+  /** 秘书：删除一条定时；系统生成的条目由档案与待办派生，不接受删除 */
+  SECRETARY_SCHEDULE_REMOVE: 'secretary:schedule-remove',
+  /** 秘书：读档案与人设；profile 为 null 表示还没完成初次设置 */
+  SECRETARY_GET_PROFILE: 'secretary:get-profile',
+  /** 秘书：表单写入档案（部分字段合并），越界取值当场拒绝 */
+  SECRETARY_SAVE_PROFILE: 'secretary:save-profile',
+  /** 秘书：重新设置，可选清空私有记忆 */
+  SECRETARY_RESET_PROFILE: 'secretary:reset-profile',
+  /** 秘书：头像图片由 Main 落盘，renderer 只传字节或 null */
+  SECRETARY_SET_AVATAR: 'secretary:set-avatar',
+  /** 秘书：列出秘书可用的 skill（自有 + 勾选的全局），设置页与右侧面板共用 */
+  SECRETARY_SKILLS_LIST: 'secretary:skills-list',
+  /** 秘书：删除一个自有 skill，renderer 只传 slug */
+  SECRETARY_SKILL_DELETE: 'secretary:skill-delete',
+  /** 秘书：启用或停用一个 skill（自有写档案，全局改勾选） */
+  SECRETARY_SKILL_SET_ENABLED: 'secretary:skill-set-enabled',
+  /** 秘书：读一个 skill 的 SKILL.md 正文，只给用户看 */
+  SECRETARY_SKILL_READ: 'secretary:skill-read',
+  /** 秘书：列出秘书自造的工具（含代码），设置页展开查看 */
+  SECRETARY_TOOLS_LIST: 'secretary:tools-list',
+  /** 秘书：删除一个自造工具，renderer 只传 slug */
+  SECRETARY_TOOL_DELETE: 'secretary:tool-delete',
+  /** 秘书：撤销接管（会话界面或设置页） */
+  SECRETARY_TAKEOVER_REVOKE: 'secretary:takeover-revoke',
+  /** 秘书：列出交给秘书接管的会话，设置页用 */
+  SECRETARY_TAKEOVERS_LIST: 'secretary:takeovers-list',
+  /** 秘书：列出用户收回跟踪后不再由范围权限覆盖的会话，设置页用 */
+  SECRETARY_UNTRACKED_LIST: 'secretary:untracked-list',
+  /** 秘书：把会话从「不再跟踪」名单里移除，renderer 只传会话 id */
+  SECRETARY_UNTRACKED_REMOVE: 'secretary:untracked-remove',
+  /** 秘书：动态按时间游标分页，renderer 不拿全量再切片 */
+  SECRETARY_FEED: 'secretary:feed',
+  /** 秘书：按天汇总的看板（日报），入参是日期，缺省今天 */
+  SECRETARY_DAILY: 'secretary:daily',
+  SECRETARY_DONE_REPORT: 'secretary:done-report',
+  /** 秘书联系方式：读绑定状态（不含 token） */
+  SECRETARY_CONTACT_STATE: 'secretary:contact-state',
+  /** main → 主界面 renderer：联系方式状态变化 */
+  SECRETARY_CONTACT_CHANGED: 'secretary:contact-changed',
+  /** 秘书联系方式：校验 token 并生成一次性绑定码；只带码时重新生成 */
+  SECRETARY_CONTACT_BIND: 'secretary:contact-bind',
+  /** 秘书联系方式：退出绑定向导 */
+  SECRETARY_CONTACT_CANCEL: 'secretary:contact-cancel',
+  /** 秘书联系方式：解绑（清 chat，停轮询，保留 bot 与 token） */
+  SECRETARY_CONTACT_UNBIND: 'secretary:contact-unbind',
+  /** 秘书联系方式：更换 bot（token 一起清） */
+  SECRETARY_CONTACT_FORGET_BOT: 'secretary:contact-forget-bot',
+  /** 秘书联系方式：发一条测试消息 */
+  SECRETARY_CONTACT_TEST: 'secretary:contact-test',
+  /** 秘书联系方式：扩权开关 */
+  SECRETARY_CONTACT_SETTINGS: 'secretary:contact-settings',
+  /** 秘书联系方式：手机关注的任务，取消一项或全清 */
+  SECRETARY_CONTACT_FOLLOWING: 'secretary:contact-following',
+  /** 秘书联系方式：拉一个 Telegram 群的论坛话题给设置页勾选 */
+  SECRETARY_CONTACT_TELEGRAM_TOPICS: 'secretary:contact-telegram-topics',
+  /** 秘书清单：侧栏、设置页与新建流程用 */
+  SECRETARY_LIST: 'secretary:list',
+  /** main → renderer：秘书清单变化（新建、删除、改名、换头像） */
+  SECRETARY_LIST_CHANGED: 'secretary:list-changed',
+  /** 新建一个秘书：只建目录与隐藏项目，档案走欢迎页 */
+  SECRETARY_CREATE: 'secretary:create',
+  /** 删除秘书前的提醒：列出它在管的会话、待办、定时、联系方式与记忆 */
+  SECRETARY_DELETE_PREVIEW: 'secretary:delete-preview',
+  /** 删除秘书：必须带二次确认标记 */
+  SECRETARY_DELETE: 'secretary:delete',
+  /** 把一个会话从管理它的秘书转交给另一个秘书 */
+  SECRETARY_TRANSFER: 'secretary:transfer',
+  /** 总看板：每个秘书一份看板，renderer 合并与筛选 */
+  SECRETARY_OVERVIEW: 'secretary:overview',
+  /** main → 主界面 renderer：深链 enso://secretary 要求选中某个会话，可再定位到某张确认卡 */
+  SECRETARY_OPEN_CONVERSATION: 'secretary:open-conversation',
+  /** 远程桌面：leader 变化推送 / 浏览器上传文件落到宿主临时目录 */
+  REMOTE_LEADER_CHANGED: 'remote:leader-changed',
+  REMOTE_UPLOAD: 'remote:upload',
+
+  // 可迁移配置同步
+  CONFIG_SYNC_EXPORT: 'config-sync:export',
+  CONFIG_SYNC_OPEN_IMPORT: 'config-sync:open-import',
+  CONFIG_SYNC_PREVIEW_IMPORT: 'config-sync:preview-import',
+  CONFIG_SYNC_COMMIT_IMPORT: 'config-sync:commit-import',
+  CONFIG_SYNC_CANCEL_IMPORT: 'config-sync:cancel-import',
+
+  // 窗口控制
+  WINDOW_MINIMIZE: 'window:minimize',
+  WINDOW_MAXIMIZE: 'window:maximize',
+  WINDOW_CLOSE: 'window:close',
+  WINDOW_IS_MAXIMIZED: 'window:is-maximized',
+  WINDOW_IS_FULLSCREEN: 'window:is-fullscreen',
+  WINDOW_SET_TITLE_BAR_APPEARANCE: 'window:set-title-bar-appearance',
+  WINDOW_MAXIMIZED_CHANGED: 'window:maximized-changed',
+  WINDOW_FULLSCREEN_CHANGED: 'window:fullscreen-changed',
+  WINDOW_SET_TRAFFIC_LIGHTS_VISIBLE: 'window:set-traffic-lights-visible',
+  /** renderer → main：macOS 布局变化后重算窗口形状与拖拽命中区 */
+  WINDOW_REFRESH_DRAG_REGIONS: 'window:refresh-drag-regions',
+  WINDOW_OPEN_SETTINGS: 'window:open-settings',
+  /** main → 主界面 renderer：macOS View 菜单要求切换侧栏（与渲染层快捷键同一条逻辑） */
+  WINDOW_TOGGLE_SIDEBAR: 'window:toggle-sidebar',
+  /** main → settings renderer：打开后切分类并闪行 */
+  SETTINGS_DEEP_LINK: 'settings:deep-link',
+  SETTINGS_DEEP_LINK_CONSUME: 'settings:deep-link-consume',
+  WINDOW_POPUP_MENU: 'window:popup-menu',
+  WINDOW_TAKE_OPEN_FOLDERS: 'window:takeOpenFolders',
+  WINDOW_OPEN_FOLDER_REQUESTED: 'window:openFolderRequested',
+  WINDOW_INSTALL_SHELL_INTEGRATION: 'window:installShellIntegration',
+  WINDOW_SHELL_INTEGRATION_STATUS: 'window:shellIntegrationStatus',
+  APP_CLOSE_REQUEST: 'app:close-request',
+  APP_CLOSE_RESPONSE: 'app:close-response',
+  APP_FLUSH_PERSIST_REQUEST: 'app:flush-persist-request',
+  APP_FLUSH_PERSIST_RESPONSE: 'app:flush-persist-response',
+  /**
+   * main → 主窗口：弹层状态 RestartOverlayState（重启 / 安装更新 / 退出在等命令结束、正在重启、
+   * 新实例恢复会话），null 关
+   */
+  APP_RESTART_WAITING: 'app:restart-waiting',
+  /** 主窗口挂载时取当前重启弹层状态（启动时推送可能早于订阅）；只回本机主窗口 */
+  APP_RESTART_WAITING_GET: 'app:restart-waiting-get',
+  /** 主窗口 → main：等待弹层上点「强制退出」 */
+  APP_RESTART_FORCE: 'app:restart-force',
+  APP_SET_BADGE_COUNT: 'app:set-badge-count',
+
+  // 拖放浮窗（实验，macOS）：浮窗 ⇄ Main ⇄ 主窗口
+  DROP_SHELF_STATE: 'drop-shelf:state',
+  DROP_SHELF_DROP: 'drop-shelf:drop',
+  DROP_SHELF_PENDING: 'drop-shelf:pending',
+  DROP_SHELF_TAKE: 'drop-shelf:take',
+
+  // 本地供应商扫描/导入
+  PROVIDERS_SCAN_LOCAL: 'providers:scan-local',
+  PROVIDERS_COLLECT_IMPORT: 'providers:collect-import',
+  PROVIDERS_LIST_MODELS: 'providers:list-models',
+  PROVIDERS_TEST: 'providers:test',
+  PROVIDERS_MODEL_META: 'providers:model-meta',
+  PROVIDERS_REFRESH_MODEL_CATALOG: 'providers:refresh-model-catalog',
+  PROVIDERS_CLASSIFIER_MODELS: 'providers:classifier-models',
+  /** Main 合成的统一模型目录快照（Renderer 订阅，不落 settings.json） */
+  MODEL_DIRECTORY_GET: 'modelDirectory:get',
+  MODEL_DIRECTORY_CHANGED: 'modelDirectory:changed',
+
+  // 本地 token 用量统计
+  USAGE_SUMMARY: 'usage:summary',
+
+  // 隐私脱敏记录（只读，不含原值）
+  PRIVACY_MASK_RECORDS: 'privacy-mask:records',
+
+  // bash 提权口令：只对桌面主窗口与完整模式主界面开放
+  ELEVATION_PENDING: 'elevation:pending',
+  ELEVATION_ANSWER: 'elevation:answer',
+  ELEVATION_CHANGED: 'elevation:changed',
+
+  // 资源监控
+  RESOURCES_SAMPLE: 'resources:sample',
+  RESOURCES_STORAGE_SCAN: 'resources:storage-scan',
+  RESOURCES_STORAGE_CLEAN: 'resources:storage-clean',
+  RESOURCES_STORAGE_REVEAL: 'resources:storage-reveal',
+  RESOURCES_STORAGE_CANCEL: 'resources:storage-cancel',
+  RESOURCES_STORAGE_LAST: 'resources:storage-last',
+  RESOURCES_STORAGE_PROGRESS: 'resources:storage-progress',
+  RESOURCES_SESSIONS_CLEAN: 'resources:sessions-clean',
+  RESOURCES_SESSIONS_CLEAN_REQUEST: 'resources:sessions-clean-request',
+  RESOURCES_SESSIONS_CLEAN_DONE: 'resources:sessions-clean-done',
+
+  // 记忆管理
+  MEMORY_LIST: 'memory:list',
+  MEMORY_DETAIL: 'memory:detail',
+  MEMORY_ARCHIVE: 'memory:archive',
+  MEMORY_RESTORE: 'memory:restore',
+  MEMORY_FORGETTING_RUN: 'memory:forgetting-run',
+  MEMORY_RECONCILE_RUN: 'memory:reconcile-run',
+  MEMORY_ARCHIVE_CANDIDATES: 'memory:archive-candidates',
+  MEMORY_ARCHIVE_CANDIDATES_CONFIRM: 'memory:archive-candidates-confirm',
+  MEMORY_DELETE: 'memory:delete',
+  MEMORY_DELETE_PREVIEW: 'memory:delete-preview',
+  MEMORY_UPDATE: 'memory:update',
+  MEMORY_STATS: 'memory:stats',
+  MEMORY_JOBS: 'memory:jobs',
+  MEMORY_JOBS_CLEAR: 'memory:jobs-clear',
+  MEMORY_KG_RETRY_FAILED: 'memory:kg-retry-failed',
+  MEMORY_EVOLVES_PENDING: 'memory:evolves-pending',
+  MEMORY_EVOLVES_REVIEW: 'memory:evolves-review',
+  MEMORY_PENDING_WRITES: 'memory:pending-writes',
+  MEMORY_PENDING_WRITE_REVIEW: 'memory:pending-write-review',
+  MEMORY_MODELS: 'memory:models',
+  MEMORY_MODEL_DOWNLOAD: 'memory:model-download',
+  MEMORY_MODEL_CANCEL: 'memory:model-cancel',
+  MEMORY_MODEL_DELETE: 'memory:model-delete',
+  MEMORY_MODEL_PROGRESS: 'memory:model-progress',
+  MEMORY_CHAT_MODELS: 'memory:chat-models',
+  MEMORY_CHAT_MODEL_DOWNLOAD: 'memory:chat-model-download',
+  MEMORY_CHAT_MODEL_CANCEL: 'memory:chat-model-cancel',
+  MEMORY_CHAT_MODEL_DELETE: 'memory:chat-model-delete',
+  MEMORY_CHAT_MODEL_PROGRESS: 'memory:chat-model-progress',
+  DCG_STATUS: 'dcg:status',
+  DCG_INSTALL: 'dcg:install',
+  DCG_UNINSTALL: 'dcg:uninstall',
+  MEMORY_REEMBED: 'memory:reembed',
+  MEMORY_CHANGED: 'memory:changed',
+  MEMORY_GRAPH: 'memory:graph',
+  MEMORY_GRAPH_ENTITY: 'memory:graph-entity',
+  MEMORY_TREE: 'memory:tree',
+  MEMORY_INSIGHT: 'memory:insight',
+  MEMORY_CRYSTALLIZE: 'memory:crystallize',
+  MEMORY_DISTILLABLE_SESSIONS: 'memory:distillable-sessions',
+  MEMORY_DISTILL_SESSION: 'memory:distill-session',
+
+  // OAuth 订阅供应商（pi 内置）
+  OAUTH_PROVIDERS_LIST: 'oauth-providers:list',
+  OAUTH_LOGIN: 'oauth-providers:login',
+  OAUTH_LOGIN_RESPOND: 'oauth-providers:login-respond',
+  OAUTH_LOGIN_CANCEL: 'oauth-providers:login-cancel',
+  OAUTH_LOGIN_REOPEN: 'oauth-providers:login-reopen',
+  OAUTH_LOGOUT: 'oauth-providers:logout',
+  OAUTH_IMPORT_CODEX: 'oauth-providers:import-codex',
+  OAUTH_LOGIN_EVENT: 'oauth-providers:login-event',
+  OAUTH_ACCOUNT_INFO: 'oauth-providers:account-info',
+  OAUTH_CREDENTIAL_KEYS_LIST: 'oauth:credential-keys-list',
+  OAUTH_CREDENTIALS_CHANGED: 'oauth:credentials-changed',
+
+  // 本地 skill / MCP 扫描/导入
+  ASSETS_SCAN_LOCAL: 'assets:scan-local',
+  ASSETS_COLLECT_IMPORT: 'assets:collect-import',
+  ASSETS_LIST_PROJECT_SKILLS: 'assets:list-project-skills',
+  ASSETS_LIST_WORKFLOW_PRESETS: 'assets:list-workflow-presets',
+  ASSETS_SKILL_OCCUPANCY: 'assets:skill-occupancy',
+  ASSETS_INSTRUCTION_OCCUPANCY: 'assets:instruction-occupancy',
+  ASSETS_MCP_OCCUPANCY: 'assets:mcp-occupancy',
+  ASSETS_BUILTIN_TOOL_OCCUPANCY: 'assets:builtin-tool-occupancy',
+  /** Claude Code 已装插件及其组件摘要 */
+
+  // MCP OAuth 授权与连接状态
+  MCP_AUTHORIZE: 'mcp:authorize',
+  MCP_REVOKE: 'mcp:revoke',
+  MCP_AUTH_STATE: 'mcp:auth-state',
+  MCP_STATUS_EVENT: 'mcp:status-event',
+  MCP_STATUS_SNAPSHOT: 'mcp:status-snapshot',
+
+  // 指令内容（写时复制）
+  INSTRUCTIONS_READ: 'instructions:read',
+  INSTRUCTIONS_WRITE: 'instructions:write',
+  INSTRUCTIONS_WRITE_SOURCE: 'instructions:write-source',
+  INSTRUCTIONS_DELETE: 'instructions:delete',
+  // 由设置管理的工作流预设（userData/agent/workflows）
+  WORKFLOW_PRESETS_LIST: 'workflow-presets:list',
+  WORKFLOW_PRESETS_READ: 'workflow-presets:read',
+  WORKFLOW_PRESETS_SAVE: 'workflow-presets:save',
+  WORKFLOW_PRESETS_DELETE: 'workflow-presets:delete',
+
+  // 预设的自定义系统提示词内容（以 UUID 命名的外部文件）
+  PRESETS_SYSTEM_PROMPT_READ: 'presets:system-prompt-read',
+  PRESETS_SYSTEM_PROMPT_WRITE: 'presets:system-prompt-write',
+
+  PRESETS_FETCH_IMPORT: 'presets:fetch-import',
+
+  // Agent 会话（Renderer → Main → utilityProcess）
+  AGENT_SPAWN: 'agent:spawn',
+  AGENT_PROMPT: 'agent:prompt',
+  AGENT_STEER: 'agent:steer',
+  AGENT_WITHDRAW_STEER: 'agent:withdraw-steer',
+  AGENT_ABORT: 'agent:abort',
+  AGENT_ABORT_RETRY: 'agent:abort-retry',
+  AGENT_RETRY: 'agent:retry',
+  AGENT_EVENT: 'agent:event',
+  AGENT_SNAPSHOT: 'agent:snapshot',
+  /** 取走上次应用退出时被打断的回合（取一次即清空） */
+  AGENT_TAKE_INTERRUPTED_TURNS: 'agent:take-interrupted-turns',
+  /** 已结束 child 的 safe journal 只读回放（路径由 Main 推导，请求只带 conversationId） */
+  AGENT_CHILD_HISTORY_READ: 'agent:child-history-read',
+  /** 父会话的子运行目录（只回摘要，不回路径） */
+  AGENT_CHILD_RUNS_LIST: 'agent:child-runs-list',
+  /** 子运行只读回放。pi jsonl 分页，safe journal 整页投影。路径由 Main 从目录推导 */
+  AGENT_CHILD_RUN_READ: 'agent:child-run-read',
+  /** 手动「重新读取会话」：Main 选来源（worker 活快照 / safe journal），只读不 spawn */
+  AGENT_CONVERSATION_RELOAD: 'agent:conversation-reload',
+  /** 父会话 jsonl 尾窗/分页只读（不 spawn）；路径由 Main 从已登记 sessionFile 推导 */
+  AGENT_PARENT_HISTORY_TAIL: 'agent:parent-history-tail',
+  AGENT_SUMMARIZE_TITLE: 'agent:summarize-title',
+  /** 已启动会话就地换模型；worker 换完回报，Main 据此更新已启动模型记录 */
+  AGENT_SET_MODEL: 'agent:set-model',
+  AGENT_SET_THINKING: 'agent:set-thinking',
+  AGENT_SET_REASONING: 'agent:set-reasoning',
+  AGENT_APPROVAL_RESPOND: 'agent:approval-respond',
+  AGENT_SET_APPROVAL_MODE: 'agent:set-approval-mode',
+  AGENT_SET_PLAN_MODE: 'agent:set-plan-mode',
+  AGENT_PLAN_RESPOND: 'agent:plan-respond',
+  NOTIFICATION_FOCUS_SESSION: 'notification:focus-session',
+  /** renderer → main：上报当前正在查看的会话，供系统通知抑制判断 */
+  NOTIFICATION_ACTIVE_SESSION: 'notification:active-session',
+  /** 宿主 main → 远程主界面：系统通知内容，由界面所在电脑（远程节点 guest 的 main）弹出 */
+  NOTIFICATION_SHOW: 'notification:show',
+  /** renderer → main：会话静音立即生效（落盘前也不推送）。走 agent: 前缀，远端界面可以同步 */
+  AGENT_SESSION_MUTED: 'agent:session-muted',
+  AGENT_TASK_STOP: 'agent:task-stop',
+  AGENT_TASK_KEEP: 'agent:task-keep',
+  /** 把运行中的前台命令移交为后台任务 */
+  AGENT_TOOL_BACKGROUND: 'agent:tool-background',
+  /** 会话名下在跑子代理的进度（等待行展开） */
+  AGENT_SUBAGENT_PROGRESS: 'agent:subagent-progress',
+  /** Main → renderer：子代理进度全量快照推送（REPLACE 语义，payload 自带 sessionId） */
+  AGENT_SUBAGENT_PROGRESS_CHANGED: 'agent:subagent-progress-changed',
+  AGENT_SUBAGENT_STOP: 'agent:subagent-stop',
+  AGENT_WORKFLOW_STOP: 'agent:workflow-stop',
+  AGENT_REWIND: 'agent:rewind',
+  /** 手动压缩会话上下文（/compact 与上下文面板按钮共用） */
+  AGENT_COMPACT: 'agent:compact',
+  AGENT_FORK: 'agent:fork',
+  AGENT_DISMISS_COWORKER: 'agent:dismiss-coworker',
+  AGENT_HIRE_COWORKER: 'agent:hire-coworker',
+  AGENT_ASK_RESPOND: 'agent:ask-respond',
+  AGENT_RELEASE: 'agent:release',
+
+  WORKTREE_CREATE: 'worktree:create',
+  WORKTREE_BIND: 'worktree:bind',
+  WORKTREE_BRANCHES: 'worktree:branches',
+  WORKTREE_SWITCH_BRANCH: 'worktree:switch-branch',
+  WORKTREE_RENAME: 'worktree:rename',
+  WORKTREE_GET: 'worktree:get',
+  WORKTREE_LIST: 'worktree:list',
+  WORKTREE_STATUS: 'worktree:status',
+  WORKTREE_REMOVE: 'worktree:remove',
+  WORKTREE_REBUILD: 'worktree:rebuild',
+  WORKTREE_REPO_CLEAN: 'worktree:repo-clean',
+
+  // Agent 类型注册表 + 绑定 sender 的确定性 child 派发
+  AGENT_TYPES_REGISTRY_LIST: 'agent-types:registry-list',
+  AGENT_MODEL_SELECTION_REGISTER: 'agent-dispatch:model-selection-register',
+  AGENT_DISPATCH_BIND_SOURCE: 'agent-dispatch:bind-source',
+  AGENT_DISPATCH: 'agent-dispatch:dispatch',
+  AGENT_DISPATCH_EVENT: 'agent-dispatch:event',
+
+  // Main 持有的项目/会话权威记录（通用 settings 只是投影）
+  SOURCE_AUTHORITY_READ: 'source-authority:read',
+  SOURCE_AUTHORITY_CHANGED: 'source-authority:changed',
+  SOURCE_PROJECT_CREATE: 'source-authority:project-create',
+  SOURCE_PROJECT_SELECT: 'source-authority:project-select',
+  SOURCE_PROJECT_REMOVE: 'source-authority:project-remove',
+  SOURCE_CONVERSATION_CREATE: 'source-authority:conversation-create',
+  SOURCE_CONVERSATION_SELECT: 'source-authority:conversation-select',
+  SOURCE_CONVERSATION_END: 'source-authority:conversation-end',
+  SOURCE_CONVERSATION_REMOVE: 'source-authority:conversation-remove',
+  SOURCE_CONVERSATION_UPDATE_SELECTION: 'source-authority:conversation-update-selection',
+
+  // 原生对话框
+  DIALOG_SELECT_DIRECTORY: 'dialog:select-directory',
+  DIALOG_SELECT_FILE: 'dialog:select-file',
+
+  // 来自本地应用的最近项目
+  PROJECTS_GET_RECENT: 'projects:get-recent',
+  /** 列出宿主机某目录的子目录（远端客户端没有系统目录选择框，用它浏览添加项目） */
+  PROJECTS_LIST_HOST_DIRS: 'projects:list-host-dirs',
+  /** 在宿主机目录下新建子文件夹（添加项目的目录浏览里用） */
+  PROJECTS_CREATE_HOST_DIR: 'projects:create-host-dir',
+  /** 在系统文件管理器或指定 appId 的应用里打开项目根目录或会话 worktree（仅本地项目） */
+  PROJECTS_REVEAL: 'projects:reveal',
+  PROJECTS_CODE_SOURCES: 'projects:code-sources',
+  /** 列出本机已安装、可打开项目目录的编辑器 / 终端 */
+  PROJECTS_OPEN_IN_APPS: 'projects:open-in-apps',
+
+  // SSH 连接配置（设置页 + 添加项目选择器）
+  SSH_CONNECTIONS_LIST: 'ssh-connections:list',
+  SSH_CONNECTIONS_UPSERT: 'ssh-connections:upsert',
+  SSH_CONNECTIONS_DELETE: 'ssh-connections:delete',
+  SSH_CONNECTIONS_TEST: 'ssh-connections:test',
+  SSH_CONNECTIONS_LIST_DIRS: 'ssh-connections:list-dirs',
+  SSH_CONNECTIONS_TRUST_HOST: 'ssh-connections:trust-host',
+
+  // 文件搜索（@ 提及）
+  FILES_SEARCH: 'files:search',
+  FILES_READ: 'files:read',
+  // 目录媒体文件枚举（背景图文件夹随机模式）
+  FILES_LIST_MEDIA: 'files:list-media',
+  FILES_SAVE_PASTED_TEXT: 'files:save-pasted-text',
+  FILES_LIST_DIR: 'files:list-dir',
+  FILES_READ_REL: 'files:read-rel',
+  /** Markdown 预览相对图片：返回 data URL，不开放任意文件读取 */
+  FILES_READ_IMAGE: 'files:read-image',
+  /** Markdown 预览远程图片：主进程带 SSRF 防护代理读取，返回 data URL */
+  FILES_FETCH_REMOTE_IMAGE: 'files:fetch-remote-image',
+  FILES_WRITE: 'files:write',
+  FILES_WATCH_START: 'files:watch-start',
+  FILES_WATCH_STOP: 'files:watch-stop',
+  FILES_WATCH_EVENT: 'files:watch-event',
+  FILES_MKDIR: 'files:mkdir',
+  FILES_CREATE: 'files:create-file',
+  FILES_RENAME: 'files:rename',
+  FILES_REMOVE: 'files:remove',
+  FILES_ABS: 'files:abs-path',
+  FILES_COPY_PATH: 'files:copy-path',
+  FILES_COPY_FILE: 'files:copy-file',
+  FILES_REVEAL: 'files:reveal',
+  FILES_REVEAL_EXTERNAL: 'files:reveal-external',
+  FILES_OPEN: 'files:open',
+  FILES_OPEN_CONTEXT: 'files:open-context',
+  FILES_SEARCH_WORKSPACE: 'files:search-workspace',
+  FILES_RESOLVE_LINKS: 'files:resolve-links',
+
+  GIT_DIFF_HEAD: 'git:diff-head',
+  GIT_STATUS: 'git:status',
+  GIT_FILE_DIFF: 'git:file-diff',
+  GIT_HISTORY: 'git:history',
+  GIT_COMMIT_FILES: 'git:commit-files',
+  GIT_COMMIT_DIFF: 'git:commit-diff',
+  GIT_STAGE: 'git:stage',
+  GIT_UNSTAGE: 'git:unstage',
+  GIT_DISCARD: 'git:discard',
+  GIT_COMMIT: 'git:commit',
+  GIT_FETCH: 'git:fetch',
+  GIT_PULL: 'git:pull',
+  GIT_PUSH: 'git:push',
+
+  // Changes 面板「Session」模式的编辑前快照（主进程按会话落盘）
+  CHANGES_SNAPSHOTS_READ: 'changes:snapshots-read',
+  CHANGES_SNAPSHOTS_WRITE: 'changes:snapshots-write',
+
+  // 外部会话导入
+  SESSIONS_SCAN_EXTERNAL: 'sessions:scan-external',
+  SESSIONS_READ_EXTERNAL: 'sessions:read-external',
+  SESSIONS_IMPORT_EXTERNAL: 'sessions:import-external',
+
+  // 右侧面板终端(node-pty)
+  TERMINAL_CREATE: 'terminal:create',
+  TERMINAL_WRITE: 'terminal:write',
+  TERMINAL_RESIZE: 'terminal:resize',
+  TERMINAL_DISPOSE: 'terminal:dispose',
+  /** main → renderer:pty 输出 */
+  TERMINAL_DATA: 'terminal:data',
+  /** main → renderer:pty 退出 */
+  TERMINAL_EXIT: 'terminal:exit',
+
+  // 右侧面板内嵌浏览器(WebContentsView 叠层)
+  BROWSER_SET_VIEWPORT: 'browser:set-viewport',
+  /** 渲染层有模态浮层时，guest 立刻沉到 workbench 之下（避免弹窗被网页挡一帧） */
+  BROWSER_SET_OVERLAY_ACTIVE: 'browser:set-overlay-active',
+  BROWSER_NAVIGATE: 'browser:navigate',
+  BROWSER_GO_BACK: 'browser:go-back',
+  BROWSER_GO_FORWARD: 'browser:go-forward',
+  BROWSER_RELOAD: 'browser:reload',
+  BROWSER_CLEAR_DATA: 'browser:clear-data',
+  BROWSER_SET_LOCKED: 'browser:set-locked',
+  /** main → renderer:当前 tab 状态 */
+  BROWSER_STATE: 'browser:state',
+  /** main → renderer:agent 已打开页，请建 Browser 面板 */
+  BROWSER_REVEAL: 'browser:reveal',
+  BROWSER_RESTORE_TABS: 'browser:restore-tabs',
+  BROWSER_LIST_SEARCHABLE_TABS: 'browser:list-searchable-tabs',
+  BROWSER_CLOSE_TAB: 'browser:close-tab',
+  BROWSER_CLOSE_SESSION: 'browser:close-session',
+  /** renderer → main:开关面板内嵌 DevTools */
+  BROWSER_SET_DEVTOOLS: 'browser:set-devtools',
+  /** renderer → main:DevTools 洞矩形 */
+  BROWSER_SET_DEVTOOLS_VIEWPORT: 'browser:set-devtools-viewport',
+  /** main → renderer:agent 关了页，拆掉 dock tab */
+  BROWSER_TAB_CLOSED: 'browser:tab-closed',
+  /** renderer → main:开关 Design Mode */
+  BROWSER_SET_DESIGN_MODE: 'browser:set-design-mode',
+  /** main → renderer:圈选结果 / 取消 */
+  BROWSER_DESIGN_MODE_EVENT: 'browser:design-mode-event',
+  /** renderer → main:读取当前选中元素/选区的完整快照与裁剪图 */
+  BROWSER_DESCRIBE_SELECTION: 'browser:describe-selection',
+  /** renderer → main:在 DOM 树中移动当前选中元素（parent/child/next/previous） */
+  BROWSER_MOVE_SELECTION: 'browser:move-selection',
+  /** renderer → main:清空当前页内选中框并恢复悬停拾取 */
+  BROWSER_CLEAR_SELECTION: 'browser:clear-selection',
+  /** renderer → main:同步当前页面的编号标注 Pin */
+  BROWSER_SET_ANNOTATION_PINS: 'browser:set-annotation-pins',
+  /** renderer → main:在页内打开或关闭指定编号 Pin（可选滚动定位） */
+  BROWSER_OPEN_ANNOTATION_PIN: 'browser:open-annotation-pin',
+  /** renderer → main:通过 CDP + 页内脚本读取选中元素的 27 项 CSS 与页面变量 */
+  BROWSER_READ_DESIGN_CSS: 'browser:read-design-css',
+  /** renderer → main:实时预览 queue / draft 槽位的 CSS 修改 */
+  BROWSER_PREVIEW_DESIGN_CSS: 'browser:preview-design-css',
+
+  // 自动更新
+  COMPUTER_CAPABILITIES: 'computer:capabilities',
+  COMPUTER_OPEN_PERMISSIONS: 'computer:open-permissions',
+  // computer 按 app 授权名单（只读列出 / 撤销）
+  COMPUTER_ALLOWED_APPS: 'computer:allowed-apps',
+  COMPUTER_REVOKE_APP: 'computer:revoke-app',
+  UPDATER_CHECK: 'updater:check',
+  UPDATER_DOWNLOAD_UPDATE: 'updater:downloadUpdate',
+  UPDATER_QUIT_AND_INSTALL: 'updater:quitAndInstall',
+  UPDATER_SET_AUTO_UPDATE_ENABLED: 'updater:setAutoUpdateEnabled',
+  UPDATER_SET_AUTO_RESTART_MODE: 'updater:setAutoRestartMode',
+  UPDATER_SET_CHANNEL: 'updater:setChannel',
+  /** renderer → Main：输入框里有没有重启后会丢的未发送草稿（不等空闲的自动重启据此先等） */
+  COMPOSER_UNSENT_DRAFT: 'composer:unsent-draft',
+  UPDATER_STATUS: 'updater:status',
+  UPDATER_GET_STATE: 'updater:getState',
+  UPDATER_RESTART: 'updater:restart',
+
+  // 网络代理
+  PROXY_APPLY: 'proxy:apply',
+
+  // 自定义 CA 证书（NODE_EXTRA_CA_CERTS）
+  CA_CERT_STATUS: 'ca-cert:status',
+  CA_CERT_APPLY: 'ca-cert:apply',
+
+  // userData/user.css：读取、首次写模板并用系统程序打开、文件变化广播
+  APPEARANCE_USER_CSS_GET: 'appearance:user-css:get',
+  APPEARANCE_USER_CSS_OPEN: 'appearance:user-css:open',
+  APPEARANCE_USER_CSS_CHANGED: 'appearance:user-css:changed',
+
+  // pi 全局 settings.json 的 compaction.reserveTokens
+  COMPACTION_RESERVE_TOKENS_GET: 'compaction:reserve-tokens-get',
+  COMPACTION_RESERVE_TOKENS_SET: 'compaction:reserve-tokens-set',
+
+  // 手机副屏（配对 + 中继）
+  PAIR_START: 'pair:start',
+  PAIR_CANCEL: 'pair:cancel',
+  PAIR_REVOKE: 'pair:revoke',
+  PAIR_RENAME: 'pair:rename',
+  PAIR_SET_SCOPE: 'pair:set-scope',
+  PAIR_STATUS: 'pair:status',
+  PAIR_SET_RELAY: 'pair:set-relay',
+  PAIR_CATALOG: 'pair:catalog',
+  PAIR_STATUS_CHANGED: 'pair:status-changed',
+  /** main → renderer：手机订阅了某会话，请求恢复（历史会话在 worker 里没有投影） */
+  PAIR_RESUME_SESSION: 'pair:resume-session',
+  /** main → renderer：手机新建了会话，请求登记（否则桌面列表里没有它，其事件也会被丢弃） */
+  PAIR_SESSION_CREATED: 'pair:session-created',
+  /** main → renderer：手机改了会话模型/推理档位，请求应用到会话 store（与桌面同一路径） */
+  PAIR_SESSION_CONFIG: 'pair:session-config',
+  /** main → renderer：手机的排队消息 / 会话目标操作（只存于 renderer store，不走 agent bridge） */
+  PAIR_QUEUE_ACTION: 'pair:queue-action',
+
+  // 远程节点：本机作为 guest 连接另一台 EnsoCode 桌面端
+  NODES_LIST: 'nodes:list',
+  NODES_PAIR: 'nodes:pair',
+  /** 节点层里点「连接到节点…」：本机切回本机界面并在那里打开配对对话框（配对链接只在本机界面输入） */
+  NODES_REQUEST_PAIR: 'nodes:request-pair',
+  /** main → 本机主窗口 renderer：打开配对对话框 */
+  NODES_PAIR_REQUESTED: 'nodes:pair-requested',
+  NODES_REMOVE: 'nodes:remove',
+  NODES_RENAME: 'nodes:rename',
+  /** main → renderer：节点列表/连接状态变化 */
+  NODES_STATUS_CHANGED: 'nodes:status-changed',
+  /** 主窗口打开某节点的设置窗口（宿主 renderer 经 rpc 隧道） */
+  NODES_OPEN_SETTINGS: 'nodes:open-settings',
+  /** 主窗口可见层切到本机或某节点（节点界面层由 main 叠在本机 workbench 之上） */
+  NODES_SWITCH: 'nodes:switch',
+  NODES_ACTIVE: 'nodes:active',
+  /** main → renderer：主窗口可见层变化 */
+  NODES_ACTIVE_CHANGED: 'nodes:active-changed',
+  /** 节点设置窗口专用 preload ↔ main（只认该窗口的 sender） */
+  NODE_REMOTE_INIT: 'node-remote:init',
+  NODE_REMOTE_ATTACH: 'node-remote:attach',
+  NODE_REMOTE_INVOKE: 'node-remote:invoke',
+  NODE_REMOTE_SEND: 'node-remote:send',
+  NODE_REMOTE_DETACH: 'node-remote:detach',
+  NODE_REMOTE_CLOSE: 'node-remote:close',
+  NODE_REMOTE_EVENT: 'node-remote:event',
+  /** 主窗口节点层 ↔ 本机 main：远程界面里本机窗口、节点切换与通知的调用（main 按白名单裁决） */
+  NODE_REMOTE_LOCAL_INVOKE: 'node-remote:local-invoke',
+  NODE_REMOTE_LOCAL_SEND: 'node-remote:local-send',
+  NODE_REMOTE_LOCAL_EVENT: 'node-remote:local-event',
+
+  WORKSPACE_SEARCH_QUERY: 'workspace-search:query',
+
+  BTW_PROMPT: 'btw:prompt',
+  BTW_ABORT: 'btw:abort',
+  BTW_SPAWN: 'btw:spawn',
+  BTW_DISPOSE: 'btw:dispose',
+
+  // Bot 模式（实验）：成员、聊天、投递；身份 / 工作区 / 人设一律由 Main 推导
+  BOTS_LIST: 'bots:list',
+  BOT_GET: 'bots:get',
+  BOT_CREATE: 'bots:create',
+  BOT_UPDATE: 'bots:update',
+  BOT_ARCHIVE: 'bots:archive',
+  BOT_DELETE: 'bots:delete',
+  BOT_SET_AVATAR: 'bots:set-avatar',
+  BOT_CHATS_LIST: 'bots:chats-list',
+  BOT_CHAT_CREATE: 'bots:chat-create',
+  BOT_CHAT_UPDATE: 'bots:chat-update',
+  BOT_CHAT_DELETE: 'bots:chat-delete',
+  BOT_CHAT_NEW_SESSION: 'bots:chat-new-session',
+  BOT_CHAT_SWITCH_SESSION: 'bots:chat-switch-session',
+  BOT_CHAT_CLONE: 'bots:chat-clone',
+  /** 群话题：根群下新建 / 切换 / 改名 / 删除 */
+  BOT_THREAD_CREATE: 'bots:thread-create',
+  BOT_THREAD_SELECT: 'bots:thread-select',
+  BOT_THREAD_UPDATE: 'bots:thread-update',
+  BOT_THREAD_DELETE: 'bots:thread-delete',
+  BOT_CHAT_STOP: 'bots:chat-stop',
+  BOT_CHAT_INTERJECT_QUEUED: 'bots:chat-interject-queued',
+  BOT_CHAT_STATE: 'bots:chat-state',
+  BOT_CHAT_SESSIONS: 'bots:chat-sessions',
+  BOT_CHAT_TIMELINE: 'bots:chat-timeline',
+  BOT_SEND: 'bots:send',
+  BOT_OPEN_WORKSPACE: 'bots:open-workspace',
+  /** bot 会话正文（含已结束的历史会话），只接受 bot 会话 id */
+  BOT_SESSION_HISTORY: 'bots:session-history',
+  BOT_DELEGATIONS_LIST: 'bots:delegations-list',
+  BOT_DELEGATION_CANCEL: 'bots:delegation-cancel',
+  BOT_DELEGATION_RETRY: 'bots:delegation-retry',
+  BOT_ROUTINES_LIST: 'bots:routines-list',
+  BOT_ROUTINE_SAVE: 'bots:routine-save',
+  BOT_ROUTINE_DELETE: 'bots:routine-delete',
+  BOT_ROUTINE_RUN_NOW: 'bots:routine-run-now',
+  /** 批准 / 拒绝成员提议或改动的例行任务版本 */
+  BOT_ROUTINE_REVIEW: 'bots:routine-review',
+  /** 某例行任务最近 20 次运行历史 */
+  BOT_ROUTINE_RUNS: 'bots:routine-runs',
+  /** 成员 / 群核心笔记：只收 botId 或 chatId，保存带 version 防覆盖 */
+  BOT_NOTES_GET: 'bots:notes-get',
+  BOT_NOTES_SAVE: 'bots:notes-save',
+  /** 群任务看板：列表 / 新建或编辑 / 指派（以人类身份 @ 成员）/ 完成 / 取消 / 删除 */
+  BOT_TASKS_LIST: 'bots:tasks-list',
+  BOT_TASK_SAVE: 'bots:task-save',
+  BOT_TASK_ASSIGN: 'bots:task-assign',
+  BOT_TASK_COMPLETE: 'bots:task-complete',
+  BOT_TASK_CANCEL: 'bots:task-cancel',
+  BOT_TASK_DELETE: 'bots:task-delete',
+  BOT_TASK_REVIEW: 'bots:task-review',
+  BOT_TASK_REPLY: 'bots:task-reply',
+  /** 「自动设置能力」：便宜模型按成员描述推荐能力，只返回建议不落盘 */
+  BOT_SUGGEST_ABILITIES: 'bots:suggest-abilities',
+  BOT_SUGGEST_PERSONA: 'bots:suggest-persona',
+  BOT_SUGGEST_GOAL: 'bots:suggest-goal',
+  /** 团队模板 / 导入：校验并预览改名 */
+  BOT_TEAM_PREVIEW: 'bots:team-preview',
+  /** 原子创建团队（成员 + 群） */
+  BOT_TEAM_CREATE: 'bots:team-create',
+  /** 成员用量：按周期排行 / 今日·7 天·30 天概览与预算状态 */
+  BOT_USAGE_SUMMARY: 'bots:usage-summary',
+  BOT_USAGE: 'bots:usage',
+  /** Bot 收件箱（Main 持久化）：列表 / 忽略与重新打开 */
+  BOT_INBOX_LIST: 'bots:inbox-list',
+  BOT_INBOX_UPDATE: 'bots:inbox-update',
+  /** main → renderer：Bot 数据变化提示 */
+  BOT_EVENT: 'bots:event',
+  /** Bot 聊天全文搜索：群时间线 + 私聊当前 / 历史会话 */
+  BOT_SEARCH: 'bots:search',
+  /** 产物卡片：只收聊天 + 条目 / 会话消息标识，路径由 Main 推导并校验在工作区根内 */
+  BOT_ARTIFACTS_LIST: 'bots:artifacts-list',
+  BOT_ARTIFACT_READ: 'bots:artifact-read',
+  BOT_ARTIFACT_OPEN: 'bots:artifact-open',
+  /** 输入框 @文件补全：只收 chatId + 查询词，工作区根由 Main 推导 */
+  BOT_FILE_SEARCH: 'bots:file-search',
+  BOT_CHAT_SAVE_PASTED_TEXT: 'bots:chat-save-pasted-text',
+  /** 回退 / 重试：只收 chatId（群重试加失败 entryId），会话由 Main 按聊天推导 */
+  BOT_REWIND: 'bots:rewind',
+  BOT_RETRY: 'bots:retry',
+  /** 成员 / 团队模板库（userData/bot-templates.json）；写入后广播 CHANGED */
+  BOT_TEMPLATES_GET: 'bots:templates-get',
+  BOT_TEMPLATES_SAVE: 'bots:templates-save',
+  BOT_TEMPLATES_CHANGED: 'bots:templates-changed',
+  /** Enso 插件：管理操作只能在本机界面或服务端 CLI 上做 */
+  EXTENSION_PLUGINS_LIST: 'extension-plugins:list',
+  EXTENSION_PLUGINS_REGISTRY_NOTICE: 'extension-plugins:registry-notice',
+  EXTENSION_PLUGINS_DISMISS_REGISTRY_NOTICE: 'extension-plugins:dismiss-registry-notice',
+  EXTENSION_PLUGINS_CHANGED: 'extension-plugins:changed',
+  /** main → renderer：插件被拦截、待授权或已自动更新 */
+  EXTENSION_PLUGINS_NOTICE: 'extension-plugins:notice',
+  EXTENSION_PLUGINS_COMMIT: 'extension-plugins:commit',
+  EXTENSION_PLUGINS_DISCARD: 'extension-plugins:discard',
+  EXTENSION_PLUGINS_SET_ENABLED: 'extension-plugins:set-enabled',
+  EXTENSION_PLUGINS_SET_CROSS_SESSION_INJECT: 'extension-plugins:set-cross-session-inject',
+  EXTENSION_PLUGINS_SET_DEV_WATCH: 'extension-plugins:set-dev-watch',
+  EXTENSION_PLUGINS_APPROVE_PENDING: 'extension-plugins:approve-pending',
+  EXTENSION_PLUGINS_REJECT_PENDING: 'extension-plugins:reject-pending',
+  EXTENSION_PLUGINS_UNINSTALL: 'extension-plugins:uninstall',
+  /** 桌面专用：弹系统对话框选目录或 zip，远端不可调 */
+  EXTENSION_PLUGINS_PICK_AND_STAGE: 'extension-plugins:pick-and-stage',
+  /** 从 http(s) zip 链接暂存；渲染层只传链接，远端不可调 */
+  EXTENSION_PLUGINS_STAGE_URL: 'extension-plugins:stage-url',
+  /** 从已记录的安装来源重新暂存（更新 / 开发时重新加载），渲染层只传插件 id */
+  EXTENSION_PLUGINS_RESTAGE: 'extension-plugins:restage',
+  /** 立即检查 GitHub 来源的插件更新；结果随列表下发 */
+  EXTENSION_PLUGINS_CHECK_UPDATES: 'extension-plugins:check-updates',
+  /** 插件市场列表（签名索引 + 本机安装状态）；入参 refresh 布尔 */
+  EXTENSION_PLUGINS_MARKET_LIST: 'extension-plugins:market-list',
+  /** 从插件市场暂存；渲染层只传插件 id 与可选版本 */
+  EXTENSION_PLUGINS_MARKET_STAGE: 'extension-plugins:market-stage',
+  /** 插件市场「国内镜像」开关 */
+  EXTENSION_PLUGINS_MARKET_SET_MIRROR: 'extension-plugins:market-set-mirror',
+  /** 插件使用说明。渲染层只传 id 和来源，路径由 Main 推导或按索引拉取 */
+  EXTENSION_PLUGINS_README: 'extension-plugins:readme',
+  /** 运行期：界面发起的插件调用（命令、挂件、侧栏页面、补全），算用户手势 */
+  EXTENSION_PLUGINS_CALL: 'extension-plugins:call',
+  /** 运行期：按插件 id + 相对路径取渲染资源，渲染层不传磁盘路径 */
+  EXTENSION_PLUGINS_ASSET: 'extension-plugins:asset',
+  /** Main → 发起窗口：插件读写草稿的请求；只发给发起手势的那个窗口 */
+  EXTENSION_PLUGINS_DRAFT_REQUEST: 'extension-plugins:draft-request',
+  /** Main → 所有界面：插件推给自己侧栏页面的事件 */
+  EXTENSION_PLUGINS_VIEW_EVENT: 'extension-plugins:view-event',
+  /** 渲染进程对草稿请求的回包，Main 校验回包窗口与发起窗口一致 */
+  EXTENSION_PLUGINS_DRAFT_RESPONSE: 'extension-plugins:draft-response',
+  /** 插件配置项：读（密钥不回显）与写；只在本机界面或服务端 CLI 上做 */
+  EXTENSION_PLUGINS_CONFIG_GET: 'extension-plugins:config-get',
+  EXTENSION_PLUGINS_CONFIG_SET: 'extension-plugins:config-set',
+  /** 插件进程日志末尾；只在本机界面或服务端 CLI 上看 */
+  EXTENSION_PLUGINS_LOGS: 'extension-plugins:logs',
+  /** 产出文件列表；可选插件 id，渲染层不传磁盘路径 */
+  EXTENSION_PLUGINS_ARTIFACTS_LIST: 'extension-plugins:artifacts-list',
+  /** 按产出 id 读取内容（≤ 8MB），路径由 Main 推导 */
+  EXTENSION_PLUGINS_ARTIFACT_READ: 'extension-plugins:artifact-read',
+  /** 按产出 id 删除 */
+  EXTENSION_PLUGINS_ARTIFACT_DELETE: 'extension-plugins:artifact-delete',
+  /** 桌面专用：另存对话框，渲染层只传产出 id */
+  EXTENSION_PLUGINS_ARTIFACT_SAVE: 'extension-plugins:artifact-save',
+  /** 侧栏页面状态，替代 localStorage */
+  EXTENSION_PLUGINS_VIEW_STATE_GET: 'extension-plugins:view-state-get',
+  EXTENSION_PLUGINS_VIEW_STATE_SET: 'extension-plugins:view-state-set',
+  /** 桌面专用：配置项选择文件或目录，只把路径字符串交回界面 */
+  EXTENSION_PLUGINS_PICK_PATH: 'extension-plugins:pick-path',
+} as const;
+
+export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];
+
+/** 重启在等什么：在跑的工具、没法脱离应用只能等它结束的转后台命令，或正在写的回复 */
+export type RestartWaitReason = 'tool' | 'background-not-detachable' | 'reply';
+
+/** 等待弹层等完命令要做什么：菜单重启、安装更新、退出（Cmd+Q / 关窗 / 菜单退出） */
+export type AppExitReason = 'restart' | 'update' | 'quit';
+
+/**
+ * 主窗口弹层：等命令结束（reason 在等哪种命令，exit 等完要做什么；可强制退出）；菜单重启的「正在重启」；
+ * 新实例在恢复会话
+ */
+export type RestartOverlayState =
+  | { phase: 'waiting'; reason: RestartWaitReason; exit: AppExitReason }
+  | { phase: 'restarting' }
+  | { phase: 'resuming' };

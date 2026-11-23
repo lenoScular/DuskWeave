@@ -1,0 +1,236 @@
+import { describe, expect, it } from 'vitest';
+import {
+  COMPOSER_DROP_ID,
+  type DragPayload,
+  PINNED_DROP_ID,
+  pinnedChatDragId,
+  projectGroupDragId,
+  routeDrop,
+  selectorGroupDropId,
+  UNGROUPED_GROUP_DROP_ID,
+} from './dragDrop';
+
+const project: DragPayload = {
+  type: 'project',
+  projectId: 'p1',
+  path: '/repo/checkout-service',
+  name: 'checkout-service',
+};
+
+const chat: DragPayload = {
+  type: 'chat',
+  conversationId: 'c1',
+  title: '给购物车加活动\n污染行',
+  sessionFile: '/sessions/c1.jsonl',
+  pinned: false,
+};
+
+describe('routeDrop: 项目', () => {
+  it('项目拖到另一项目 → 重排', () => {
+    expect(routeDrop(project, 'project:p2', undefined)).toEqual({
+      kind: 'reorder-projects',
+      activeId: 'p1',
+      overId: 'p2',
+    });
+  });
+
+  it('项目拖到自身 → 不动', () => {
+    expect(routeDrop(project, 'project:p1', undefined)).toBeNull();
+  });
+
+  it('项目拖到 Composer → 插入项目根绝对路径的 file mention', () => {
+    expect(routeDrop(project, COMPOSER_DROP_ID, undefined)).toEqual({
+      kind: 'insert-file-mention',
+      path: '/repo/checkout-service',
+      label: 'checkout-service',
+    });
+  });
+
+  it('项目拖到 Pinned 区 → 不动', () => {
+    expect(routeDrop(project, PINNED_DROP_ID, undefined)).toBeNull();
+  });
+});
+
+describe('routeDrop: 会话', () => {
+  it('会话拖到 Composer → 插入 chat mention,标题取首行', () => {
+    expect(routeDrop(chat, COMPOSER_DROP_ID, undefined)).toEqual({
+      kind: 'insert-chat-mention',
+      conversationId: 'c1',
+      label: '给购物车加活动',
+      sessionFile: '/sessions/c1.jsonl',
+    });
+  });
+
+  it('空标题回落 Untitled chat', () => {
+    expect(routeDrop({ ...chat, title: '  ' }, COMPOSER_DROP_ID, undefined)).toMatchObject({
+      label: 'Untitled chat',
+    });
+  });
+
+  it('无 sessionFile 的会话拖到 Composer → 不插入', () => {
+    expect(routeDrop({ ...chat, sessionFile: undefined }, COMPOSER_DROP_ID, undefined)).toBeNull();
+  });
+
+  it('拖入当前会话自身的输入框 → 不插入', () => {
+    expect(routeDrop(chat, COMPOSER_DROP_ID, 'c1')).toBeNull();
+  });
+
+  it('会话拖到 Pinned 区 → 置顶', () => {
+    expect(routeDrop(chat, PINNED_DROP_ID, undefined)).toEqual({
+      kind: 'pin-conversation',
+      conversationId: 'c1',
+    });
+  });
+
+  it('已置顶会话拖到 Pinned 区 → 不重复切换', () => {
+    expect(routeDrop({ ...chat, pinned: true }, PINNED_DROP_ID, undefined)).toBeNull();
+  });
+
+  it('会话拖到项目行 → 不动(不支持跨项目移动)', () => {
+    expect(routeDrop(chat, 'project:p2', undefined)).toBeNull();
+  });
+});
+
+describe('routeDrop: Pinned 组内排序', () => {
+  it('置顶会话拖到另一置顶行 → 组内重排', () => {
+    expect(routeDrop({ ...chat, pinned: true }, pinnedChatDragId('c9'), undefined)).toEqual({
+      kind: 'reorder-pinned',
+      activeId: 'c1',
+      overId: 'c9',
+    });
+  });
+
+  it('拖到自身 → 不动', () => {
+    expect(routeDrop({ ...chat, pinned: true }, pinnedChatDragId('c1'), undefined)).toBeNull();
+  });
+
+  it('未置顶会话拖到置顶行上 → 视为拖入置顶区(置顶)', () => {
+    expect(routeDrop(chat, pinnedChatDragId('c9'), undefined)).toEqual({
+      kind: 'pin-conversation',
+      conversationId: 'c1',
+    });
+  });
+
+  it('项目拖到置顶行 → 不动', () => {
+    expect(routeDrop(project, pinnedChatDragId('c9'), undefined)).toBeNull();
+  });
+});
+
+describe('routeDrop: 工作区文件', () => {
+  const file: DragPayload = {
+    type: 'workspace-file',
+    relativePath: 'src/a.ts',
+    name: 'a.ts',
+  };
+
+  it('拖到 Composer → file mention', () => {
+    expect(routeDrop(file, COMPOSER_DROP_ID, undefined)).toEqual({
+      kind: 'insert-file-mention',
+      path: 'src/a.ts',
+      label: 'a.ts',
+    });
+  });
+
+  it('拖到项目行 → 不动', () => {
+    expect(routeDrop(file, 'project:p1', undefined)).toBeNull();
+  });
+});
+
+describe('routeDrop: 无落点', () => {
+  it('overId 为 null → 不动', () => {
+    expect(routeDrop(chat, null, undefined)).toBeNull();
+  });
+});
+
+describe('routeDrop: 项目分组拖拽', () => {
+  const proj = (id: string): DragPayload => ({
+    type: 'project',
+    projectId: id,
+    path: `/${id}`,
+    name: id,
+  });
+  const groupDrag = (id: string): DragPayload => ({ type: 'project-group', groupId: id });
+
+  it('项目拖到另一组头 → move-project-to-group', () => {
+    const ctx = { projectGroupId: (id: string) => (id === 'p1' ? 'work' : undefined) };
+    expect(routeDrop(proj('p1'), projectGroupDragId('other'), undefined, ctx)).toEqual({
+      kind: 'move-project-to-group',
+      projectId: 'p1',
+      groupId: 'other',
+    });
+  });
+
+  it('项目拖到未分组头 → move groupId=null', () => {
+    const ctx = { projectGroupId: (id: string) => (id === 'p1' ? 'work' : undefined) };
+    expect(routeDrop(proj('p1'), UNGROUPED_GROUP_DROP_ID, undefined, ctx)).toEqual({
+      kind: 'move-project-to-group',
+      projectId: 'p1',
+      groupId: null,
+    });
+  });
+
+  it('项目已在该组、拖到自身组头（无 before）→ 不动', () => {
+    const ctx = { projectGroupId: (id: string) => (id === 'p1' ? 'work' : undefined) };
+    expect(routeDrop(proj('p1'), projectGroupDragId('work'), undefined, ctx)).toBeNull();
+  });
+
+  it('项目拖到不同组的项目行 → move + beforeProjectId', () => {
+    const ctx = { projectGroupId: (id: string) => (id === 'p1' ? 'work' : 'play') };
+    expect(routeDrop(proj('p1'), 'project:p2', undefined, ctx)).toEqual({
+      kind: 'move-project-to-group',
+      projectId: 'p1',
+      groupId: 'play',
+      beforeProjectId: 'p2',
+    });
+  });
+
+  it('项目拖到同组另一项目行 → 仍走 reorder-projects', () => {
+    const ctx = { projectGroupId: () => 'work' };
+    expect(routeDrop(proj('p1'), 'project:p2', undefined, ctx)).toEqual({
+      kind: 'reorder-projects',
+      activeId: 'p1',
+      overId: 'p2',
+    });
+  });
+
+  it('组头拖到另一组头 → reorder-groups', () => {
+    expect(routeDrop(groupDrag('work'), projectGroupDragId('play'), undefined)).toEqual({
+      kind: 'reorder-groups',
+      activeId: 'work',
+      overId: 'play',
+    });
+  });
+
+  it('组头拖到未分组头 → 不动', () => {
+    expect(routeDrop(groupDrag('work'), UNGROUPED_GROUP_DROP_ID, undefined)).toBeNull();
+  });
+
+  it('分组标签拖到另一标签 → reorder-groups（与组头同一份顺序）', () => {
+    expect(routeDrop(groupDrag('work'), selectorGroupDropId('play'), undefined)).toEqual({
+      kind: 'reorder-groups',
+      activeId: 'work',
+      overId: 'play',
+    });
+  });
+
+  it('分组标签拖到「全部」「未分组」或自身 → 不动', () => {
+    expect(routeDrop(groupDrag('work'), selectorGroupDropId('__all__'), undefined)).toBeNull();
+    expect(
+      routeDrop(groupDrag('work'), selectorGroupDropId('__ungrouped__'), undefined)
+    ).toBeNull();
+    expect(routeDrop(groupDrag('work'), selectorGroupDropId('work'), undefined)).toBeNull();
+  });
+
+  it('会话拖到组头 → 不动', () => {
+    expect(routeDrop(chat, projectGroupDragId('work'), undefined)).toBeNull();
+  });
+
+  it('项目拖到选择器菜单项 selector-group:work → move 到 work', () => {
+    const ctx = { projectGroupId: (id: string) => (id === 'p1' ? 'old' : undefined) };
+    expect(routeDrop(proj('p1'), selectorGroupDropId('work'), undefined, ctx)).toEqual({
+      kind: 'move-project-to-group',
+      projectId: 'p1',
+      groupId: 'work',
+    });
+  });
+});

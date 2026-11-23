@@ -1,0 +1,57 @@
+/**
+ * 会话级 worktree 隔离的纯 helper（store 与 UI 共用）。
+ * 产品决策见 docs/plans/2026-08-22-enso-code-design.md「trust 与 isolation」。
+ */
+
+import type { WorktreeStatus } from '@shared/types/worktree';
+
+/**
+ * 主工作树有未提交改动时的哨兵返回值（非错误文案）：
+ * worktree 从 HEAD 切出，脏改动会留在主树不会丢，风险只是「会话此前在主树的改动没带过去」，
+ * 由 UI 弹二次确认让用户决定，确认后以 allowDirtyMainTree 重试。
+ */
+export const DIRTY_MAIN_TREE = 'dirty-main-tree';
+
+export { workspaceBranchChangedNote } from '@shared/types/agent';
+
+/** worktree 有未落地成果（未提交或领先未合并），清理/归档/删除前需要确认 */
+export function worktreeHasPendingWork(status: WorktreeStatus | undefined): boolean {
+  if (!status) return false;
+  return status.dirty || status.ahead > 0;
+}
+
+/** 已合并且干净：才允许后台自动清理。未知 / 不存在 / dirty / 未合并一律 false */
+export function worktreeReadyToAutoCleanup(
+  status: Pick<WorktreeStatus, 'exists' | 'dirty' | 'ahead'> | undefined
+): boolean {
+  return status?.exists === true && status.dirty === false && status.ahead === 0;
+}
+
+/**
+ * 工作区迁移提醒：随下一条用户消息前置注入。
+ * 此前对话里的绝对路径全部失效，必须显式告知 agent，否则它会继续往旧工作区写。
+ */
+export function workspaceMigratedNote(path: string): string {
+  return (
+    '<workspace-migrated>\n' +
+    `FYI: this session's workspace has moved to: ${path}\n` +
+    'Absolute paths mentioned earlier in this conversation are stale; ' +
+    'resolve paths against the new workspace root when you read or edit files.\n' +
+    'This is background information only — not a task, request, or goal. ' +
+    'Do not act on it and do not call goal tools for it; just answer the message below.\n' +
+    '</workspace-migrated>'
+  );
+}
+
+/** worktree 清理/丢失后回退主工作树的提醒（语义同上，方向相反） */
+export function workspaceFallbackNote(path: string): string {
+  return (
+    '<workspace-migrated>\n' +
+    `FYI: this session's isolated worktree is gone. The workspace is now the main working tree: ${path}\n` +
+    'Absolute paths mentioned earlier in this conversation are stale; ' +
+    'resolve paths against the new workspace root when you read or edit files.\n' +
+    'This is background information only — not a task, request, or goal. ' +
+    'Do not act on it and do not call goal tools for it; just answer the message below.\n' +
+    '</workspace-migrated>'
+  );
+}

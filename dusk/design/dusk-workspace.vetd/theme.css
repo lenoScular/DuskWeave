@@ -1,0 +1,39 @@
+@import "@fontsource/eb-garamond/500.css";
+@import "@fontsource/eb-garamond/600.css";
+@import "@fontsource-variable/albert-sans";
+
+@theme {
+  --color-surface: #171f1e;
+  --color-surface-foreground: #eff1e9;
+  --color-panel: #1e2926;
+  --color-rail: #141b1a;
+  --color-raised: #293632;
+  --color-line: #455650;
+  --color-muted: #b8c5bc;
+  --color-quiet: #a0b0a6;
+  --color-primary: #c2de94;
+  --color-primary-foreground: #192414;
+  --color-stamp: #34442c;
+  --color-scrim: #0d1514;
+  --color-cool: #a4dbd9;
+  --color-pine: #2a4143;
+  --color-rose: #f1aebd;
+  --color-clay: #47323f;
+  --color-pollen: #ebcd91;
+  --color-bark: #483a2d;
+  --color-iris: #c8bdf4;
+  --color-thicket: #393650;
+  --font-sans: "Albert Sans Variable", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display: "EB Garamond", "Songti SC", "SimSun", serif;
+  --radius-control: 8px;
+}
+
+@layer base {
+  button:not(:disabled) { cursor: pointer; }
+  a:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
+    outline: 2px solid var(--color-primary);
+    outline-offset: 3px;
+  }
+  ::selection { background: var(--color-primary); color: var(--color-primary-foreground); }
+  * { scrollbar-width: thin; scrollbar-color: var(--color-line) transparent; }
+}

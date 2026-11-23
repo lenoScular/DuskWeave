@@ -1,0 +1,1724 @@
+import { useDraggable } from '@dnd-kit/core';
+import { Editor, type EditorOptions } from '@pierre/diffs/edit';
+import { EditProvider, File, Virtualizer } from '@pierre/diffs/react';
+import { conversationCwd } from '@shared/conversationCwd';
+import type { FilesDirEntry } from '@shared/types';
+import type { ProjectedMessage } from '@shared/types/agent';
+import { ChevronLeft, ChevronRight, Code2, Eye, RefreshCw, Search } from 'lucide-react';
+import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ConfirmDialog } from '@/components/chat/ConfirmDialog';
+import { CODE_THEME, ensureHighlighter } from '@/components/chat/codeHighlighter';
+import {
+  insertComposerMention,
+  requestFocusComposer,
+} from '@/components/chat/composerMentionBridge';
+import type { DragPayload } from '@/components/chat/dragDrop';
+import { ResizeHandle } from '@/components/chat/ResizeHandle';
+import { Button } from '@/components/ui/button';
+import {
+  ContextMenu,
+  ContextMenuItem,
+  ContextMenuPopup,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from '@/components/ui/context-menu';
+import { addToast } from '@/components/ui/toast';
+import { useCodeHighlightOptions } from '@/hooks/useColorScheme';
+import { useIsMobile } from '@/hooks/useViewport';
+import { useI18n } from '@/i18n';
+import { IS_MAC } from '@/lib/keybindings';
+import {
+  addSidePanelBrowser,
+  registerFilesOpener,
+  registerFilesTabCloser,
+} from '@/lib/sidePanelDock';
+import { cn } from '@/lib/utils';
+import { useSessionsStore } from '@/stores/sessions';
+import { hasAuthoritativeMessages } from '@/stores/sessions/messageCache';
+import { buildTimeline, completedEditWriteFingerprint } from '@/stores/sessions/timeline';
+import { useSettingsStore } from '@/stores/settings';
+import { resolveFilesTreeWidth, useSidePanelStore } from '@/stores/sidePanel';
+import {
+  fileViewerKey,
+  pluginFileViewersFor,
+  usePluginFileViewers,
+} from '../../plugins/fileViewers';
+import { PluginFrame } from '../../plugins/PluginView';
+import { FileImageViewer, isImageRel } from './FileImageViewer';
+import { FilesSearchPane } from './FilesSearchPane';
+import { fileTypeIcon, fileTypeIconClass } from './fileIcons';
+import { FileMarkdownPreview } from './filePreviewMarkdown';
+import { ancestorDirs, applyCompletedWrites } from './filesTreeRefresh';
+import {
+  fileTabPathMenuItems,
+  fromPreviewKey,
+  type RelMutation,
+  remapRelForRename,
+  renameDraftDecision,
+  shouldCloseForDelete,
+  toggleViewMode,
+  toPreviewKey,
+  wasPathInvalidated,
+} from './filesViewRel';
+import { readWorkspaceDocument, refreshWorkspaceDocument } from './filesWorkspaceRefresh';
+import { FileTreeMenu, isMarkdownRel, revealLabel } from './fileTreeMenu';
+import { usePanelHotkeyTarget } from './panelVisibility';
+import { idsToClose } from './tabCloseActions';
+
+const FILE_OPTIONS = {
+  theme: CODE_THEME,
+  disableFileHeader: true,
+  overflow: 'scroll',
+  preferredHighlighter: 'shiki-js',
+} as const;
+
+function createEditor<A>(options: EditorOptions<A>) {
+  return new Editor(options);
+}
+
+function joinRel(parent: string, name: string): string {
+  return parent ? `${parent}/${name}` : name;
+}
+
+function fileName(rel: string): string {
+  return rel.split('/').pop() || rel;
+}
+
+function dirOf(rel: string): string {
+  const idx = rel.lastIndexOf('/');
+  return idx < 0 ? '' : rel.slice(0, idx);
+}
+
+interface OpenDoc {
+  rel: string;
+  contents: string;
+  draft: string;
+  version: number;
+  dirty: boolean;
+  conflict: boolean;
+  tooLarge?: boolean;
+  preview?: boolean;
+  /** 同 tab 内的 source/preview 切换（仅 Markdown）；undefined 视为 source */
+  viewMode?: 'source' | 'preview';
+  /** 正在用的插件文件查看器（pluginId:viewerId）；undefined 为编辑器 */
+  viewer?: string;
+  /** 图片查看器：不读文本，version 变化时重新取图 */
+  image?: boolean;
+}
+
+const EMPTY_MESSAGES: ProjectedMessage[] = [];
+
+interface FilesViewProps {
+  conversationId: string;
+  projectId: string;
+}
+
+export function FilesView({ conversationId, projectId }: FilesViewProps) {
+  const { t } = useI18n();
+  const fileOptions = useCodeHighlightOptions(FILE_OPTIONS);
+  const saveHotkey = usePanelHotkeyTarget('files');
+  const req = useMemo(() => ({ conversationId, projectId }), [conversationId, projectId]);
+  const workspaceRevision = useSessionsStore(
+    (s) => s.workspaceRevisionByConversation[conversationId] ?? 0
+  );
+  const workspaceMigrating = useSessionsStore((s) =>
+    Boolean(s.conversations[conversationId]?.workspaceMigrating)
+  );
+  const readFile = useCallback(
+    (rel: string) =>
+      readWorkspaceDocument(
+        () => window.electronAPI.workspaceFiles.read({ ...req, rel }),
+        () => {
+          const state = useSessionsStore.getState();
+          return {
+            revision: state.workspaceRevisionByConversation[conversationId] ?? 0,
+            migrating: Boolean(state.conversations[conversationId]?.workspaceMigrating),
+          };
+        }
+      ),
+    [conversationId, req]
+  );
+  const [ready, setReady] = useState(false);
+  const [openDocs, setOpenDocs] = useState<OpenDoc[]>([]);
+  const [activeRel, setActiveRel] = useState<string | null>(null);
+  const fileViewers = usePluginFileViewers();
+  const fileViewersRef = useRef(fileViewers);
+  fileViewersRef.current = fileViewers;
+  // 窄屏下文件树与编辑区逐级显示：打开文件进编辑区，返回回到文件树
+  const isMobile = useIsMobile();
+  const [mobileTree, setMobileTree] = useState(true);
+  // 按面板实际宽度夹住文件树，面板被拖窄时编辑区不被挤没
+  const paneRef = useRef<HTMLDivElement>(null);
+  const [paneWidth, setPaneWidth] = useState(0);
+  useEffect(() => {
+    const pane = paneRef.current;
+    if (!pane || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries.at(-1)?.contentRect.width;
+      if (width !== undefined) setPaneWidth(Math.round(width));
+    });
+    observer.observe(pane);
+    return () => observer.disconnect();
+  }, []);
+  const treeWidth = useSidePanelStore((s) => resolveFilesTreeWidth(s.filesTreeWidth, paneWidth));
+  const nudgeFilesTreeWidth = useSidePanelStore((s) => s.nudgeFilesTreeWidth);
+  const resetFilesTreeWidth = useSidePanelStore((s) => s.resetFilesTreeWidth);
+  const nudgeTreeWidth = useCallback(
+    (delta: number) => nudgeFilesTreeWidth(delta, paneWidth),
+    [nudgeFilesTreeWidth, paneWidth]
+  );
+  const showDoc = useCallback((rel: string) => {
+    setActiveRel(rel);
+    setMobileTree(false);
+  }, []);
+  useEffect(() => {
+    if (!activeRel) setMobileTree(true);
+  }, [activeRel]);
+  const [treeGen, setTreeGen] = useState(0);
+  const [expandedDirs, setExpandedDirs] = useState<Set<string>>(() => new Set());
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [draft, setDraft] = useState<null | { parent: string; kind: 'file' | 'dir' }>(null);
+  const [renaming, setRenaming] = useState<null | {
+    rel: string;
+    name: string;
+    at: 'tree' | 'tab';
+  }>(null);
+  const [confirmDelete, setConfirmDelete] = useState<null | { rel: string; name: string }>(null);
+  const project = useSettingsStore((s) => s.projects.find((p) => p.id === projectId));
+  // 宿主桌面操作（定位、复制文件、内置浏览器）：SSH 项目与远程客户端都不可用
+  const local = project?.kind !== 'ssh' && !window.electronAPI.remote;
+  const openDocsRef = useRef(openDocs);
+  openDocsRef.current = openDocs;
+  const activeRelRef = useRef(activeRel);
+  activeRelRef.current = activeRel;
+  /** 待跳转行：目标文件的编辑器挂上后消费 */
+  const pendingLineRef = useRef<{ rel: string; line: number } | null>(null);
+  const attachedEditorRef = useRef<{ rel: string; editor: Editor<undefined> } | null>(null);
+  const tabStripRef = useRef<HTMLDivElement>(null);
+  /** 重命名/删除留痕：让 rename/delete 期间已在途的 read/write 不再复活失效路径 */
+  const opEpochRef = useRef(0);
+  const mutationsRef = useRef<RelMutation[]>([]);
+  const recordMutation = useCallback((rel: string) => {
+    opEpochRef.current += 1;
+    mutationsRef.current.push({ epoch: opEpochRef.current, rel });
+    if (mutationsRef.current.length > 200) mutationsRef.current.splice(0, 100);
+  }, []);
+
+  useEffect(() => {
+    const strip = tabStripRef.current;
+    if (!strip || !activeRel) return;
+    const tab = strip.querySelector(`[data-file-tab="${CSS.escape(activeRel)}"]`);
+    tab?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+  }, [activeRel]);
+
+  useEffect(() => {
+    let alive = true;
+    ensureHighlighter().then(() => {
+      if (alive) setReady(true);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const applyDisk = useCallback((rel: string, content: string) => {
+    setOpenDocs((docs) =>
+      docs.map((doc) => (doc.rel === rel ? refreshWorkspaceDocument(doc, content) : doc))
+    );
+  }, []);
+
+  const bumpDocVersion = useCallback((rel: string) => {
+    setOpenDocs((docs) =>
+      docs.map((doc) => (doc.rel === rel ? { ...doc, version: doc.version + 1 } : doc))
+    );
+  }, []);
+
+  const failToast = useCallback(
+    (error?: string) => {
+      addToast({
+        title: t(
+          error === 'exists'
+            ? 'A file or folder with that name already exists.'
+            : error === 'invalid-name'
+              ? 'Invalid name.'
+              : 'Could not complete the file action.'
+        ),
+      });
+    },
+    [t]
+  );
+
+  const openFile = useCallback(
+    async (rel: string, viewMode?: 'source' | 'preview') => {
+      const existing = openDocsRef.current.find((doc) => doc.rel === rel);
+      if (existing) {
+        if (viewMode) {
+          setOpenDocs((docs) =>
+            docs.map((doc) => (doc.rel === rel ? { ...doc, viewMode, viewer: undefined } : doc))
+          );
+        }
+        showDoc(rel);
+        return;
+      }
+      if (
+        isImageRel(rel) &&
+        viewMode !== 'source' &&
+        !pluginFileViewersFor(rel, fileViewersRef.current).some((viewer) => viewer.default)
+      ) {
+        setOpenDocs((docs) => [
+          ...docs,
+          { rel, contents: '', draft: '', version: 0, dirty: false, conflict: false, image: true },
+        ]);
+        showDoc(rel);
+        void window.electronAPI.workspaceFiles.watchStart({ ...req, rel });
+        return;
+      }
+      const epoch = opEpochRef.current;
+      const result = await readFile(rel);
+      if (!result || wasPathInvalidated(mutationsRef.current, rel, epoch)) return;
+      if (!result.ok) {
+        if (result.error !== 'too-large') {
+          failToast(result.error);
+          return;
+        }
+        setOpenDocs((docs) => [
+          ...docs,
+          {
+            rel,
+            contents: '',
+            draft: '',
+            version: 0,
+            dirty: false,
+            conflict: false,
+            tooLarge: true,
+          },
+        ]);
+        showDoc(rel);
+        return;
+      }
+      setOpenDocs((docs) => [
+        ...docs,
+        {
+          rel,
+          contents: result.content,
+          draft: result.content,
+          version: 0,
+          dirty: false,
+          conflict: false,
+          viewMode,
+          viewer: viewMode
+            ? undefined
+            : (() => {
+                const preferred = pluginFileViewersFor(rel, fileViewersRef.current).find(
+                  (viewer) => viewer.default
+                );
+                return preferred ? fileViewerKey(preferred) : undefined;
+              })(),
+        },
+      ]);
+      showDoc(rel);
+      void window.electronAPI.workspaceFiles.watchStart({ ...req, rel });
+    },
+    [failToast, readFile, req, showDoc]
+  );
+
+  const [confirmClose, setConfirmClose] = useState<null | {
+    kind: 'one' | 'others' | 'right' | 'all';
+    rel?: string;
+  }>(null);
+
+  const closeRels = useCallback(
+    (shouldClose: (rel: string) => boolean) => {
+      const docs = openDocsRef.current;
+      const nextDocs = docs.filter((doc) => !shouldClose(doc.rel));
+      for (const doc of docs) {
+        if (shouldClose(doc.rel)) {
+          void window.electronAPI.workspaceFiles.watchStop({ ...req, rel: doc.rel });
+        }
+      }
+      setOpenDocs(nextDocs);
+      setActiveRel((current) => {
+        if (current && nextDocs.some((doc) => doc.rel === current)) return current;
+        return nextDocs.at(-1)?.rel ?? null;
+      });
+    },
+    [req]
+  );
+
+  const closeFile = useCallback(
+    (rel: string) => {
+      closeRels((path) => path === rel);
+    },
+    [closeRels]
+  );
+
+  const requestCloseFile = useCallback(
+    (rel: string) => {
+      const doc = openDocsRef.current.find((item) => item.rel === rel);
+      if (doc?.dirty) {
+        setConfirmClose({ kind: 'one', rel });
+        return;
+      }
+      closeFile(rel);
+    },
+    [closeFile]
+  );
+
+  useEffect(() => {
+    return registerFilesTabCloser(conversationId, () => {
+      const rel = activeRelRef.current;
+      if (!rel || openDocsRef.current.length === 0) return false;
+      requestCloseFile(rel);
+      return true;
+    });
+  }, [conversationId, requestCloseFile]);
+
+  useEffect(() => {
+    return () => {
+      for (const doc of openDocsRef.current) {
+        void window.electronAPI.workspaceFiles.watchStop({ ...req, rel: doc.rel });
+      }
+    };
+  }, [req]);
+
+  useEffect(() => {
+    let alive = true;
+    const unsubscribe = window.electronAPI.workspaceFiles.onChange((event) => {
+      if (event.conversationId !== conversationId) return;
+      const doc = openDocsRef.current.find((item) => item.rel === event.rel);
+      if (!doc) return;
+      if (doc.image) {
+        bumpDocVersion(event.rel);
+        return;
+      }
+      void readFile(event.rel).then((result) => {
+        if (alive && result?.ok) applyDisk(event.rel, result.content);
+      });
+    });
+    return () => {
+      alive = false;
+      unsubscribe();
+    };
+  }, [applyDisk, bumpDocVersion, conversationId, readFile]);
+
+  const running = useSessionsStore((s) => s.conversations[conversationId]?.status === 'running');
+  const root = useSessionsStore((s) =>
+    project?.kind === 'secretary'
+      ? undefined
+      : project?.kind === 'scratch'
+        ? (conversationCwd({
+            kind: 'scratch',
+            canonicalPath: project.path,
+            conversationId,
+          }) ?? undefined)
+        : (s.conversations[conversationId]?.worktree?.path ?? project?.path)
+  );
+  const historyBaseIndex = useSessionsStore(
+    (s) => s.conversations[conversationId]?.historyBaseIndex
+  );
+  const editWriteKey = useSessionsStore((s) =>
+    completedEditWriteFingerprint(s.conversations[conversationId]?.messages ?? EMPTY_MESSAGES)
+  );
+  // 已完成的 edit/write 路径按次序折成字符串 key（不去重，同文件再改一次 key 也变）
+  const editedRelsKey = useMemo(() => {
+    void editWriteKey;
+    const conversation = useSessionsStore.getState().conversations[conversationId];
+    return buildTimeline(
+      conversation?.messages ?? EMPTY_MESSAGES,
+      running,
+      conversation?.customEntries ?? [],
+      root
+    )
+      .flatMap((item) => {
+        if (item.kind !== 'tool' || item.state !== 'ok') return [];
+        if (item.name !== 'edit' && item.name !== 'write') return [];
+        return item.summary ? [item.summary] : [];
+      })
+      .join('\n');
+  }, [conversationId, editWriteKey, root, running]);
+  useEffect(() => {
+    let alive = true;
+    const rels = new Set(editedRelsKey ? editedRelsKey.split('\n') : []);
+    for (const rel of rels) {
+      const doc = openDocsRef.current.find((item) => item.rel === rel);
+      if (!doc) continue;
+      if (doc.image) {
+        bumpDocVersion(rel);
+        continue;
+      }
+      void readFile(rel).then((result) => {
+        if (alive && result?.ok) applyDisk(rel, result.content);
+      });
+    }
+    return () => {
+      alive = false;
+    };
+  }, [applyDisk, bumpDocVersion, readFile, editedRelsKey]);
+
+  const seenWritesRef = useRef<Set<string> | null>(null);
+  const seenWritesSessionRef = useRef(conversationId);
+  const seenWritesEpochRef = useRef(historyBaseIndex);
+
+  const bumpTree = useCallback(() => setTreeGen((n) => n + 1), []);
+  useEffect(() => {
+    if (workspaceRevision === 0 || workspaceMigrating) return;
+    let alive = true;
+    bumpTree();
+    for (const doc of openDocsRef.current) {
+      if (doc.image) {
+        bumpDocVersion(doc.rel);
+        continue;
+      }
+      const rel = fromPreviewKey(doc.rel);
+      const epoch = opEpochRef.current;
+      void readFile(rel).then((result) => {
+        if (!alive || !result || wasPathInvalidated(mutationsRef.current, rel, epoch)) return;
+        setOpenDocs((docs) =>
+          docs.map((current) =>
+            current.rel === doc.rel
+              ? refreshWorkspaceDocument(current, result.ok ? result.content : null)
+              : current
+          )
+        );
+      });
+    }
+    return () => {
+      alive = false;
+    };
+  }, [bumpDocVersion, bumpTree, readFile, workspaceMigrating, workspaceRevision]);
+
+  const expandDir = useCallback((rel: string) => {
+    if (!rel) return;
+    setExpandedDirs((set) => {
+      if (set.has(rel)) return set;
+      const next = new Set(set);
+      next.add(rel);
+      return next;
+    });
+  }, []);
+
+  const expandDirs = useCallback((rels: string[]) => {
+    if (rels.length === 0) return;
+    setExpandedDirs((set) => {
+      let changed = false;
+      const next = new Set(set);
+      for (const rel of rels) {
+        if (!rel || next.has(rel)) continue;
+        next.add(rel);
+        changed = true;
+      }
+      return changed ? next : set;
+    });
+  }, []);
+
+  useEffect(() => {
+    void editWriteKey;
+    const conversation = useSessionsStore.getState().conversations[conversationId];
+    const epoch = historyBaseIndex;
+    if (seenWritesSessionRef.current !== conversationId || seenWritesEpochRef.current !== epoch) {
+      seenWritesSessionRef.current = conversationId;
+      seenWritesEpochRef.current = epoch;
+      seenWritesRef.current = null;
+    }
+    const timeline = buildTimeline(
+      conversation?.messages ?? EMPTY_MESSAGES,
+      running,
+      conversation?.customEntries ?? [],
+      root
+    );
+    const { refreshRels, nextSeen } = applyCompletedWrites(
+      timeline,
+      seenWritesRef.current,
+      hasAuthoritativeMessages(conversation?.messages ?? [])
+    );
+    seenWritesRef.current = nextSeen;
+    if (refreshRels.length === 0) return;
+    expandDirs(refreshRels.flatMap(ancestorDirs));
+    bumpTree();
+  }, [bumpTree, conversationId, editWriteKey, expandDirs, historyBaseIndex, root, running]);
+
+  const toggleDir = useCallback((rel: string) => {
+    setExpandedDirs((set) => {
+      const next = new Set(set);
+      if (next.has(rel)) next.delete(rel);
+      else next.add(rel);
+      return next;
+    });
+  }, []);
+
+  const handleNewFile = useCallback(
+    (parent: string) => {
+      expandDir(parent);
+      setDraft({ parent, kind: 'file' });
+    },
+    [expandDir]
+  );
+
+  const handleNewFolder = useCallback(
+    (parent: string) => {
+      expandDir(parent);
+      setDraft({ parent, kind: 'dir' });
+    },
+    [expandDir]
+  );
+
+  const openPreview = useCallback(
+    async (rel: string, allowSourceToggle = false) => {
+      if (allowSourceToggle) {
+        await openFile(rel, 'preview');
+        return;
+      }
+      const key = toPreviewKey(rel);
+      const existing = openDocsRef.current.find((doc) => doc.rel === key);
+      if (existing) {
+        showDoc(key);
+        return;
+      }
+      const epoch = opEpochRef.current;
+      const result = await readFile(rel);
+      if (!result || wasPathInvalidated(mutationsRef.current, rel, epoch)) return;
+      if (!result.ok) {
+        failToast(result.error);
+        return;
+      }
+      setOpenDocs((docs) => [
+        ...docs,
+        {
+          rel: key,
+          contents: result.content,
+          draft: result.content,
+          version: 0,
+          dirty: false,
+          conflict: false,
+          preview: true,
+        },
+      ]);
+      showDoc(key);
+    },
+    [failToast, readFile, openFile, showDoc]
+  );
+
+  useEffect(
+    () =>
+      registerFilesOpener(conversationId, (rel, line, viewer) => {
+        pendingLineRef.current = line ? { rel, line } : null;
+        const attached = attachedEditorRef.current;
+        const doc = openDocsRef.current.find((item) => item.rel === rel);
+        if (
+          line &&
+          attached?.rel === rel &&
+          activeRelRef.current === rel &&
+          doc?.viewMode !== 'preview' &&
+          !doc?.viewer
+        ) {
+          pendingLineRef.current = null;
+          attached.editor.focus({ lineNumber: line });
+          return;
+        }
+        if (viewer === 'markdown' && !line) void openPreview(rel, true);
+        else
+          void openFile(
+            rel,
+            // 不跳行时让插件的默认查看器生效
+            !line &&
+              (isImageRel(rel) ||
+                pluginFileViewersFor(rel, fileViewersRef.current).some((v) => v.default))
+              ? undefined
+              : 'source'
+          );
+      }),
+    [conversationId, openFile, openPreview]
+  );
+
+  const resolvePreviewImage = useCallback(
+    (rel: string) =>
+      window.electronAPI.workspaceFiles
+        .readImage({ ...req, rel })
+        .then((result) => (result.ok ? result.dataUrl : null)),
+    [req]
+  );
+
+  const readViewerImage = useCallback(
+    (rel: string) => window.electronAPI.workspaceFiles.readImage({ ...req, rel }),
+    [req]
+  );
+
+  const resolveRemotePreviewImage = useCallback(
+    (url: string) =>
+      window.electronAPI.workspaceFiles
+        .fetchRemoteImage({ ...req, url })
+        .then((result) => (result.ok ? result.dataUrl : null)),
+    [req]
+  );
+
+  /** 图片查看器兜底：改按文本读入代码编辑器 */
+  const openImageAsSource = useCallback(
+    async (rel: string) => {
+      const epoch = opEpochRef.current;
+      const result = await readFile(rel);
+      if (!result || wasPathInvalidated(mutationsRef.current, rel, epoch)) return;
+      if (!result.ok && result.error !== 'too-large') {
+        failToast(result.error);
+        return;
+      }
+      setOpenDocs((docs) =>
+        docs.map((doc) =>
+          doc.rel !== rel
+            ? doc
+            : result.ok
+              ? {
+                  ...doc,
+                  image: undefined,
+                  contents: result.content,
+                  draft: result.content,
+                  version: doc.version + 1,
+                }
+              : { ...doc, image: undefined, tooLarge: true }
+        )
+      );
+    },
+    [failToast, readFile]
+  );
+
+  const openInBrowser = useCallback(
+    async (rel: string) => {
+      const resolved = await window.electronAPI.workspaceFiles.absPath({ ...req, rel });
+      if (!resolved.ok || !resolved.local || !resolved.fileUrl) {
+        failToast(resolved.ok ? 'unsupported' : resolved.error);
+        return;
+      }
+      const tabId = `browser:file:${conversationId}:${rel}`;
+      addSidePanelBrowser({ conversationId, tabId, title: fileName(rel) });
+      const result = await window.electronAPI.browser.navigate(
+        tabId,
+        conversationId,
+        resolved.fileUrl
+      );
+      if (!result.ok) failToast(result.error);
+    },
+    [conversationId, failToast, req]
+  );
+
+  const save = useCallback(
+    async (rel: string) => {
+      if (useSessionsStore.getState().conversations[conversationId]?.workspaceMigrating) {
+        addToast({
+          type: 'error',
+          title: t('Wait for the workspace operation to finish before saving.'),
+        });
+        return;
+      }
+      const doc = openDocsRef.current.find((item) => item.rel === rel);
+      // 没有未保存改动就不写：磁盘上的文件可能已被 agent 删除或改写，旧内容写回会把它复活或覆盖
+      if (!doc || doc.preview || !doc.dirty) return;
+      const content = doc.draft;
+      const epoch = opEpochRef.current;
+      const result = await window.electronAPI.workspaceFiles.write({ ...req, rel, content });
+      // rel 在写盘期间被重命名/删除：结果已过期，别把陈旧路径标记为「已保存」
+      if (wasPathInvalidated(mutationsRef.current, rel, epoch)) return;
+      if (!result.ok) {
+        failToast(result.error);
+        return;
+      }
+      setOpenDocs((docs) =>
+        docs.map((item) =>
+          item.rel === rel
+            ? { ...item, contents: content, dirty: item.draft !== content, conflict: false }
+            : item
+        )
+      );
+    },
+    [conversationId, failToast, req, t]
+  );
+
+  const toggleDocViewMode = useCallback((rel: string) => {
+    setOpenDocs((docs) =>
+      docs.map((doc) =>
+        doc.rel === rel ? { ...doc, viewMode: toggleViewMode(doc.viewMode) } : doc
+      )
+    );
+  }, []);
+
+  const setDocViewer = useCallback((rel: string, viewer: string | undefined) => {
+    setOpenDocs((docs) => docs.map((doc) => (doc.rel === rel ? { ...doc, viewer } : doc)));
+  }, []);
+
+  const setDocDraft = useCallback((rel: string, next: string) => {
+    setOpenDocs((docs) =>
+      docs.map((doc) =>
+        doc.rel === rel ? { ...doc, draft: next, dirty: next !== doc.contents } : doc
+      )
+    );
+  }, []);
+
+  useEffect(() => {
+    // 隐藏会话不接保存键。唯一可见的 Files 即使分组没激活也接；多个可见时只交给激活的那个
+    if (!saveHotkey) return;
+    const onKey = (event: KeyboardEvent) => {
+      // mac 只认 ⌘：终端里的 ⌃S、emacs 的 C-x C-s 不是保存
+      const mod = IS_MAC ? event.metaKey : event.ctrlKey;
+      if (!mod || event.key.toLowerCase() !== 's') return;
+      if (!activeRel) return;
+      event.preventDefault();
+      void save(activeRel);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [activeRel, save, saveHotkey]);
+
+  const active = openDocs.find((doc) => doc.rel === activeRel) ?? null;
+  const activeViewers =
+    active && !active.preview && !active.tooLarge && !active.image
+      ? pluginFileViewersFor(active.rel, fileViewers)
+      : [];
+  const activeViewer = active?.viewer
+    ? activeViewers.find((viewer) => fileViewerKey(viewer) === active.viewer)
+    : undefined;
+  const editOptions = useMemo<EditorOptions<undefined>>(
+    () => ({
+      enabledSelectionAction: true,
+      renderSelectionAction(ctx) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.style.cssText =
+          'appearance:none;border:0;margin:0;background:transparent;padding:2px 8px;font:inherit;font-size:12px;font-weight:500;line-height:20px;cursor:pointer;color:inherit;border-radius:6px';
+        button.textContent = t('Send to conversation');
+        button.addEventListener('mouseenter', () => {
+          button.style.background = 'color-mix(in lab, currentColor 8%, transparent)';
+        });
+        button.addEventListener('mouseleave', () => {
+          button.style.background = 'transparent';
+        });
+        button.addEventListener('mousedown', (event) => event.preventDefault());
+        button.addEventListener('click', () => {
+          const text = ctx.getSelectionText().trim();
+          const rel = activeRel;
+          if (!text || !rel) {
+            ctx.close();
+            return;
+          }
+          const start = ctx.selection.start.line + 1;
+          let end = ctx.selection.end.line + 1;
+          if (ctx.selection.end.character === 0 && end > start) end -= 1;
+          const loc = start === end ? `L${start}` : `L${start}-L${end}`;
+          insertComposerMention({
+            kind: 'file',
+            id: `${rel}#${loc}`,
+            label: `${fileName(rel)}#${loc}`,
+            relativePath: `${rel}#${loc}`,
+          });
+          requestFocusComposer();
+          ctx.close();
+        });
+        return button;
+      },
+      onChange(file) {
+        const rel = activeRel;
+        if (!rel) return;
+        const next = file.contents;
+        setOpenDocs((docs) =>
+          docs.map((doc) =>
+            doc.rel === rel ? { ...doc, draft: next, dirty: next !== doc.contents } : doc
+          )
+        );
+      },
+      onAttach(editor) {
+        if (!activeRel) return;
+        attachedEditorRef.current = { rel: activeRel, editor };
+        const pending = pendingLineRef.current;
+        if (pending?.rel !== activeRel) return;
+        pendingLineRef.current = null;
+        editor.focus({ lineNumber: pending.line });
+      },
+    }),
+    [activeRel, t]
+  );
+
+  const commitRename = useCallback(
+    async (rel: string, name: string): Promise<boolean> => {
+      const result = await window.electronAPI.workspaceFiles.rename({
+        ...req,
+        rel,
+        name,
+      });
+      if (!result.ok) {
+        failToast(result.error);
+        return false;
+      }
+      setRenaming(null);
+      const toRel = result.rel;
+      if (toRel) {
+        recordMutation(rel);
+        for (const doc of openDocsRef.current) {
+          if (doc.preview || doc.tooLarge) continue;
+          const nextRel = remapRelForRename(doc.rel, rel, toRel);
+          if (nextRel == null) continue;
+          void window.electronAPI.workspaceFiles.watchStop({ ...req, rel: doc.rel });
+          void window.electronAPI.workspaceFiles.watchStart({ ...req, rel: nextRel });
+        }
+        setOpenDocs((docs) =>
+          docs.map((doc) => {
+            const nextRel = remapRelForRename(doc.rel, rel, toRel);
+            return nextRel == null ? doc : { ...doc, rel: nextRel };
+          })
+        );
+        setActiveRel((cur) => (cur == null ? cur : (remapRelForRename(cur, rel, toRel) ?? cur)));
+        setExpandedDirs((set) => {
+          let changed = false;
+          const next = new Set<string>();
+          for (const dirRel of set) {
+            const mapped = remapRelForRename(dirRel, rel, toRel) ?? dirRel;
+            if (mapped !== dirRel) changed = true;
+            next.add(mapped);
+          }
+          return changed ? next : set;
+        });
+      }
+      bumpTree();
+      return true;
+    },
+    [bumpTree, failToast, recordMutation, req]
+  );
+
+  return (
+    <EditProvider createEditor={createEditor}>
+      <div ref={paneRef} className="flex h-full min-h-0 bg-background">
+        <div
+          className={cn(
+            'flex shrink-0 flex-col overflow-hidden text-sm',
+            isMobile && (mobileTree ? 'w-full' : 'hidden')
+          )}
+          style={isMobile ? undefined : { width: treeWidth }}
+        >
+          <div className="flex justify-end gap-0.5 px-1 py-0.5">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setSearchOpen((open) => !open)}
+              aria-label={t('Search')}
+              aria-pressed={searchOpen}
+            >
+              <Search />
+            </Button>
+            <Button variant="ghost" size="icon-sm" onClick={bumpTree} aria-label={t('Refresh')}>
+              <RefreshCw />
+            </Button>
+          </div>
+          {searchOpen ? (
+            <FilesSearchPane
+              conversationId={conversationId}
+              projectId={projectId}
+              onOpenFile={(rel) => void openFile(rel)}
+              onClose={() => setSearchOpen(false)}
+              menu={{
+                local,
+                onPreview: (rel) => void openPreview(rel),
+                onBrowser: (rel) => void openInBrowser(rel),
+                onCopyPath: (rel) =>
+                  void window.electronAPI.workspaceFiles.copyPath({
+                    ...req,
+                    rel,
+                    mode: 'absolute',
+                  }),
+                onCopyRel: (rel) =>
+                  void window.electronAPI.workspaceFiles.copyPath({
+                    ...req,
+                    rel,
+                    mode: 'relative',
+                  }),
+                onCopyFile: (rel) =>
+                  void window.electronAPI.workspaceFiles
+                    .copyFile({ ...req, rel })
+                    .then((result) => {
+                      if (!result.ok) failToast(result.error);
+                    }),
+                onReveal: (rel) => void window.electronAPI.workspaceFiles.reveal({ ...req, rel }),
+                onNewFile: (parent) => {
+                  setSearchOpen(false);
+                  expandDirs(ancestorDirs(parent));
+                  handleNewFile(parent);
+                },
+                onNewFolder: (parent) => {
+                  setSearchOpen(false);
+                  expandDirs(ancestorDirs(parent));
+                  handleNewFolder(parent);
+                },
+                onRename: (rel, name) => {
+                  setSearchOpen(false);
+                  expandDirs(ancestorDirs(rel));
+                  setRenaming({ rel, name, at: 'tree' });
+                },
+                onDelete: (rel, name) => setConfirmDelete({ rel, name }),
+                onSend: (rel, name) => {
+                  insertComposerMention({
+                    kind: 'file',
+                    id: rel,
+                    label: name,
+                    relativePath: rel,
+                  });
+                },
+              }}
+            />
+          ) : (
+            <div className="min-h-0 flex-1 overflow-auto">
+              <FileTreeMenu
+                target={{ kind: 'blank' }}
+                local={local}
+                onNewFile={handleNewFile}
+                onNewFolder={handleNewFolder}
+                onCopyPath={() => undefined}
+                onCopyRel={() => undefined}
+              >
+                <div className="min-h-full">
+                  <FileTree
+                    rel=""
+                    depth={0}
+                    conversationId={conversationId}
+                    projectId={projectId}
+                    treeEpoch={treeGen}
+                    draft={draft}
+                    renaming={renaming}
+                    local={local}
+                    expandedDirs={expandedDirs}
+                    onToggleDir={toggleDir}
+                    onOpen={openFile}
+                    onPreview={openPreview}
+                    onBrowser={openInBrowser}
+                    onCopyPath={(rel) =>
+                      void window.electronAPI.workspaceFiles.copyPath({
+                        ...req,
+                        rel,
+                        mode: 'absolute',
+                      })
+                    }
+                    onCopyRel={(rel) =>
+                      void window.electronAPI.workspaceFiles.copyPath({
+                        ...req,
+                        rel,
+                        mode: 'relative',
+                      })
+                    }
+                    onCopyFile={(rel) =>
+                      void window.electronAPI.workspaceFiles.copyFile({ ...req, rel }).then((r) => {
+                        if (!r.ok) failToast(r.error);
+                      })
+                    }
+                    onReveal={(rel) =>
+                      void window.electronAPI.workspaceFiles.reveal({ ...req, rel })
+                    }
+                    onNewFile={handleNewFile}
+                    onNewFolder={handleNewFolder}
+                    onRenameStart={(rel, name) => setRenaming({ rel, name, at: 'tree' })}
+                    onDelete={(rel, name) => setConfirmDelete({ rel, name })}
+                    onDraftCancel={() => setDraft(null)}
+                    onRenameCancel={() => setRenaming(null)}
+                    onDraftCommit={async (parent, kind, name) => {
+                      const api =
+                        kind === 'dir'
+                          ? window.electronAPI.workspaceFiles.mkdir
+                          : window.electronAPI.workspaceFiles.createFile;
+                      const result = await api({ ...req, rel: parent || undefined, name });
+                      if (!result.ok) {
+                        failToast(result.error);
+                        return false;
+                      }
+                      setDraft(null);
+                      bumpTree();
+                      if (kind === 'file' && result.rel) void openFile(result.rel);
+                      return true;
+                    }}
+                    onRenameCommit={commitRename}
+                  />
+                </div>
+              </FileTreeMenu>
+            </div>
+          )}
+        </div>
+        {!isMobile && <ResizeHandle onResize={nudgeTreeWidth} onReset={resetFilesTreeWidth} />}
+        <div className={cn('flex min-w-0 flex-1 flex-col', isMobile && mobileTree && 'hidden')}>
+          {openDocs.length > 0 && (
+            <div
+              ref={tabStripRef}
+              className="flex h-[36px] shrink-0 items-center gap-1 overflow-x-auto border-b px-2"
+            >
+              {isMobile && (
+                <button
+                  type="button"
+                  className="flex shrink-0 items-center rounded-md px-1 text-muted-foreground hover:bg-muted/50"
+                  onClick={() => setMobileTree(true)}
+                  aria-label={t('Files')}
+                  title={t('Files')}
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+              )}
+              {openDocs.map((doc) => {
+                const renamingHere =
+                  renaming?.rel === doc.rel && renaming.at === 'tab' && !doc.preview;
+                const tab = (
+                  <button
+                    type="button"
+                    data-file-tab={doc.rel}
+                    className={cn(
+                      'flex items-center gap-1.5 rounded-md px-2 py-1 text-xs',
+                      doc.rel === activeRel
+                        ? 'bg-muted font-medium'
+                        : 'text-muted-foreground hover:bg-muted/50'
+                    )}
+                    onClick={() => {
+                      if (!renamingHere) setActiveRel(doc.rel);
+                    }}
+                    onDoubleClick={(event) => {
+                      if (doc.preview) return;
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setRenaming({ rel: doc.rel, name: fileName(doc.rel), at: 'tab' });
+                    }}
+                  >
+                    {renamingHere ? (
+                      <NameDraft
+                        depth={0}
+                        kind="file"
+                        variant="tab"
+                        initial={renaming.name}
+                        onCancel={() => setRenaming(null)}
+                        onCommit={(name) => commitRename(doc.rel, name)}
+                      />
+                    ) : (
+                      <span className="max-w-36 truncate">
+                        {fileName(doc.preview ? fromPreviewKey(doc.rel) : doc.rel)}
+                        {doc.preview ? ` ${t('Preview')}` : ''}
+                        {doc.dirty ? '*' : ''}
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      className="text-muted-foreground hover:text-destructive"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        requestCloseFile(doc.rel);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </button>
+                );
+                return (
+                  <ContextMenu key={doc.rel}>
+                    <ContextMenuTrigger render={tab as ReactElement<Record<string, unknown>>} />
+                    <ContextMenuPopup className="min-w-40">
+                      {fileTabPathMenuItems(doc.rel, local).map((item) =>
+                        item.id === 'copy-path' ? (
+                          <ContextMenuItem
+                            key={item.id}
+                            onClick={() =>
+                              void window.electronAPI.workspaceFiles.copyPath({
+                                ...req,
+                                rel: item.rel,
+                                mode: item.mode,
+                              })
+                            }
+                          >
+                            {t('Copy Path')}
+                          </ContextMenuItem>
+                        ) : (
+                          <ContextMenuItem
+                            key={item.id}
+                            onClick={() =>
+                              void window.electronAPI.workspaceFiles.reveal({
+                                ...req,
+                                rel: item.rel,
+                              })
+                            }
+                          >
+                            {t(revealLabel())}
+                          </ContextMenuItem>
+                        )
+                      )}
+                      <ContextMenuSeparator />
+                      {!doc.preview && (
+                        <ContextMenuItem
+                          onClick={() =>
+                            setRenaming({ rel: doc.rel, name: fileName(doc.rel), at: 'tab' })
+                          }
+                        >
+                          {t('Rename')}
+                        </ContextMenuItem>
+                      )}
+                      <ContextMenuItem onClick={() => requestCloseFile(doc.rel)}>
+                        {t('Close')}
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onClick={() => {
+                          const docs = openDocsRef.current;
+                          const keep = doc.rel;
+                          const dirtyOthers = docs.some((item) => item.rel !== keep && item.dirty);
+                          closeRels(
+                            (path) =>
+                              path !== keep && !docs.find((item) => item.rel === path)?.dirty
+                          );
+                          if (dirtyOthers) setConfirmClose({ kind: 'others', rel: keep });
+                        }}
+                      >
+                        {t('Close others')}
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onClick={() => {
+                          const docs = openDocsRef.current;
+                          const targets = idsToClose(
+                            docs.map((item) => item.rel),
+                            doc.rel,
+                            'right'
+                          );
+                          const dirty = targets.some(
+                            (id) => docs.find((item) => item.rel === id)?.dirty
+                          );
+                          closeRels(
+                            (path) =>
+                              targets.includes(path) &&
+                              !docs.find((item) => item.rel === path)?.dirty
+                          );
+                          if (dirty) setConfirmClose({ kind: 'right', rel: doc.rel });
+                        }}
+                      >
+                        {t('Close tabs to the right')}
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onClick={() => {
+                          const docs = openDocsRef.current;
+                          closeRels((path) => !docs.find((item) => item.rel === path)?.dirty);
+                        }}
+                      >
+                        {t('Close saved')}
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onClick={() => {
+                          const docs = openDocsRef.current;
+                          const anyDirty = docs.some((item) => item.dirty);
+                          closeRels((path) => !docs.find((item) => item.rel === path)?.dirty);
+                          if (anyDirty) setConfirmClose({ kind: 'all' });
+                        }}
+                      >
+                        {t('Close all')}
+                      </ContextMenuItem>
+                      <ContextMenuItem onClick={() => closeRels((path) => path !== doc.rel)}>
+                        {t('Force close others')}
+                      </ContextMenuItem>
+                      <ContextMenuItem onClick={() => closeRels(() => true)}>
+                        {t('Force close all')}
+                      </ContextMenuItem>
+                    </ContextMenuPopup>
+                  </ContextMenu>
+                );
+              })}
+            </div>
+          )}
+          {active?.conflict && (
+            <div className="flex shrink-0 items-center justify-between gap-2 border-b px-2 py-1 text-[11px]">
+              <span>{t('This file changed on disk.')}</span>
+              <button
+                type="button"
+                className="underline"
+                disabled={workspaceMigrating}
+                onClick={() => {
+                  void readFile(fromPreviewKey(active.rel)).then((result) => {
+                    if (!result?.ok) return;
+                    setOpenDocs((docs) =>
+                      docs.map((doc) =>
+                        doc.rel === active.rel
+                          ? {
+                              ...doc,
+                              contents: result.content,
+                              draft: result.content,
+                              version: doc.version + 1,
+                              dirty: false,
+                              conflict: false,
+                            }
+                          : doc
+                      )
+                    );
+                  });
+                }}
+              >
+                {t('Reload')}
+              </button>
+            </div>
+          )}
+          <div className="relative min-h-0 flex-1">
+            {active &&
+              !active.preview &&
+              !active.tooLarge &&
+              (isMarkdownRel(active.rel) || activeViewers.length > 0) && (
+                <div className="absolute top-2 right-2 z-10 flex gap-1">
+                  {activeViewer ? (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      aria-label={t('View Source')}
+                      onClick={() => setDocViewer(active.rel, undefined)}
+                    >
+                      <Code2 className="h-3.5 w-3.5" />
+                      {t('View Source')}
+                    </Button>
+                  ) : (
+                    <>
+                      {activeViewers.map((viewer) => (
+                        <Button
+                          key={fileViewerKey(viewer)}
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          aria-label={viewer.title}
+                          title={viewer.pluginName}
+                          onClick={() => setDocViewer(active.rel, fileViewerKey(viewer))}
+                        >
+                          <Eye className="h-3.5 w-3.5" />
+                          {viewer.title}
+                        </Button>
+                      ))}
+                      {isMarkdownRel(active.rel) && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          aria-label={
+                            active.viewMode === 'preview' ? t('View Source') : t('Preview')
+                          }
+                          onClick={() => toggleDocViewMode(active.rel)}
+                        >
+                          {active.viewMode === 'preview' ? (
+                            <Code2 className="h-3.5 w-3.5" />
+                          ) : (
+                            <Eye className="h-3.5 w-3.5" />
+                          )}
+                          {active.viewMode === 'preview' ? t('View Source') : t('Preview')}
+                        </Button>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+            {!ready || !active ? (
+              <div className="flex h-full items-center justify-center px-3 text-center text-sm text-muted-foreground">
+                {ready ? t('Open a file from the tree.') : t('Loading...')}
+              </div>
+            ) : active.tooLarge ? (
+              <div className="flex h-full items-center justify-center px-6 text-center text-sm text-muted-foreground">
+                {t('This file is too large to open in the editor.')}
+              </div>
+            ) : active.image ? (
+              <FileImageViewer
+                key={active.rel}
+                rel={active.rel}
+                version={active.version}
+                resolveImage={readViewerImage}
+                onOpenSource={() => void openImageAsSource(active.rel)}
+              />
+            ) : activeViewer ? (
+              <PluginFrame
+                key={`${active.rel}:${fileViewerKey(activeViewer)}`}
+                pluginId={activeViewer.pluginId}
+                entry={activeViewer.entry}
+                title={activeViewer.title}
+                sessionId={conversationId}
+                file={{
+                  rel: active.rel,
+                  text: active.draft,
+                  onEdit: (text) => setDocDraft(active.rel, text),
+                }}
+              />
+            ) : active.preview || (active.viewMode === 'preview' && isMarkdownRel(active.rel)) ? (
+              <div className="h-full overflow-auto px-3 py-2 text-sm">
+                <FileMarkdownPreview
+                  text={active.preview ? active.contents : active.draft}
+                  baseDirRel={dirOf(fromPreviewKey(active.rel))}
+                  resolveImage={resolvePreviewImage}
+                  resolveRemoteImage={resolveRemotePreviewImage}
+                />
+              </div>
+            ) : (
+              <Virtualizer style={{ height: '100%', overflow: 'auto' }}>
+                <File
+                  key={`${active.rel}:${active.version}`}
+                  file={{ name: fileName(active.rel), contents: active.draft }}
+                  disableWorkerPool
+                  edit
+                  editorOptions={editOptions}
+                  options={fileOptions}
+                />
+              </Virtualizer>
+            )}
+          </div>
+        </div>
+      </div>
+      <ConfirmDialog
+        open={confirmClose !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmClose(null);
+        }}
+        title={t('Unsaved changes')}
+        description={
+          confirmClose?.kind === 'one'
+            ? t('This file has unsaved changes. Close anyway?')
+            : t('Some files have unsaved changes. Close anyway?')
+        }
+        confirmLabel={t('Close')}
+        onConfirm={() => {
+          if (!confirmClose) return;
+          if (confirmClose.kind === 'one' && confirmClose.rel) closeFile(confirmClose.rel);
+          else if (confirmClose.kind === 'others' && confirmClose.rel) {
+            const keep = confirmClose.rel;
+            closeRels((path) => path !== keep);
+          } else if (confirmClose.kind === 'right' && confirmClose.rel) {
+            const keep = confirmClose.rel;
+            const targets = new Set(
+              idsToClose(
+                openDocsRef.current.map((item) => item.rel),
+                keep,
+                'right'
+              )
+            );
+            closeRels((path) => targets.has(path));
+          } else closeRels(() => true);
+          setConfirmClose(null);
+        }}
+      />
+      <ConfirmDialog
+        open={confirmDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmDelete(null);
+        }}
+        title={t('Delete')}
+        description={t('Delete {{name}} permanently?', { name: confirmDelete?.name ?? '' })}
+        confirmLabel={t('Delete')}
+        onConfirm={() => {
+          if (!confirmDelete) return;
+          const { rel } = confirmDelete;
+          void window.electronAPI.workspaceFiles.remove({ ...req, rel }).then((result) => {
+            if (!result.ok) {
+              failToast(result.error);
+              return;
+            }
+            recordMutation(rel);
+            closeRels((path) => shouldCloseForDelete(path, rel));
+            setExpandedDirs((set) => {
+              let changed = false;
+              const next = new Set<string>();
+              for (const dirRel of set) {
+                if (shouldCloseForDelete(dirRel, rel)) {
+                  changed = true;
+                  continue;
+                }
+                next.add(dirRel);
+              }
+              return changed ? next : set;
+            });
+            setConfirmDelete(null);
+            bumpTree();
+          });
+        }}
+      />
+    </EditProvider>
+  );
+}
+
+type TreeHandlers = {
+  draft: { parent: string; kind: 'file' | 'dir' } | null;
+  renaming: { rel: string; name: string; at: 'tree' | 'tab' } | null;
+  local: boolean;
+  expandedDirs: Set<string>;
+  onToggleDir: (rel: string) => void;
+  onOpen: (rel: string) => void;
+  onPreview: (rel: string) => void;
+  onBrowser: (rel: string) => void;
+  onCopyPath: (rel: string) => void;
+  onCopyRel: (rel: string) => void;
+  onCopyFile: (rel: string) => void;
+  onReveal: (rel: string) => void;
+  onNewFile: (parent: string) => void;
+  onNewFolder: (parent: string) => void;
+  onRenameStart: (rel: string, name: string) => void;
+  onDelete: (rel: string, name: string) => void;
+  onDraftCancel: () => void;
+  onRenameCancel: () => void;
+  /** resolve 为 false 表示被拒（如重名），草稿保留待用户修改 */
+  onDraftCommit: (parent: string, kind: 'file' | 'dir', name: string) => Promise<boolean>;
+  onRenameCommit: (rel: string, name: string) => Promise<boolean>;
+};
+
+function NameDraft({
+  depth,
+  kind,
+  initial,
+  onCancel,
+  onCommit,
+  variant = 'tree',
+}: {
+  depth: number;
+  kind: 'file' | 'dir';
+  initial: string;
+  onCancel: () => void;
+  /** resolve 为 false 表示提交被拒，输入框留在原处 */
+  onCommit: (name: string) => Promise<boolean>;
+  variant?: 'tree' | 'tab';
+}) {
+  const [value, setValue] = useState(initial);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const ignoreBlurRef = useRef(true);
+  const finishedRef = useRef(false);
+  useEffect(() => {
+    const focusId = window.setTimeout(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      el.select();
+    }, 0);
+    const armId = window.setTimeout(() => {
+      ignoreBlurRef.current = false;
+    }, 50);
+    return () => {
+      window.clearTimeout(focusId);
+      window.clearTimeout(armId);
+    };
+  }, []);
+  const finish = (action: 'commit' | 'cancel') => {
+    if (finishedRef.current) return;
+    if (action === 'commit' && renameDraftDecision(value, initial) === 'commit') {
+      finishedRef.current = true;
+      void onCommit(value.trim()).then((ok) => {
+        if (ok) return;
+        // 被拒后输入框还在：解锁并拉回焦点，否则之后的回车 / Esc / 失焦都会被吞掉
+        finishedRef.current = false;
+        inputRef.current?.focus();
+      });
+      return;
+    }
+    finishedRef.current = true;
+    onCancel();
+  };
+  return (
+    <input
+      ref={inputRef}
+      className={
+        variant === 'tab'
+          ? 'max-w-36 rounded-sm border bg-background px-1 py-0 text-xs outline-none'
+          : 'mx-1 my-0.5 w-[calc(100%-0.5rem)] rounded-sm border bg-background px-1 py-0.5 text-sm outline-none'
+      }
+      style={variant === 'tree' ? { marginLeft: 8 + depth * 12 } : undefined}
+      value={value}
+      onChange={(event) => setValue(event.target.value)}
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+      onBlur={() => {
+        if (ignoreBlurRef.current) {
+          inputRef.current?.focus();
+          return;
+        }
+        finish('commit');
+      }}
+      onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing) return;
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          finish('cancel');
+        }
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          finish('commit');
+        }
+      }}
+      aria-label={kind === 'dir' ? 'New Folder' : 'New File'}
+    />
+  );
+}
+
+function FileTree({
+  rel,
+  depth,
+  conversationId,
+  projectId,
+  treeEpoch,
+  ...handlers
+}: {
+  rel: string;
+  depth: number;
+  conversationId: string;
+  projectId: string;
+  treeEpoch: number;
+} & TreeHandlers) {
+  const [entries, setEntries] = useState<FilesDirEntry[] | null>(null);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: treeEpoch 强制 listDir 刷新
+  useEffect(() => {
+    let alive = true;
+    void window.electronAPI.workspaceFiles
+      .listDir({ conversationId, projectId, rel: rel || undefined })
+      .then((result) => {
+        if (!alive) return;
+        setEntries(result.ok ? result.entries : []);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [conversationId, projectId, rel, treeEpoch]);
+
+  if (!entries) {
+    return <div className="px-2 py-1 text-muted-foreground">…</div>;
+  }
+
+  const showDraft = handlers.draft?.parent === rel;
+
+  return (
+    <div>
+      {entries.map((entry) => {
+        const child = joinRel(rel, entry.name);
+        const expanded = handlers.expandedDirs.has(child);
+        if (entry.kind === 'dir') {
+          const renameHere = handlers.renaming?.rel === child && handlers.renaming.at === 'tree';
+          const row = renameHere ? (
+            <NameDraft
+              depth={depth}
+              kind="dir"
+              initial={entry.name}
+              onCancel={handlers.onRenameCancel}
+              onCommit={(name) => handlers.onRenameCommit(child, name)}
+            />
+          ) : (
+            <button
+              type="button"
+              className="flex w-full items-center gap-1.5 px-2 py-1 text-left hover:bg-muted/60"
+              style={{ paddingLeft: 8 + depth * 12 }}
+              onClick={() => handlers.onToggleDir(child)}
+            >
+              <ChevronRight className={cn('h-3.5 w-3.5 shrink-0', expanded && 'rotate-90')} />
+              {(() => {
+                const Icon = fileTypeIcon(entry.name, true, expanded);
+                return (
+                  <Icon className={cn('h-4 w-4 shrink-0', fileTypeIconClass(entry.name, true))} />
+                );
+              })()}
+              <span className="truncate">{entry.name}</span>
+            </button>
+          );
+          return (
+            <div key={child}>
+              <FileTreeMenu
+                target={{ kind: 'dir', rel: child, name: entry.name }}
+                local={handlers.local}
+                onNewFile={handlers.onNewFile}
+                onNewFolder={handlers.onNewFolder}
+                onCopyPath={handlers.onCopyPath}
+                onCopyRel={handlers.onCopyRel}
+                onReveal={handlers.onReveal}
+                onRename={handlers.onRenameStart}
+                onDelete={handlers.onDelete}
+              >
+                {row}
+              </FileTreeMenu>
+              {expanded && (
+                <FileTree
+                  rel={child}
+                  depth={depth + 1}
+                  conversationId={conversationId}
+                  projectId={projectId}
+                  treeEpoch={treeEpoch}
+                  {...handlers}
+                />
+              )}
+            </div>
+          );
+        }
+        return (
+          <FileRow
+            key={child}
+            rel={child}
+            name={entry.name}
+            depth={depth}
+            renaming={handlers.renaming?.rel === child && handlers.renaming.at === 'tree'}
+            handlers={handlers}
+          />
+        );
+      })}
+      {showDraft && handlers.draft && (
+        <NameDraft
+          depth={depth}
+          kind={handlers.draft.kind}
+          initial=""
+          onCancel={handlers.onDraftCancel}
+          onCommit={(name) => handlers.onDraftCommit(rel, handlers.draft!.kind, name)}
+        />
+      )}
+    </div>
+  );
+}
+
+function FileRow({
+  rel,
+  name,
+  depth,
+  renaming,
+  handlers,
+}: {
+  rel: string;
+  name: string;
+  depth: number;
+  renaming: boolean;
+  handlers: TreeHandlers;
+}) {
+  const { setNodeRef, listeners, isDragging } = useDraggable({
+    id: `workspace-file:${rel}`,
+    data: { type: 'workspace-file', relativePath: rel, name } satisfies DragPayload,
+  });
+  const row = renaming ? (
+    <NameDraft
+      depth={depth}
+      kind="file"
+      initial={name}
+      onCancel={handlers.onRenameCancel}
+      onCommit={(next) => handlers.onRenameCommit(rel, next)}
+    />
+  ) : (
+    <button
+      type="button"
+      ref={setNodeRef}
+      {...listeners}
+      style={{ paddingLeft: 20 + depth * 12, opacity: isDragging ? 0.4 : undefined }}
+      className="flex w-full cursor-default items-center gap-1.5 px-2 py-1 text-left hover:bg-muted/60"
+      onClick={() => handlers.onOpen(rel)}
+    >
+      {(() => {
+        const Icon = fileTypeIcon(name, false);
+        return <Icon className={cn('h-4 w-4 shrink-0', fileTypeIconClass(name, false))} />;
+      })()}
+      <span className="truncate">{name}</span>
+    </button>
+  );
+  return (
+    <FileTreeMenu
+      target={{ kind: 'file', rel, name }}
+      local={handlers.local}
+      onNewFile={handlers.onNewFile}
+      onNewFolder={handlers.onNewFolder}
+      onView={handlers.onOpen}
+      onPreview={handlers.onPreview}
+      onBrowser={handlers.onBrowser}
+      onCopyPath={handlers.onCopyPath}
+      onCopyRel={handlers.onCopyRel}
+      onCopyFile={handlers.onCopyFile}
+      onReveal={handlers.onReveal}
+      onRename={handlers.onRenameStart}
+      onDelete={handlers.onDelete}
+      onSend={(path, label) => {
+        insertComposerMention({
+          kind: 'file',
+          id: path,
+          label,
+          relativePath: path,
+        });
+      }}
+    >
+      {row}
+    </FileTreeMenu>
+  );
+}

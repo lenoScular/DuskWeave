@@ -1,0 +1,1949 @@
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import type { OauthFlowEvent } from '@shared/oauthFlow';
+import type { OauthLoginEvent, OauthLoginPrompt } from '@shared/types';
+import { IPC_CHANNELS, OAUTH_LABEL_MAX_LENGTH } from '@shared/types';
+import type { WebContents } from 'electron';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+
+// app.getPath 指到临时目录：整条链路（ModelRuntime.create → listCredentials →
+// readStoredCredential）都真的读盘，不能污染本机 userData
+const userData = mkdtempSync(path.join(tmpdir(), 'enso-oauth-'));
+const electronMocks = vi.hoisted(() => ({
+  openExternal: vi.fn(async () => {}),
+  windows: [] as Array<{
+    isDestroyed: () => boolean;
+    webContents: Pick<WebContents, 'isDestroyed' | 'send'>;
+  }>,
+}));
+vi.mock('electron', () => ({
+  app: { getPath: () => userData, getName: () => 'enso-code', on: () => {} },
+  BrowserWindow: { getAllWindows: () => electronMocks.windows },
+  shell: { openExternal: electronMocks.openExternal },
+}));
+
+vi.mock('./uiHost', async () =>
+  (await import('../../../test/helpers/localUi')).mockUiHost(() => electronMocks.windows)
+);
+vi.mock('./proxyConfig', () => ({
+  getProxyConfig: () => ({ whenReady: async () => true }),
+}));
+// 登录完成会后台触发目录刷新；不 mock 的话，动态 import('./modelDirectory') 会经
+// settings.ts → oauthProviders.ts 的静态链把本模块重新拉回模块注册表，时机不定，
+// 会踩掉下文 resetModules + doMock 搭建的 fake runtime（“unknown oauth provider”）。
+vi.mock('./modelDirectory', () => ({
+  refreshModelDirectory: async () => {},
+}));
+
+/** 造一个可解码的 JWT（只有 payload 有意义，签名不校验） */
+function fakeJwt(payload: Record<string, unknown>): string {
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
+  return `${encode({ alg: 'none' })}.${encode(payload)}.sig`;
+}
+
+const expires = Date.now() + 3_600_000;
+const noNetworkFetch = vi.fn(async () => new Response('', { status: 404 }));
+
+beforeAll(() => {
+  vi.stubGlobal('fetch', noNetworkFetch);
+  const dir = path.join(userData, 'agent', 'pi-agent');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'auth.json'),
+    JSON.stringify({
+      anthropic: { type: 'oauth', access: 'sk-ant-oat01-one', refresh: 'r1', expires },
+      'anthropic#2': { type: 'oauth', access: 'sk-ant-oat01-two', refresh: 'r2', expires },
+      cursor: {
+        type: 'oauth',
+        access: '',
+        refresh: 'cursor-refresh-token',
+        expires,
+      },
+      'openai-codex': {
+        type: 'oauth',
+        access: fakeJwt({
+          'https://api.openai.com/auth': { chatgpt_plan_type: 'plus' },
+          'https://api.openai.com/profile': { email: 'user@example.com' },
+        }),
+        refresh: 'r3',
+        expires,
+      },
+      // Antigravity 的凭证自带 projectId / email（pi 不拒绝额外字段）
+      'google-antigravity': {
+        type: 'oauth',
+        access: '',
+        refresh: 'r4',
+        expires,
+        projectId: 'projects/enso-test',
+        email: 'ag@example.com',
+      },
+      // api key 凭证不该被当成订阅账号
+      openai: { type: 'api_key', key: 'sk-test' },
+    })
+  );
+});
+
+afterAll(() => {
+  vi.unstubAllGlobals();
+  rmSync(userData, { recursive: true, force: true });
+});
+
+describe('listOauthProviders 的账号枚举', () => {
+  // 首条用例替整个文件付模块图的 import 成本，5s 默认值在并行跑满时会超时
+  it('Qoder 与 Qoder-CN 分别列为支持多账号的订阅供应商', { timeout: 20_000 }, async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const providers = await listOauthProviders();
+    for (const [id, name] of [
+      ['qoder', 'Qoder'],
+      ['qoder-cn', 'Qoder-CN'],
+    ]) {
+      expect(providers.find((provider) => provider.id === id)).toMatchObject({
+        id,
+        name,
+        supportsMultipleAccounts: true,
+        accounts: [],
+      });
+    }
+  });
+
+  it('同一厂商的两个账号各占一行，裸 key 排在 #2 前面', { timeout: 20_000 }, async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const providers = await listOauthProviders();
+    const anthropic = providers.find((provider) => provider.id === 'anthropic');
+    expect(anthropic?.accounts.map((account) => account.key)).toEqual(['anthropic', 'anthropic#2']);
+    expect(anthropic?.accounts.every((account) => account.providerId === 'anthropic')).toBe(true);
+  });
+
+  it('列表明确区分 Cursor 单账号限制与其他 provider 的多账号能力', async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const providers = await listOauthProviders();
+    expect(providers.find((provider) => provider.id === 'cursor')?.supportsMultipleAccounts).toBe(
+      false
+    );
+    expect(
+      providers.find((provider) => provider.id === 'anthropic')?.supportsMultipleAccounts
+    ).toBe(true);
+  });
+
+  it('OpenAI access token 的 profile claim 包含 email 时不发网络请求就能读出来', async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const providers = await listOauthProviders();
+    const codex = providers.find((provider) => provider.id === 'openai-codex');
+    expect(codex?.accounts).toEqual([
+      { key: 'openai-codex', providerId: 'openai-codex', email: 'user@example.com', plan: 'plus' },
+    ]);
+  });
+
+  it('OpenAI access token 的顶层 email 保持兼容', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed['openai-codex'] = {
+        type: 'oauth',
+        access: fakeJwt({
+          email: 'legacy@example.com',
+          'https://api.openai.com/auth': { chatgpt_plan_type: 'plus' },
+        }),
+        refresh: 'r3',
+        expires,
+      };
+    });
+    try {
+      const { listOauthProviders } = await import('./oauthProviders');
+      const providers = await listOauthProviders();
+      const codex = providers.find((provider) => provider.id === 'openai-codex');
+      expect(codex?.accounts[0]?.email).toBe('legacy@example.com');
+    } finally {
+      restore();
+    }
+  });
+
+  it.each([
+    ['缺失', undefined],
+    ['null', null],
+    ['字符串', 'invalid-profile'],
+    ['数组', []],
+  ])('OpenAI profile %s 时回退到有效顶层 email', async (_label, profile) => {
+    const restore = withAuthJson((parsed) => {
+      const claims: Record<string, unknown> = {
+        email: 'legacy@example.com',
+        'https://api.openai.com/auth': { chatgpt_plan_type: 'plus' },
+      };
+      if (profile !== undefined) claims['https://api.openai.com/profile'] = profile;
+      parsed['openai-codex'] = {
+        type: 'oauth',
+        access: fakeJwt(claims),
+        refresh: 'r3',
+        expires,
+      };
+    });
+    try {
+      const { listOauthProviders } = await import('./oauthProviders');
+      const providers = await listOauthProviders();
+      const codex = providers.find((provider) => provider.id === 'openai-codex');
+      expect(codex?.accounts).toEqual([
+        {
+          key: 'openai-codex',
+          providerId: 'openai-codex',
+          email: 'legacy@example.com',
+          plan: 'plus',
+        },
+      ]);
+    } finally {
+      restore();
+    }
+  });
+
+  it('OpenAI profile email 类型错误时回退到有效顶层 email', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed['openai-codex'] = {
+        type: 'oauth',
+        access: fakeJwt({
+          email: 'legacy@example.com',
+          'https://api.openai.com/profile': { email: 123 },
+        }),
+        refresh: 'r3',
+        expires,
+      };
+    });
+    try {
+      const { listOauthProviders } = await import('./oauthProviders');
+      const providers = await listOauthProviders();
+      const codex = providers.find((provider) => provider.id === 'openai-codex');
+      expect(codex?.accounts[0]?.email).toBe('legacy@example.com');
+    } finally {
+      restore();
+    }
+  });
+
+  it('OpenAI profile 与顶层 email 均非字符串时只保留账号 key', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed['openai-codex'] = {
+        type: 'oauth',
+        access: fakeJwt({
+          email: 456,
+          'https://api.openai.com/profile': { email: null },
+        }),
+        refresh: 'r3',
+        expires,
+      };
+    });
+    try {
+      const { listOauthProviders } = await import('./oauthProviders');
+      const providers = await listOauthProviders();
+      const codex = providers.find((provider) => provider.id === 'openai-codex');
+      expect(codex?.accounts).toEqual([{ key: 'openai-codex', providerId: 'openai-codex' }]);
+    } finally {
+      restore();
+    }
+  });
+
+  it('OpenAI profile 与顶层 email 都有效时 profile 优先', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed['openai-codex'] = {
+        type: 'oauth',
+        access: fakeJwt({
+          email: 'legacy@example.com',
+          'https://api.openai.com/profile': { email: 'profile@example.com' },
+        }),
+        refresh: 'r3',
+        expires,
+      };
+    });
+    try {
+      const { listOauthProviders } = await import('./oauthProviders');
+      const providers = await listOauthProviders();
+      const codex = providers.find((provider) => provider.id === 'openai-codex');
+      expect(codex?.accounts[0]?.email).toBe('profile@example.com');
+    } finally {
+      restore();
+    }
+  });
+
+  it('未登录的 provider 是空 accounts 数组，api_key 凭证不算订阅账号', async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const providers = await listOauthProviders();
+    const xai = providers.find((provider) => provider.id === 'xai');
+    expect(xai?.accounts).toEqual([]);
+    // openai 只有 api_key 凭证，不该出现在订阅列表里凭空多出一个账号
+    const openai = providers.find((provider) => provider.id === 'openai');
+    expect(openai?.accounts ?? []).toEqual([]);
+  });
+
+  it('合成 id 的克隆 provider 不作为独立条目暴露给界面', async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const providers = await listOauthProviders();
+    expect(providers.some((provider) => provider.id.includes('#'))).toBe(false);
+  });
+
+  it('Antigravity 已注册进 runtime，作为可登录的订阅 provider 出现', async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const providers = await listOauthProviders();
+    const antigravity = providers.find((provider) => provider.id === 'google-antigravity');
+    expect(antigravity).toBeDefined();
+    expect(antigravity?.models.length).toBeGreaterThan(0);
+  });
+
+  it('Devin 已注册进 runtime，作为可登录的订阅 provider 出现', async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const providers = await listOauthProviders();
+    const devin = providers.find((provider) => provider.id === 'devin');
+    expect(devin).toBeDefined();
+    expect(devin?.name).toBe('Devin');
+    expect(devin?.accounts).toEqual([]);
+  });
+
+  it('Antigravity 的 email 直接来自凭证，列表不必等网络', async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const providers = await listOauthProviders();
+    const antigravity = providers.find((provider) => provider.id === 'google-antigravity');
+    expect(antigravity?.accounts).toEqual([
+      { key: 'google-antigravity', providerId: 'google-antigravity', email: 'ag@example.com' },
+    ]);
+  });
+
+  it('JWT 里超长 plan 按共享上限截断', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed['openai-codex'] = {
+        type: 'oauth',
+        access: fakeJwt({
+          email: 'huge@example.com',
+          'https://api.openai.com/auth': { chatgpt_plan_type: 'P'.repeat(200) },
+        }),
+        refresh: 'r3',
+        expires,
+      };
+    });
+    try {
+      const { listOauthProviders } = await import('./oauthProviders');
+      const providers = await listOauthProviders();
+      const codex = providers.find((provider) => provider.id === 'openai-codex');
+      expect(codex?.accounts[0]?.plan).toBe('P'.repeat(OAUTH_LABEL_MAX_LENGTH));
+    } finally {
+      restore();
+    }
+  });
+});
+
+/** 收集 OAUTH_LOGIN_EVENT 的假 WebContents */
+let nextSenderId = 100;
+function fakeSender(): {
+  sender: WebContents;
+  events: OauthLoginEvent[];
+  flowEvents: OauthFlowEvent[];
+} {
+  const events: OauthLoginEvent[] = [];
+  const flowEvents: OauthFlowEvent[] = [];
+  const sender = {
+    id: nextSenderId++,
+    isDestroyed: () => false,
+    send: (_channel: string, payload: OauthFlowEvent) => {
+      flowEvents.push(payload);
+      if (payload.event.type === 'progress' && payload.event.message === 'Starting login...') {
+        return;
+      }
+      events.push(payload.event);
+    },
+  };
+  return { sender: sender as unknown as WebContents, events, flowEvents };
+}
+
+async function completeOauthLogin(providerId: string, sender: WebContents) {
+  const { beginOauthLogin } = await import('./oauthProviders');
+  const identity = {
+    flowId: crypto.randomUUID(),
+    ownerWebContentsId: sender.id,
+    host: 'provider-wizard' as const,
+  };
+  const handle = beginOauthLogin(providerId, sender, identity);
+  if (handle.completion) await handle.completion;
+  return handle;
+}
+
+describe('OAuth 凭证跨窗口失效通知', () => {
+  it('只通知其它存活 renderer，发起窗口由本地 done/logout 路径刷新', async () => {
+    const sourceSend = vi.fn();
+    const otherSend = vi.fn();
+    const destroyedSend = vi.fn();
+    const source = {
+      isDestroyed: () => false,
+      send: sourceSend,
+    };
+    electronMocks.windows.push(
+      {
+        isDestroyed: () => false,
+        webContents: source,
+      },
+      {
+        isDestroyed: () => false,
+        webContents: { isDestroyed: () => false, send: otherSend },
+      },
+      {
+        isDestroyed: () => true,
+        webContents: { isDestroyed: () => false, send: destroyedSend },
+      }
+    );
+    try {
+      const { broadcastOauthCredentialsChanged } = await import('./oauthProviders');
+      broadcastOauthCredentialsChanged(source as unknown as WebContents);
+      expect(sourceSend).not.toHaveBeenCalled();
+      expect(destroyedSend).not.toHaveBeenCalled();
+      expect(otherSend).toHaveBeenCalledOnce();
+      expect(otherSend).toHaveBeenCalledWith(IPC_CHANNELS.OAUTH_CREDENTIALS_CHANGED);
+    } finally {
+      electronMocks.windows.splice(0);
+    }
+  });
+
+  it('成功退登一个合成账号后广播，且同厂商其它账号仍保留', async () => {
+    const restore = withAuthJson(() => {});
+    const sourceSend = vi.fn();
+    const otherSend = vi.fn();
+    const source = {
+      isDestroyed: () => false,
+      send: sourceSend,
+    };
+    electronMocks.windows.push(
+      {
+        isDestroyed: () => false,
+        webContents: source,
+      },
+      {
+        isDestroyed: () => false,
+        webContents: { isDestroyed: () => false, send: otherSend },
+      }
+    );
+    try {
+      const { listOauthProviders, oauthLogout } = await import('./oauthProviders');
+      await oauthLogout('anthropic#2', source as unknown as WebContents);
+      const providers = await listOauthProviders();
+      expect(
+        providers
+          .find((provider) => provider.id === 'anthropic')
+          ?.accounts.map((account) => account.key)
+      ).toEqual(['anthropic']);
+      expect(otherSend).toHaveBeenCalledWith(IPC_CHANNELS.OAUTH_CREDENTIALS_CHANGED);
+      expect(sourceSend).not.toHaveBeenCalled();
+    } finally {
+      restore();
+      electronMocks.windows.splice(0);
+      const { listOauthProviders } = await import('./oauthProviders');
+      await listOauthProviders();
+    }
+  });
+});
+
+describe('kimi-coding 用量探测', () => {
+  const reset5h = '2026-09-01T00:00:00.000Z';
+  const reset7d = '2026-09-08T00:00:00.000Z';
+  const usageUrl = 'https://api.kimi.com/coding/v1/usages';
+
+  function withKimiAccount(): () => void {
+    return withAuthJson((parsed) => {
+      parsed['kimi-coding'] = {
+        type: 'oauth',
+        access: 'kimi-access-token',
+        refresh: 'kimi-refresh',
+        expires,
+      };
+    });
+  }
+
+  it('probeAccount 把 kimi-coding 分派到用量端点，带 Bearer 与 Accept', async () => {
+    const restore = withKimiAccount();
+    const seen: Array<{
+      url: string;
+      method: string;
+      auth: string | null;
+      accept: string | null;
+    }> = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const headers = new Headers(init?.headers);
+      seen.push({
+        url: String(input),
+        method: init?.method ?? 'GET',
+        auth: headers.get('authorization'),
+        accept: headers.get('accept'),
+      });
+      return jsonOk({ usages: {} });
+    });
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const usage = await getOauthAccountUsage('kimi-coding');
+      expect(seen).toContainEqual({
+        url: usageUrl,
+        method: 'GET',
+        auth: 'Bearer kimi-access-token',
+        accept: 'application/json',
+      });
+      expect(usage.error).toBeUndefined();
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('成功响应映射 5h/7d/mo，忽略 month_code，非法 reset 省略', async () => {
+    const restore = withKimiAccount();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      expect(String(input)).toBe(usageUrl);
+      return jsonOk({
+        usages: {
+          limit_5h: { used_ratio: 0.2, reset_time: reset5h },
+          limit_7d: { used_ratio: '0.005', reset_time: 'not-a-date' },
+          limit_month_total: { used_ratio: 1.2 },
+          limit_month_code: { used_ratio: 0.9, reset_time: reset7d },
+        },
+        boosterWallet: null,
+      });
+    });
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const usage = await getOauthAccountUsage('kimi-coding');
+      expect(usage).toEqual({
+        key: 'kimi-coding',
+        windows: [
+          { label: '5h', usedPercent: 20, resetsAt: Date.parse(reset5h) },
+          { label: '7d', usedPercent: 1 },
+          { label: 'mo', usedPercent: 100 },
+        ],
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('401 表示 token 失效，返回 error 而不是空的健康窗口', async () => {
+    const restore = withKimiAccount();
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('', { status: 401 }));
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      await expect(getOauthAccountUsage('kimi-coding')).resolves.toMatchObject({
+        key: 'kimi-coding',
+        windows: [],
+        error: expect.stringMatching(/401|失效|unauthorized/i),
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('404 表示账号不支持用量，返回 error', async () => {
+    const restore = withKimiAccount();
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('', { status: 404 }));
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      await expect(getOauthAccountUsage('kimi-coding')).resolves.toMatchObject({
+        key: 'kimi-coding',
+        windows: [],
+        error: expect.stringMatching(/404|不支持|not support/i),
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('fetch 抛异常时返回 error 且不向外抛', async () => {
+    const restore = withKimiAccount();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('network down'));
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      await expect(getOauthAccountUsage('kimi-coding')).resolves.toMatchObject({
+        key: 'kimi-coding',
+        windows: [],
+        error: expect.stringMatching(/network down/),
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('超时中止映射为「查询超时」而不是原始 AbortError 文案', async () => {
+    const restore = withKimiAccount();
+    const abort = new Error('This operation was aborted');
+    abort.name = 'AbortError';
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockRejectedValue(abort);
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      await expect(getOauthAccountUsage('kimi-coding')).resolves.toMatchObject({
+        key: 'kimi-coding',
+        windows: [],
+        error: expect.stringMatching(/超时/),
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+});
+
+// 渲染层可以往这三个通道传任意字符串，而它们最终都会被当成 auth.json 的键使用。
+// 安全评审 P1：不收窄的话「登录」能覆盖已登录账号的凭证。
+describe('IPC 入参收窄', () => {
+  it('登录时传合成 id 被拒，不会覆盖该账号已有的凭证', async () => {
+    const { listOauthProviders } = await import('./oauthProviders');
+    const { sender, events } = fakeSender();
+    await completeOauthLogin('anthropic#2', sender);
+    expect(events).toEqual([{ type: 'error', message: 'unknown oauth provider: anthropic#2' }]);
+    const providers = await listOauthProviders();
+    const anthropic = providers.find((provider) => provider.id === 'anthropic');
+    expect(anthropic?.accounts.map((account) => account.key)).toEqual(['anthropic', 'anthropic#2']);
+  });
+
+  it('Cursor 已登录时拒绝再登一个账号，且不覆盖既有凭证', async () => {
+    const file = path.join(userData, 'agent', 'pi-agent', 'auth.json');
+    const before = JSON.parse(readFileSync(file, 'utf8')).cursor;
+    const { sender, events } = fakeSender();
+    await completeOauthLogin('cursor', sender);
+    expect(events).toEqual([
+      { type: 'error', message: 'cursor does not support multiple accounts' },
+    ]);
+    const after = JSON.parse(readFileSync(file, 'utf8')).cursor;
+    expect(after).toEqual(before);
+  });
+
+  it('登录时传不存在的 provider 被拒', async () => {
+    const { sender, events } = fakeSender();
+    await completeOauthLogin('../../../etc/passwd', sender);
+    expect(events[0]).toMatchObject({ type: 'error' });
+  });
+
+  it('登录时传只有 api_key 支持的 provider 被拒（groq 无 oauth 登录）', async () => {
+    const { sender, events } = fakeSender();
+    await completeOauthLogin('groq', sender);
+    expect(events).toEqual([{ type: 'error', message: 'unknown oauth provider: groq' }]);
+  });
+
+  it('被拒后登录锁已释放，下一次仍能进入流程', async () => {
+    const first = fakeSender();
+    await completeOauthLogin('anthropic#2', first.sender);
+    const second = fakeSender();
+    await completeOauthLogin('anthropic#2', second.sender);
+    expect(second.events[0]).not.toMatchObject({ message: 'login already in progress' });
+  });
+
+  it('登出 auth.json 里不存在的 key 是 no-op，不动其他账号', async () => {
+    const { oauthLogout, listOauthProviders } = await import('./oauthProviders');
+    await oauthLogout('anthropic#9');
+    const providers = await listOauthProviders();
+    const anthropic = providers.find((provider) => provider.id === 'anthropic');
+    expect(anthropic?.accounts.map((account) => account.key)).toEqual(['anthropic', 'anthropic#2']);
+  });
+
+  it('查不存在的账号额度直接返回 error，不发网络请求', async () => {
+    const { getOauthAccountUsage } = await import('./oauthProviders');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const usage = await getOauthAccountUsage('anthropic#9');
+    expect(usage).toEqual({
+      key: 'anthropic#9',
+      windows: [],
+      error: 'unknown account: anthropic#9',
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
+  });
+
+  it('api_key 凭证的 key 不算订阅账号，查额度同样被拒', async () => {
+    const { getOauthAccountUsage } = await import('./oauthProviders');
+    const usage = await getOauthAccountUsage('openai');
+    expect(usage.error).toBe('unknown account: openai');
+  });
+});
+
+// 真实踩过的坑：antigravity 的 auth.apiKey 不是裸 token，而是
+// {access, refresh, expires, projectId, email} 的 JSON（projectId 得随 token 一起进 streamSimple）。
+// 整段当 Bearer 打过去会 401，再被 best-effort 静默成空窗口，长得就像「接了但没数据」。
+describe('Antigravity 额度探测', () => {
+  it('用解开的 access token 打请求，绝不把整段凭证 JSON 当 Bearer', async () => {
+    const restore = withAntigravityAccess();
+    const { getOauthAccountUsage } = await import('./oauthProviders');
+    const seenAuth: string[] = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      seenAuth.push(new Headers(init?.headers).get('authorization') ?? '');
+      void input;
+      return new Response(
+        JSON.stringify({
+          models: {
+            'gemini-3-pro': {
+              modelProvider: 'GOOGLE',
+              quotaInfo: { remainingFraction: 0.25, resetTime: new Date(expires).toISOString() },
+            },
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    });
+
+    try {
+      const usage = await getOauthAccountUsage('google-antigravity');
+
+      expect(usage.error).toBeUndefined();
+      expect(usage.windows).toEqual([
+        { label: 'Google Daily', usedPercent: 75, resetsAt: expect.any(Number) },
+      ]);
+      expect(seenAuth).toContain('Bearer ya29.access-token');
+      expect(seenAuth.some((value) => value.includes('projectId'))).toBe(false);
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('厂商 windowLabel 超长时按共享上限截断', async () => {
+    const restore = withAntigravityAccess();
+    const { getOauthAccountUsage } = await import('./oauthProviders');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      return new Response(
+        JSON.stringify({
+          models: {
+            'gemini-3-pro': {
+              quotaInfo: {
+                remainingFraction: 0.4,
+                resetTime: new Date(expires).toISOString(),
+                windowLabel: 'W'.repeat(200),
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    });
+    try {
+      const usage = await getOauthAccountUsage('google-antigravity');
+      expect(usage.error).toBeUndefined();
+      expect(usage.windows).toHaveLength(1);
+      expect(usage.windows[0]?.label).toBe('W'.repeat(OAUTH_LABEL_MAX_LENGTH));
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('凭证缺 projectId 时落到 error 而不是静默空窗口', async () => {
+    const { getOauthAccountUsage } = await import('./oauthProviders');
+    const broken = path.join(userData, 'agent', 'pi-agent', 'auth.json');
+    const original = readFileSync(broken, 'utf8');
+    const parsed = JSON.parse(original);
+    parsed['google-antigravity'] = { type: 'oauth', access: 'ya29.x', refresh: 'r', expires };
+    writeFileSync(broken, JSON.stringify(parsed));
+    try {
+      const usage = await getOauthAccountUsage('google-antigravity');
+      expect(usage.windows).toEqual([]);
+      expect(usage.error).toMatch(/projectId/);
+    } finally {
+      writeFileSync(broken, original);
+    }
+  });
+});
+
+const authFile = () => path.join(userData, 'agent', 'pi-agent', 'auth.json');
+
+function withAuthJson(mutate: (parsed: Record<string, unknown>) => void): () => void {
+  const original = readFileSync(authFile(), 'utf8');
+  const parsed = JSON.parse(original) as Record<string, unknown>;
+  mutate(parsed);
+  writeFileSync(authFile(), JSON.stringify(parsed));
+  return () => writeFileSync(authFile(), original);
+}
+
+describe('ChatGPT 额度查询权威缓存', () => {
+  let ordinal = 40;
+  const setup = () => {
+    const key = `openai-codex#${ordinal++}`;
+    const restore = withAuthJson((parsed) => {
+      parsed[key] = {
+        type: 'oauth',
+        access: fakeJwt({ 'https://api.openai.com/auth': { chatgpt_account_id: key } }),
+        refresh: `refresh-${key}`,
+        expires,
+      };
+    });
+    return { key, restore };
+  };
+  it('并发及重复UI查询只请求一次额度网络', async () => {
+    const { key, restore } = setup();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          rate_limit: {
+            primary_window: {
+              used_percent: 20,
+              reset_at: Math.floor((Date.now() + 100_000) / 1000),
+            },
+          },
+        })
+      )
+    );
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const result = await getOauthAccountUsage(key);
+      expect(result.windows[0]?.usedPercent).toBe(20);
+      await Promise.all([getOauthAccountUsage(key), getOauthAccountUsage(key)]);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+  it('HTTP失败空窗口保留unknown error，不假装账号健康', async () => {
+    const { key, restore } = setup();
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('', { status: 429 }));
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      expect(await getOauthAccountUsage(key)).toMatchObject({
+        windows: [],
+        error: expect.any(String),
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+  it.each([{ allowed: false }, { limit_reached: true }])(
+    '额度端点明确拒绝标志%s即使百分比未满也记录耗尽',
+    async (flag) => {
+      const { key, restore } = setup();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            rate_limit: {
+              ...flag,
+              primary_window: {
+                used_percent: 20,
+                reset_at: Math.floor((Date.now() + 100_000) / 1000),
+              },
+            },
+          })
+        )
+      );
+      try {
+        const { getOauthAccountUsage } = await import('./oauthProviders');
+        const result = await getOauthAccountUsage(key);
+        expect(result.windows.some((window) => window.usedPercent === 100)).toBe(true);
+      } finally {
+        fetchSpy.mockRestore();
+        restore();
+      }
+    }
+  );
+  it('全局拒绝的恢复时间只取真正耗尽窗口，不被健康周窗口拉长', async () => {
+    const { key, restore } = setup();
+    const shortReset = Math.floor((Date.now() + 100_000) / 1000);
+    const longReset = shortReset + 7 * 86_400;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          rate_limit: {
+            allowed: false,
+            primary_window: { used_percent: 100, reset_at: shortReset },
+            secondary_window: { used_percent: 20, reset_at: longReset },
+          },
+        })
+      )
+    );
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const result = await getOauthAccountUsage(key);
+      expect(result.windows.find((window) => window.label === 'rate limit')?.resetsAt).toBe(
+        shortReset * 1000
+      );
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+  it('全局拒绝但百分比无耗尽时不把健康窗口reset当恢复时间', async () => {
+    const { key, restore } = setup();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          rate_limit: {
+            allowed: false,
+            primary_window: {
+              used_percent: 20,
+              reset_at: Math.floor((Date.now() + 7 * 86_400_000) / 1000),
+            },
+          },
+        })
+      )
+    );
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const result = await getOauthAccountUsage(key);
+      expect(result.windows.find((window) => window.label === 'rate limit')).not.toHaveProperty(
+        'resetsAt'
+      );
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+  it('同账号token轮换不失效，复用key换真实身份必须清旧额度', async () => {
+    const { key, restore } = setup();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            rate_limit: {
+              primary_window: {
+                used_percent: 100,
+                reset_at: Math.floor((Date.now() + 100_000) / 1000),
+              },
+            },
+          })
+        )
+    );
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      await getOauthAccountUsage(key);
+      withAuthJson((parsed) => {
+        parsed[key] = {
+          type: 'oauth',
+          access: fakeJwt({ exp: 123, 'https://api.openai.com/auth': { chatgpt_account_id: key } }),
+          refresh: 'rotated',
+          expires,
+        };
+      });
+      expect((await getOauthAccountUsage(key)).windows[0]?.usedPercent).toBe(100);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      withAuthJson((parsed) => {
+        parsed[key] = {
+          type: 'oauth',
+          access: fakeJwt({
+            'https://api.openai.com/auth': { chatgpt_account_id: 'different-account' },
+          }),
+          refresh: 'new-person',
+          expires,
+        };
+      });
+      fetchSpy.mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({
+              rate_limit: {
+                primary_window: {
+                  used_percent: 20,
+                  reset_at: Math.floor((Date.now() + 100_000) / 1000),
+                },
+              },
+            })
+          )
+      );
+      expect((await getOauthAccountUsage(key)).windows[0]?.usedPercent).toBe(20);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+  it('尚未创建Main缓存时logout也清磁盘证据，最高号复用不继承封锁', async () => {
+    const key = 'openai-codex#2';
+    const restore = withAuthJson((parsed) => {
+      for (const existing of Object.keys(parsed))
+        if (existing.startsWith('openai-codex#')) delete parsed[existing];
+      parsed[key] = {
+        type: 'oauth',
+        access: fakeJwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'reused' } }),
+        refresh: 'r',
+        expires,
+      };
+    });
+    const quotaFile = path.join(userData, 'oauth-quota-state.json');
+    writeFileSync(
+      quotaFile,
+      JSON.stringify({
+        version: 1,
+        records: [
+          {
+            key,
+            identity: 'a'.repeat(64),
+            checkedAt: Date.now(),
+            windows: [],
+            hardUntil: Date.now() + 100_000,
+          },
+        ],
+      })
+    );
+    vi.resetModules();
+    try {
+      const { oauthLogout } = await import('./oauthProviders');
+      await oauthLogout(key);
+      expect(JSON.parse(readFileSync(quotaFile, 'utf8')).records).not.toContainEqual(
+        expect.objectContaining({ key })
+      );
+      const { nextAccountKey } = await import('@shared/piAccounts');
+      expect(
+        nextAccountKey('openai-codex', Object.keys(JSON.parse(readFileSync(authFile(), 'utf8'))))
+      ).toBe(key);
+    } finally {
+      restore();
+    }
+  });
+});
+
+function withAntigravityAccess(): () => void {
+  return withAuthJson((parsed) => {
+    parsed['google-antigravity'] = {
+      type: 'oauth',
+      access: 'ya29.access-token',
+      refresh: 'r4',
+      expires,
+      projectId: 'projects/enso-test',
+      email: 'ag@example.com',
+    };
+  });
+}
+
+function jsonOk(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+describe('xAI 额度探测', () => {
+  it('打 CLI billing 周池，带 xai-grok-cli 头，映射成 7d 窗口', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed.xai = {
+        type: 'oauth',
+        access: fakeJwt({ sub: 'xai-user-1' }),
+        refresh: 'rx',
+        expires,
+      };
+    });
+    const seen: Array<{ url: string; auth: string | null; tokenAuth: string | null }> = [];
+    const periodEnd = new Date(Date.now() + 2 * 86_400_000).toISOString();
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      const headers = new Headers(init?.headers);
+      seen.push({
+        url,
+        auth: headers.get('authorization'),
+        tokenAuth: headers.get('x-xai-token-auth'),
+      });
+      if (url.includes('/oauth2/userinfo')) {
+        return jsonOk({ email: 'grok@example.com' });
+      }
+      if (url.includes('format=credits')) {
+        return jsonOk({
+          config: {
+            creditUsagePercent: 18,
+            currentPeriod: {
+              type: 'USAGE_PERIOD_TYPE_WEEKLY',
+              start: new Date(Date.now() - 5 * 86_400_000).toISOString(),
+              end: periodEnd,
+            },
+          },
+        });
+      }
+      return jsonOk({});
+    });
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const usage = await getOauthAccountUsage('xai');
+      expect(usage.error).toBeUndefined();
+      expect(usage.windows).toEqual([
+        { label: '7d', usedPercent: 18, resetsAt: Date.parse(periodEnd) },
+      ]);
+      const billing = seen.find((call) => call.url.includes('format=credits'));
+      expect(billing?.tokenAuth).toBe('xai-grok-cli');
+      expect(billing?.auth).toMatch(/^Bearer /);
+      expect(seen.some((call) => call.url === 'https://cli-chat-proxy.grok.com/v1/billing')).toBe(
+        false
+      );
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('unified 账号缺周百分比时改打月池', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed.xai = {
+        type: 'oauth',
+        access: fakeJwt({ sub: 'xai-user-2' }),
+        refresh: 'rx',
+        expires,
+      };
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/oauth2/userinfo')) return jsonOk({ email: 'grok@example.com' });
+      if (url.includes('format=credits')) {
+        return jsonOk({
+          config: {
+            isUnifiedBillingUser: true,
+            currentPeriod: {
+              type: 'USAGE_PERIOD_TYPE_WEEKLY',
+              start: new Date(Date.now() - 86_400_000).toISOString(),
+              end: new Date(Date.now() + 6 * 86_400_000).toISOString(),
+            },
+          },
+        });
+      }
+      if (url.endsWith('/v1/billing')) {
+        return jsonOk({
+          config: {
+            monthlyLimit: { val: 15000 },
+            used: { val: 4500 },
+            billingPeriodEnd: '2026-09-01T00:00:00Z',
+          },
+        });
+      }
+      return jsonOk({});
+    });
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const usage = await getOauthAccountUsage('xai');
+      expect(usage.error).toBeUndefined();
+      expect(usage.windows).toEqual([
+        { label: 'mo', usedPercent: 30, resetsAt: Date.parse('2026-09-01T00:00:00Z') },
+      ]);
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+});
+
+describe('Cursor 额度探测', () => {
+  it('JWT 账号走 usage-summary 的 auto/api 百分比', async () => {
+    const access = fakeJwt({ sub: 'auth0|user_cursor_1' });
+    const restore = withAuthJson((parsed) => {
+      parsed.cursor = { type: 'oauth', access, refresh: 'cr', expires };
+    });
+    const cycleEnd = Date.now() + 10 * 86_400_000;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.includes('/api/usage-summary')) {
+        return jsonOk({
+          billingCycleEnd: cycleEnd,
+          individualUsage: {
+            plan: { autoPercentUsed: 12, apiPercentUsed: 34, enabled: true },
+          },
+        });
+      }
+      if (url.includes('/api/auth/me')) return jsonOk({ email: 'cursor@example.com' });
+      return jsonOk({});
+    });
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const usage = await getOauthAccountUsage('cursor');
+      expect(usage.error).toBeUndefined();
+      expect(usage.windows).toEqual([
+        { label: 'auto', usedPercent: 12, resetsAt: cycleEnd },
+        { label: 'api', usedPercent: 34, resetsAt: cycleEnd },
+      ]);
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('非 JWT token 退到 GetCurrentPeriodUsage', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed.cursor = {
+        type: 'oauth',
+        access: 'cursor-access-token',
+        refresh: 'cursor-refresh-token',
+        expires,
+      };
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url.includes('GetCurrentPeriodUsage')) {
+        expect(init?.method).toBe('POST');
+        return jsonOk({
+          billingCycleEnd: '1771077734000',
+          planUsage: { autoPercentUsed: 8, apiPercentUsed: 21, enabled: true },
+        });
+      }
+      if (url.includes('cursor.com')) {
+        throw new Error('session endpoints must not be called without user id');
+      }
+      return jsonOk({});
+    });
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const usage = await getOauthAccountUsage('cursor');
+      expect(usage.error).toBeUndefined();
+      expect(usage.windows).toEqual([
+        { label: 'auto', usedPercent: 8, resetsAt: 1_771_077_734_000 },
+        { label: 'api', usedPercent: 21, resetsAt: 1_771_077_734_000 },
+      ]);
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+});
+
+describe('Devin 额度探测', () => {
+  it('打 SeatManagement GetUserStatus，映射日窗口与套餐名', async () => {
+    const restore = withAuthJson((parsed) => {
+      parsed.devin = {
+        type: 'oauth',
+        access: fakeJwt({ email: 'devin@example.com' }),
+        refresh: 'rd',
+        expires,
+      };
+    });
+    const { create, GetUserStatusResponseSchema, toBinary } = await import(
+      '@shared/providers/devin/proto'
+    );
+    const payload = toBinary(
+      GetUserStatusResponseSchema,
+      create(GetUserStatusResponseSchema, {
+        userStatus: {
+          email: 'devin@example.com',
+          planStatus: {
+            dailyQuotaRemainingPercent: 40,
+            dailyQuotaResetAtUnix: 1_800_000_000n,
+          },
+        },
+        planInfo: { planName: 'Pro' },
+      })
+    );
+    const seen: string[] = [];
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      seen.push(String(input));
+      return new Response(Buffer.from(payload), { status: 200 });
+    });
+    try {
+      const { getOauthAccountUsage } = await import('./oauthProviders');
+      const usage = await getOauthAccountUsage('devin');
+      expect(usage.error).toBeUndefined();
+      expect(usage.windows).toEqual([
+        { label: 'Daily', usedPercent: 60, resetsAt: 1_800_000_000_000 },
+      ]);
+      expect(seen.some((url) => url.includes('SeatManagementService/GetUserStatus'))).toBe(true);
+    } finally {
+      fetchSpy.mockRestore();
+      restore();
+    }
+  });
+});
+
+describe('登录事件安全边界', () => {
+  it('完整授权地址只留在 Main，重开仍用原地址且错误正文不超过 300 字', async () => {
+    vi.resetModules();
+    electronMocks.openExternal.mockClear();
+
+    const fullAuthUrl =
+      'https://accounts.example.test/oauth/authorize?state=csrf-secret&client_id=enso';
+    const upstreamError = `${JSON.stringify({ access_token: 'ya29.secret' })}${'x'.repeat(600)}`;
+    const loginOutcome = Promise.withResolvers<void>();
+    interface FakeProvider {
+      id: string;
+      name: string;
+      auth: { oauth: { name: string } };
+      getModels: () => never[];
+    }
+    const providers: FakeProvider[] = [
+      {
+        id: 'throwing-oauth',
+        name: 'Throwing OAuth',
+        auth: { oauth: { name: 'Throwing OAuth' } },
+        getModels: () => [],
+      },
+    ];
+    const runtime = {
+      registerProvider: (id: string) => {
+        providers.push({
+          id,
+          name: id,
+          auth: { oauth: { name: id } },
+          getModels: () => [],
+        });
+      },
+      registerNativeProvider: (provider: FakeProvider) => providers.push(provider),
+      unregisterProvider: (id: string) => {
+        const index = providers.findIndex((provider) => provider.id === id);
+        if (index !== -1) providers.splice(index, 1);
+      },
+      getProvider: (id: string) => providers.find((provider) => provider.id === id),
+      getProviders: () => providers,
+      listCredentials: async () => [],
+      refresh: async () => {},
+      login: async (
+        _providerId: string,
+        _method: string,
+        interaction: {
+          notify: (event: { type: 'auth_url'; url: string; instructions?: string }) => void;
+        }
+      ) => {
+        interaction.notify({
+          type: 'auth_url',
+          url: fullAuthUrl,
+          instructions: 'Complete login',
+        });
+        await loginOutcome.promise;
+      },
+    };
+    vi.doMock('@earendil-works/pi-coding-agent', () => ({
+      ModelRuntime: { create: async () => runtime },
+    }));
+
+    try {
+      const { beginOauthLogin, cancelOauthLogin, reopenOauthLogin, respondOauthPrompt } =
+        await import('./oauthProviders');
+      const { sender, events, flowEvents } = fakeSender();
+      const child = {
+        sessionId: 'parent::enso-1',
+        generation: '11111111-1111-4111-8111-111111111111',
+        parent: {
+          sessionId: 'parent',
+          generation: '22222222-2222-4222-8222-222222222222',
+        },
+        instanceId: '33333333-3333-4333-8333-333333333333',
+        instanceName: 'Enso',
+        typeKey: 'agent:enso' as const,
+        profileId: 'enso-locked-v1' as const,
+      };
+      const locator = {
+        flowId: crypto.randomUUID(),
+        ownerWebContentsId: sender.id,
+        host: 'agent-child-tab' as const,
+        child,
+        turnId: 'turn-a',
+        requestId: 'request-a',
+      };
+      const handle = beginOauthLogin('throwing-oauth', sender, locator);
+      expect(handle.start).toEqual({ status: 'started', locator });
+      const running = handle.completion;
+      await vi.waitFor(() => {
+        expect(events).toContainEqual({
+          type: 'auth_url',
+          url: 'https://accounts.example.test/oauth/authorize',
+          instructions: 'Complete login',
+        });
+      });
+      expect(flowEvents.every((event) => event.locator === locator)).toBe(true);
+      expect(electronMocks.openExternal).toHaveBeenCalledTimes(1);
+      expect(electronMocks.openExternal).toHaveBeenLastCalledWith(fullAuthUrl);
+
+      const foreignChild = {
+        ...locator,
+        child: {
+          ...child,
+          sessionId: 'parent::enso-2',
+          instanceId: '44444444-4444-4444-8444-444444444444',
+        },
+      };
+      const oldTurn = { ...locator, turnId: 'turn-old' };
+      expect(cancelOauthLogin(foreignChild)).toBe(false);
+      expect(reopenOauthLogin(foreignChild)).toBe(false);
+      expect(respondOauthPrompt(foreignChild, 'missing', 'value')).toBe(false);
+      expect(cancelOauthLogin(oldTurn)).toBe(false);
+      expect(reopenOauthLogin(locator)).toBe(true);
+      expect(electronMocks.openExternal).toHaveBeenCalledTimes(2);
+      expect(electronMocks.openExternal).toHaveBeenLastCalledWith(fullAuthUrl);
+
+      loginOutcome.reject(new Error(upstreamError));
+      await running;
+      const errorEvent = events.find((event) => event.type === 'error');
+      expect(errorEvent?.message.length).toBeLessThanOrEqual(300);
+      expect(errorEvent?.message).not.toContain('ya29.secret');
+
+      expect(reopenOauthLogin(locator)).toBe(false);
+      expect(electronMocks.openExternal).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.doUnmock('@earendil-works/pi-coding-agent');
+      vi.resetModules();
+    }
+  });
+});
+
+describe('登录提示的留空提交', () => {
+  interface PromptingLogin {
+    prompt: OauthLoginPrompt;
+    respond: (value: string) => boolean;
+    /** 厂商 login 实际收到的回复 */
+    answered: Promise<string>;
+    completion: Promise<OauthLoginEvent> | undefined;
+  }
+
+  /** 厂商 login 只发一个提示，拿到回复后正常完成；request 原样交给 interaction.prompt */
+  async function withPromptingLogin(
+    request: Record<string, unknown>,
+    run: (login: PromptingLogin) => Promise<void>
+  ): Promise<void> {
+    vi.resetModules();
+    const answered = Promise.withResolvers<string>();
+    interface FakeProvider {
+      id: string;
+      name: string;
+      auth: { oauth?: { name?: string } };
+      getModels: () => string[];
+    }
+    const providers: FakeProvider[] = [
+      {
+        id: 'prompt-oauth',
+        name: 'Prompt OAuth',
+        auth: { oauth: { name: 'Prompt OAuth' } },
+        getModels: () => [],
+      },
+    ];
+    const runtime = {
+      registerProvider: (id: string, config: { oauth?: { name?: string } }) => {
+        providers.push({
+          id,
+          name: config.oauth?.name ?? id,
+          auth: { oauth: config.oauth },
+          getModels: () => [],
+        });
+      },
+      registerNativeProvider: (provider: FakeProvider) => providers.push(provider),
+      unregisterProvider: (id: string) => {
+        const index = providers.findIndex((provider) => provider.id === id);
+        if (index !== -1) providers.splice(index, 1);
+      },
+      getProvider: (id: string) => providers.find((provider) => provider.id === id),
+      getProviders: () => providers,
+      listCredentials: async () => [],
+      refresh: async () => ({ aborted: false, errors: new Map() }),
+      getAuth: async () => ({ auth: { apiKey: 'opaque-prompt-token' } }),
+      // pi 的 adaptOAuth 把扩展的旧版提示整体展开进 AuthPrompt，allowEmpty 随之原样到达
+      login: async (
+        _providerId: string,
+        _method: string,
+        interaction: { prompt: (prompt: Record<string, unknown>) => Promise<string> }
+      ) => {
+        answered.resolve(await interaction.prompt(request));
+      },
+    };
+    vi.doMock('@earendil-works/pi-coding-agent', () => ({
+      ModelRuntime: { create: async () => runtime },
+    }));
+    try {
+      const { beginOauthLogin, respondOauthPrompt } = await import('./oauthProviders');
+      const { sender, events } = fakeSender();
+      const locator = {
+        flowId: crypto.randomUUID(),
+        ownerWebContentsId: sender.id,
+        host: 'provider-wizard' as const,
+      };
+      const handle = beginOauthLogin('prompt-oauth', sender, locator);
+      const prompt = await vi.waitFor(() => {
+        const event = events.find((item) => item.type === 'prompt');
+        if (event?.type !== 'prompt') throw new Error('prompt not emitted yet');
+        return event.prompt;
+      });
+      await run({
+        prompt,
+        respond: (value) => respondOauthPrompt(locator, prompt.requestId, value),
+        answered: answered.promise,
+        completion: handle.completion,
+      });
+    } finally {
+      vi.doUnmock('@earendil-works/pi-coding-agent');
+      vi.resetModules();
+    }
+  }
+
+  // 真实场景：Qoder 提示「粘贴 PAT，或留空走浏览器登录」并声明 allowEmpty；Main 丢了声明，界面只能逼用户贴 PAT
+  it('声明 allowEmpty 的提示随事件透传，空值回复交给厂商登录流程', async () => {
+    await withPromptingLogin(
+      {
+        type: 'text',
+        message: 'Paste a Qoder Personal Access Token (pt-...), or leave empty for browser login',
+        placeholder: 'pt-...',
+        allowEmpty: true,
+      },
+      async ({ prompt, respond, answered, completion }) => {
+        expect(prompt.allowEmpty).toBe(true);
+        expect(respond('')).toBe(true);
+        await expect(answered).resolves.toBe('');
+        await completion;
+      }
+    );
+  });
+
+  // 安全边界：放行只看 Main 登记的声明，未声明或非严格 true 的提示收到空值要拒绝，且提示继续等真正的回答
+  it.each([
+    ['未声明', {}],
+    ['非布尔真值', { allowEmpty: 'true' }],
+  ])('allowEmpty %s的提示拒绝空值与纯空白回复，之后仍可正常作答', async (_label, declared) => {
+    await withPromptingLogin(
+      { type: 'text', message: 'Paste the authorization code', ...declared },
+      async ({ respond, answered, completion }) => {
+        expect(respond('')).toBe(false);
+        expect(respond('   ')).toBe(false);
+        expect(respond('auth-code')).toBe(true);
+        await expect(answered).resolves.toBe('auth-code');
+        await completion;
+      }
+    );
+  });
+});
+
+describe('登录成功凭证失效通知', () => {
+  it('done 发给发起窗口后，credentials-changed 广播到其它 renderer', async () => {
+    vi.resetModules();
+    let loggedIn = false;
+    interface FakeProvider {
+      id: string;
+      name: string;
+      auth: { oauth?: { name?: string } };
+      getModels: () => string[];
+    }
+    const providers: FakeProvider[] = [
+      {
+        id: 'success-oauth',
+        name: 'Success OAuth',
+        auth: { oauth: { name: 'Success OAuth' } },
+        getModels: () => ['success-model'],
+      },
+    ];
+    const runtime = {
+      registerProvider: (id: string, config: { oauth?: { name?: string }; models?: unknown[] }) => {
+        providers.push({
+          id,
+          name: config.oauth?.name ?? id,
+          auth: { oauth: config.oauth },
+          getModels: () => [],
+        });
+      },
+      registerNativeProvider: (provider: FakeProvider) => providers.push(provider),
+      unregisterProvider: (id: string) => {
+        const index = providers.findIndex((provider) => provider.id === id);
+        if (index !== -1) providers.splice(index, 1);
+      },
+      getProvider: (id: string) => providers.find((provider) => provider.id === id),
+      getProviders: () => providers,
+      listCredentials: async () =>
+        loggedIn ? [{ providerId: 'success-oauth', type: 'oauth' as const }] : [],
+      refresh: async () => ({ aborted: false, errors: new Map() }),
+      getAuth: async () => ({ auth: { apiKey: 'opaque-success-token' } }),
+      login: async () => {
+        loggedIn = true;
+      },
+    };
+    vi.doMock('@earendil-works/pi-coding-agent', () => ({
+      ModelRuntime: { create: async () => runtime },
+    }));
+
+    const sourceSend = vi.fn();
+    const otherSend = vi.fn();
+    const source = { id: nextSenderId++, isDestroyed: () => false, send: sourceSend };
+    electronMocks.windows.push(
+      { isDestroyed: () => false, webContents: source },
+      {
+        isDestroyed: () => false,
+        webContents: { isDestroyed: () => false, send: otherSend },
+      }
+    );
+    try {
+      const { beginOauthLogin } = await import('./oauthProviders');
+      const events: OauthLoginEvent[] = [];
+      const sender = {
+        ...source,
+        send: (channel: string, payload: { event: OauthLoginEvent }) => {
+          if (channel === IPC_CHANNELS.OAUTH_LOGIN_EVENT) events.push(payload.event);
+          sourceSend(channel, payload);
+        },
+      } as unknown as WebContents;
+      electronMocks.windows[0] = {
+        isDestroyed: () => false,
+        webContents: sender,
+      };
+      const identity = {
+        flowId: crypto.randomUUID(),
+        ownerWebContentsId: sender.id,
+        host: 'provider-wizard' as const,
+      };
+      const handle = beginOauthLogin('success-oauth', sender, identity);
+      await handle.completion;
+
+      expect(events).toContainEqual({
+        type: 'done',
+        providerId: 'success-oauth',
+        account: { key: 'success-oauth', providerId: 'success-oauth' },
+      });
+      expect(otherSend).toHaveBeenCalledWith(IPC_CHANNELS.OAUTH_CREDENTIALS_CHANGED);
+      expect(sourceSend).not.toHaveBeenCalledWith(IPC_CHANNELS.OAUTH_CREDENTIALS_CHANGED);
+    } finally {
+      electronMocks.windows.splice(0);
+      vi.doUnmock('@earendil-works/pi-coding-agent');
+      vi.resetModules();
+    }
+  });
+});
+
+describe('OAuth 登录的安装级 deviceId', () => {
+  it('向 pi login 提供稳定 UUID 的 getDeviceId，并持久化到 pi 全局 settings.json', async () => {
+    vi.resetModules();
+    const actual = await vi.importActual<typeof import('@earendil-works/pi-coding-agent')>(
+      '@earendil-works/pi-coding-agent'
+    );
+    // 实际模块加载期间可能完成旧的后台 import；切 fake runtime 前先排空并清缓存。
+    await vi.dynamicImportSettled();
+    vi.resetModules();
+    let getDeviceId: (() => string) | undefined;
+    interface FakeProvider {
+      id: string;
+      name: string;
+      auth: { oauth?: { name?: string } };
+      getModels: () => string[];
+    }
+    const providers: FakeProvider[] = [
+      {
+        id: 'device-oauth',
+        name: 'Device OAuth',
+        auth: { oauth: { name: 'Device OAuth' } },
+        getModels: () => [],
+      },
+    ];
+    const runtime = {
+      registerProvider: (id: string, config: { oauth?: { name?: string } }) => {
+        providers.push({
+          id,
+          name: config.oauth?.name ?? id,
+          auth: { oauth: config.oauth },
+          getModels: () => [],
+        });
+      },
+      registerNativeProvider: (provider: FakeProvider) => providers.push(provider),
+      unregisterProvider: (id: string) => {
+        const index = providers.findIndex((provider) => provider.id === id);
+        if (index !== -1) providers.splice(index, 1);
+      },
+      getProvider: (id: string) => providers.find((provider) => provider.id === id),
+      getProviders: () => providers,
+      listCredentials: async () => [],
+      refresh: async () => ({ aborted: false, errors: new Map() }),
+      getAuth: async () => ({ auth: { apiKey: 'opaque-device-token' } }),
+      login: async (
+        _providerId: string,
+        _method: string,
+        _interaction: unknown,
+        options?: { getDeviceId?: () => string }
+      ) => {
+        getDeviceId = options?.getDeviceId;
+      },
+    };
+    vi.doMock('@earendil-works/pi-coding-agent', () => ({
+      ModelRuntime: { create: async () => runtime },
+      SettingsManager: actual.SettingsManager,
+    }));
+    try {
+      const { sender, events } = fakeSender();
+      await completeOauthLogin('device-oauth', sender);
+      expect(events.at(-1), JSON.stringify(events)).toMatchObject({
+        type: 'done',
+        providerId: 'device-oauth',
+      });
+
+      const first = getDeviceId?.();
+      expect(first).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      );
+      expect(getDeviceId?.()).toBe(first);
+      // pi 的 SettingsManager.save() 是异步排队写盘
+      const settingsFile = path.join(userData, 'agent', 'pi-agent', 'settings.json');
+      await vi.waitFor(() => {
+        const saved = JSON.parse(readFileSync(settingsFile, 'utf8')) as { deviceId?: string };
+        expect(saved.deviceId).toBe(first);
+      });
+    } finally {
+      await vi.dynamicImportSettled();
+      vi.doUnmock('@earendil-works/pi-coding-agent');
+      vi.resetModules();
+    }
+  });
+});
+
+describe('Main OAuth 真凭证 key 读取', () => {
+  it('返回多账号实际 key，忽略 api_key 凭证且不暴露 token', async () => {
+    const { readStoredOauthCredentialKeys } = await import('./oauthProviders');
+    const keys = await readStoredOauthCredentialKeys();
+    expect([...keys].sort()).toEqual(
+      ['anthropic', 'anthropic#2', 'cursor', 'google-antigravity', 'openai-codex'].sort()
+    );
+    expect(keys.has('openai')).toBe(false);
+  });
+
+  it('轻量读取不创建 ModelRuntime 或注册 provider', async () => {
+    vi.resetModules();
+    const create = vi.fn(async () => {
+      throw new Error('ModelRuntime must not be created');
+    });
+    vi.doMock('@earendil-works/pi-coding-agent', () => ({ ModelRuntime: { create } }));
+    try {
+      const { readStoredOauthCredentialKeys } = await import('./oauthProviders');
+      const keys = await readStoredOauthCredentialKeys();
+      expect(keys.has('anthropic')).toBe(true);
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      vi.doUnmock('@earendil-works/pi-coding-agent');
+      vi.resetModules();
+    }
+  });
+
+  it('auth.json 不存在时返回空集合', async () => {
+    const file = authFile();
+    const backup = `${file}.missing-test`;
+    rmSync(backup, { force: true });
+    renameSync(file, backup);
+    try {
+      const { readStoredOauthCredentialKeys } = await import('./oauthProviders');
+      expect(await readStoredOauthCredentialKeys()).toEqual(new Set());
+    } finally {
+      renameSync(backup, file);
+    }
+  });
+
+  it('auth.json 损坏时传播解析错误，不伪装成空账号集合', async () => {
+    const file = authFile();
+    const original = readFileSync(file, 'utf8');
+    writeFileSync(file, '{not-json');
+    try {
+      const { readStoredOauthCredentialKeys } = await import('./oauthProviders');
+      await expect(readStoredOauthCredentialKeys()).rejects.toBeInstanceOf(SyntaxError);
+    } finally {
+      writeFileSync(file, original);
+    }
+  });
+
+  it('非 ENOENT 文件系统错误原样上抛', async () => {
+    const file = authFile();
+    const backup = `${file}.io-error-test`;
+    rmSync(backup, { force: true });
+    renameSync(file, backup);
+    mkdirSync(file);
+    try {
+      const { readStoredOauthCredentialKeys } = await import('./oauthProviders');
+      await expect(readStoredOauthCredentialKeys()).rejects.toMatchObject({ code: 'EISDIR' });
+    } finally {
+      rmSync(file, { recursive: true, force: true });
+      renameSync(backup, file);
+    }
+  });
+});
+
+describe('从 Codex 本地登录态导入', () => {
+  const codexDir = mkdtempSync(path.join(tmpdir(), 'enso-codex-'));
+  const codexAuth = path.join(codexDir, 'auth.json');
+  const exp = Math.floor(Date.now() / 1000) + 3600;
+  const codexAccess = fakeJwt({
+    exp,
+    'https://api.openai.com/auth': { chatgpt_account_id: 'acct_codex', chatgpt_plan_type: 'pro' },
+    'https://api.openai.com/profile': { email: 'codex@example.com' },
+  });
+  const writeCodexAuth = (value: unknown) => writeFileSync(codexAuth, JSON.stringify(value));
+
+  afterAll(() => rmSync(codexDir, { recursive: true, force: true }));
+
+  it('文件不存在 → not-found，auth.json 不动', async () => {
+    const before = readFileSync(authFile(), 'utf8');
+    const { importCodexOauthCredential } = await import('./oauthProviders');
+    expect(
+      await importCodexOauthCredential(undefined, path.join(codexDir, 'missing.json'))
+    ).toEqual({ status: 'not-found' });
+    expect(readFileSync(authFile(), 'utf8')).toBe(before);
+  });
+
+  it('API key 模式 → not-logged-in', async () => {
+    writeCodexAuth({ auth_mode: 'apikey', OPENAI_API_KEY: 'sk-x', tokens: null });
+    const { importCodexOauthCredential } = await import('./oauthProviders');
+    expect(await importCodexOauthCredential(undefined, codexAuth)).toEqual({
+      status: 'not-logged-in',
+    });
+  });
+
+  it('损坏的 JSON → failed', async () => {
+    writeFileSync(codexAuth, '{oops');
+    const { importCodexOauthCredential } = await import('./oauthProviders');
+    expect(await importCodexOauthCredential(undefined, codexAuth)).toMatchObject({
+      status: 'failed',
+    });
+  });
+
+  it('导入后凭证经 pi 写入 auth.json 的下一个账号 key，列表可见且广播其它窗口', async () => {
+    const restore = withAuthJson(() => {});
+    const otherSend = vi.fn();
+    const source = { isDestroyed: () => false, send: vi.fn() };
+    electronMocks.windows.push(
+      { isDestroyed: () => false, webContents: source },
+      { isDestroyed: () => false, webContents: { isDestroyed: () => false, send: otherSend } }
+    );
+    writeCodexAuth({
+      auth_mode: 'chatgpt',
+      tokens: {
+        id_token: 'id',
+        access_token: codexAccess,
+        refresh_token: 'codex-refresh',
+        account_id: 'acct_codex',
+      },
+    });
+    try {
+      const { importCodexOauthCredential, listOauthProviders } = await import('./oauthProviders');
+      const result = await importCodexOauthCredential(source as unknown as WebContents, codexAuth);
+      expect(result).toEqual({
+        status: 'imported',
+        account: {
+          key: 'openai-codex#2',
+          providerId: 'openai-codex',
+          email: 'codex@example.com',
+          plan: 'pro',
+        },
+      });
+      const stored = JSON.parse(readFileSync(authFile(), 'utf8'))['openai-codex#2'];
+      expect(stored).toEqual({
+        type: 'oauth',
+        access: codexAccess,
+        refresh: 'codex-refresh',
+        expires: exp * 1000,
+        accountId: 'acct_codex',
+        codexLinked: true,
+      });
+      const codex = (await listOauthProviders()).find((p) => p.id === 'openai-codex');
+      expect(codex?.accounts.map((a) => a.key)).toEqual(['openai-codex', 'openai-codex#2']);
+      expect(otherSend).toHaveBeenCalledWith(IPC_CHANNELS.OAUTH_CREDENTIALS_CHANGED);
+      // 导入成功后目录会刷新并向所有窗口（含发起窗口）广播 modelDirectory:changed；
+      // 这里断言的是旧语义「不向发起窗口发 credentials-changed」，按通道过滤
+      const sourceChannels = source.send.mock.calls.map(([channel]) => channel);
+      expect(sourceChannels).not.toContain(IPC_CHANNELS.OAUTH_CREDENTIALS_CHANGED);
+
+      // 同一 ChatGPT 账号再导一次：拒绝，不产生 #3
+      const again = await importCodexOauthCredential(undefined, codexAuth);
+      expect(again).toEqual({ status: 'duplicate', accountKey: 'openai-codex#2' });
+      expect(Object.keys(JSON.parse(readFileSync(authFile(), 'utf8')))).not.toContain(
+        'openai-codex#3'
+      );
+    } finally {
+      restore();
+      electronMocks.windows.splice(0);
+      const { listOauthProviders } = await import('./oauthProviders');
+      await listOauthProviders();
+    }
+  });
+
+  it.each([
+    ['Codex 的较新', exp - 60, true],
+    ['本应用的较新', exp + 60, false],
+  ])(
+    '旧版复制导入的同账号凭证：再导入就地关联并保留较新的 token（%s）',
+    async (_label, storedExp, codexWins) => {
+      const ours = {
+        type: 'oauth',
+        access: fakeJwt({
+          exp: storedExp,
+          'https://api.openai.com/auth': { chatgpt_account_id: 'acct_codex' },
+        }),
+        refresh: 'ours-refresh',
+        expires: storedExp * 1000,
+        accountId: 'acct_codex',
+      };
+      const restore = withAuthJson((parsed) => {
+        parsed['openai-codex#2'] = ours;
+      });
+      writeCodexAuth({
+        auth_mode: 'chatgpt',
+        tokens: {
+          id_token: 'id',
+          access_token: codexAccess,
+          refresh_token: 'codex-refresh',
+          account_id: 'acct_codex',
+        },
+      });
+      try {
+        const { importCodexOauthCredential, getOauthQuotaCoordinator } = await import(
+          './oauthProviders'
+        );
+        const quota = getOauthQuotaCoordinator();
+        await quota.select('import-fixture', ['openai-codex#2'], ['openai-codex#2'], {
+          accountKey: 'openai-codex#2',
+          reason: 'quota-exhausted',
+          resetAt: Date.now() + 100_000,
+        });
+        expect(
+          await quota.select('import-fixture', ['openai-codex#2'], ['openai-codex#2'])
+        ).not.toHaveProperty('accountKey');
+        expect(await importCodexOauthCredential(undefined, codexAuth)).toEqual({
+          status: 'duplicate',
+          accountKey: 'openai-codex#2',
+        });
+        expect(
+          JSON.parse(readFileSync(path.join(userData, 'oauth-quota-state.json'), 'utf8')).records
+        ).not.toContainEqual(expect.objectContaining({ key: 'openai-codex#2' }));
+        expect(JSON.parse(readFileSync(authFile(), 'utf8'))['openai-codex#2']).toEqual(
+          codexWins
+            ? {
+                type: 'oauth',
+                access: codexAccess,
+                refresh: 'codex-refresh',
+                expires: exp * 1000,
+                accountId: 'acct_codex',
+                codexLinked: true,
+              }
+            : { ...ours, codexLinked: true }
+        );
+      } finally {
+        restore();
+        const { listOauthProviders } = await import('./oauthProviders');
+        await listOauthProviders();
+      }
+    }
+  );
+
+  it('导入到裸 key 后 Main runtime 仍按关联方式刷新（注销临时 provider 不丢刷新包装）', async () => {
+    const restore = withAuthJson((parsed) => {
+      delete parsed['openai-codex'];
+    });
+    const home = mkdtempSync(path.join(tmpdir(), 'enso-home-'));
+    mkdirSync(path.join(home, '.codex'));
+    const homeCodexAuth = path.join(home, '.codex', 'auth.json');
+    writeFileSync(
+      homeCodexAuth,
+      JSON.stringify({
+        auth_mode: 'chatgpt',
+        tokens: {
+          id_token: 'id',
+          access_token: codexAccess,
+          refresh_token: 'codex-refresh',
+          account_id: 'acct_codex',
+        },
+      })
+    );
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    try {
+      const { getRuntime, importCodexOauthCredential } = await import('./oauthProviders');
+      expect(await importCodexOauthCredential(undefined, homeCodexAuth)).toMatchObject({
+        status: 'imported',
+        account: { key: 'openai-codex' },
+      });
+      const oauth = (await getRuntime()).getProvider('openai-codex')?.auth.oauth;
+      // 包装在位时直接沿用 Codex 文件里较新的 token；丢了包装会走 pi 内置刷新去联网（此处 404）
+      await expect(
+        oauth?.refresh(
+          {
+            type: 'oauth',
+            access: 'stale',
+            refresh: 'stale',
+            expires: 0,
+            accountId: 'acct_codex',
+            codexLinked: true,
+          },
+          new AbortController().signal
+        )
+      ).resolves.toMatchObject({ refresh: 'codex-refresh', codexLinked: true });
+    } finally {
+      restore();
+      vi.unstubAllEnvs();
+      rmSync(home, { recursive: true, force: true });
+      const { listOauthProviders } = await import('./oauthProviders');
+      await listOauthProviders();
+    }
+  });
+});

@@ -1,0 +1,43 @@
+import { Check, Copy } from 'lucide-react';
+import { useState } from 'react';
+import { useI18n } from '@/i18n';
+import { cn } from '@/lib/utils';
+
+/** 复制按钮（✓ 反馈 1s）；text 支持惰性取值（表格等渲染时才序列化） */
+export function CopyButton({
+  text,
+  className,
+  label,
+}: {
+  text: string | (() => string);
+  className?: string;
+  /** 图标后的可见文字；缺省只显示图标 */
+  label?: string;
+}) {
+  const { t } = useI18n();
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={() => {
+        const value = typeof text === 'function' ? text() : text;
+        void navigator.clipboard.writeText(value).then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1000);
+        });
+      }}
+      className={cn('flex items-center gap-1 transition-colors hover:text-foreground', className)}
+      title={t('Copy')}
+    >
+      <span className="t-icon-swap" data-state={copied ? 'b' : 'a'}>
+        <span className="t-icon inline-flex" data-icon="a">
+          <Copy className="h-3 w-3" />
+        </span>
+        <span className="t-icon inline-flex" data-icon="b">
+          <Check className="h-3 w-3" />
+        </span>
+      </span>
+      {label}
+    </button>
+  );
+}

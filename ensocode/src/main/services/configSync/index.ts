@@ -1,0 +1,762 @@
+import { randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { app } from '@platform';
+import { collectPresetPromptIds } from '@shared/presetPrompts';
+import type {
+  ConfigSyncCommitResult,
+  ConfigSyncExportOptions,
+  ConfigSyncExportResult,
+  ConfigSyncMode,
+  ConfigSyncOpenResult,
+  ConfigSyncPreviewResult,
+  ConfigSyncSummary,
+} from '@shared/types';
+import { resolveEditMode } from '@shared/types';
+import { persistedSettingsState } from '@shared/types/builtinTools';
+import {
+  commitSettingsTransaction,
+  readSettings,
+  SETTINGS_STATE_FIELDS,
+  type SettingsStateField,
+  settingsFingerprint,
+} from '../../ipc/settings';
+import { isValidId } from '../instructionStore';
+import {
+  deleteSystemPrompt,
+  readStoredSystemPrompt,
+  writeSystemPrompt,
+} from '../systemPromptStore';
+import { cleanupStagedResources, collectSkillResource, stageResources } from './assets';
+import {
+  ConfigSyncCodecError,
+  decodeBundle,
+  encodeBundle,
+  isEncryptedBundle,
+  redactBundle,
+  validateBundle,
+} from './codec';
+import { planImport } from './merge';
+import { type ConfigSyncBundle, PROVIDER_DEVICE_FIELDS } from './types';
+
+type SenderKey = number;
+const MAX_PACKAGE_BYTES = 64 * 1024 * 1024;
+const TOKEN_TTL_MS = 10 * 60 * 1000;
+type ConfigSyncFieldPolicy = { mode: 'portable' } | { mode: 'excluded'; reason: string };
+
+/** 每个持久化设置字段都必须先显式归类，避免未经审视就混进同步。 */
+export const CONFIG_SYNC_FIELD_POLICY = {
+  theme: { mode: 'portable' },
+  language: { mode: 'portable' },
+  terminalTheme: { mode: 'portable' },
+  terminalFontSize: { mode: 'portable' },
+  terminalFontFamily: { mode: 'portable' },
+  terminalFontWeight: { mode: 'portable' },
+  terminalFontWeightBold: { mode: 'portable' },
+  terminalShell: { mode: 'excluded', reason: 'platform-specific shell selection' },
+  worktreeRoot: { mode: 'excluded', reason: 'device-local worktree storage path' },
+  fileOpenRules: { mode: 'excluded', reason: 'device-local file opening applications and paths' },
+  contextMenuOpen: { mode: 'excluded', reason: 'device-local file link opening application' },
+  favoriteTerminalThemes: { mode: 'portable' },
+  statusLineSegments: { mode: 'portable' },
+  loadLocalSkills: { mode: 'portable' },
+  loadHarnessAssets: { mode: 'portable' },
+  windowsLocalShell: { mode: 'excluded', reason: 'platform-specific shell selection' },
+  exploreFoldEnabled: { mode: 'portable' },
+  rtkEnabled: { mode: 'portable' },
+  longCacheRetention: {
+    mode: 'excluded',
+    reason: 'device-local prompt cache cost policy',
+  },
+  computerPreview: { mode: 'excluded', reason: 'macOS-only desktop display preference' },
+  computerAllowAllApps: { mode: 'excluded', reason: 'device-local computer control trust' },
+  openLinksInBuiltinBrowser: { mode: 'excluded', reason: 'desktop link-opening preference' },
+  editMode: { mode: 'portable' },
+  hashlineEditEnabled: { mode: 'excluded', reason: 'legacy read-only edit mode migration' },
+  compactStrategy: { mode: 'portable' },
+  smartCompactEnabled: { mode: 'portable' },
+  smartCompactModel: { mode: 'portable' },
+  smartCompactMode: { mode: 'portable' },
+  memoryEmbeddingModel: { mode: 'portable' },
+  memoryEmbeddingAutoDownload: {
+    mode: 'excluded',
+    reason: 'device policy for a multi-hundred-MB model download',
+  },
+  memoryModelIdleMinutes: { mode: 'excluded', reason: 'device-local model residency policy' },
+  memoryEmbeddingRemoteProviderId: {
+    mode: 'excluded',
+    reason: 'references a device-local provider record id',
+  },
+  memoryDistillEnabled: { mode: 'portable' },
+  memoryKgEnabled: { mode: 'portable' },
+  // 记忆库是每台机器一份（userData/memory/memory.db），遗忘策略作用于本机库：
+  // 同步到另一台机器等于在那边按同一阈值归档，属于不该跨机复制的数据决策
+  memoryReconcileEnabled: { mode: 'excluded', reason: 'device-local memory library policy' },
+  memoryDecayEnabled: { mode: 'excluded', reason: 'device-local memory library policy' },
+  memoryDecayArchiveCandidates: { mode: 'excluded', reason: 'device-local memory library policy' },
+  memoryDecayAutoArchive: { mode: 'excluded', reason: 'device-local memory library policy' },
+  memoryDecayStaleDays: { mode: 'excluded', reason: 'device-local memory library policy' },
+  memoryDecayMaxImportance: { mode: 'excluded', reason: 'device-local memory library policy' },
+  memoryDecayIntervalDays: { mode: 'excluded', reason: 'device-local memory library policy' },
+  memoryDistillWindowMinutes: { mode: 'excluded', reason: 'device-local memory library policy' },
+  botModeEnabled: { mode: 'excluded', reason: 'bot members and chats live on this device' },
+  scratchSessionsEnabled: {
+    mode: 'excluded',
+    reason: 'temporary chats are a device-local experiment',
+  },
+  dropShelfEnabled: { mode: 'excluded', reason: 'macOS drop shelf is a device-local experiment' },
+  secretaryEnabled: { mode: 'excluded', reason: 'secretary lives on this device' },
+  botMaxRunningTurns: { mode: 'excluded', reason: 'device-local Bot concurrency limit' },
+  botDiscussModeEnabled: {
+    mode: 'excluded',
+    reason: 'experimental Bot discussion toggle; bot chats live on this device',
+  },
+  botRouteClassifier: { mode: 'excluded', reason: 'bot members and chats live on this device' },
+  botAssistantModel: { mode: 'excluded', reason: 'bot members and chats live on this device' },
+  protectedActionsInCode: { mode: 'excluded', reason: 'device-local safety preference' },
+  dcgEnabled: { mode: 'excluded', reason: 'dcg binary is installed on this device' },
+  autoUpdate: { mode: 'excluded', reason: 'device update policy' },
+  autoRestartForUpdate: { mode: 'excluded', reason: 'device update policy' },
+  updateChannel: { mode: 'excluded', reason: 'device update policy' },
+  pluginAutoUpdate: { mode: 'excluded', reason: 'device update policy' },
+  proxyMode: { mode: 'excluded', reason: 'device network configuration' },
+  customProxyUrl: { mode: 'excluded', reason: 'device network configuration may contain secrets' },
+  customCaCertPath: { mode: 'excluded', reason: 'device-local certificate file path' },
+  sshTimeoutSeconds: { mode: 'excluded', reason: 'device network configuration' },
+  openChangesOnFileEdit: { mode: 'portable' },
+  compactReadOnlyTools: { mode: 'portable' },
+  expandLiveEdits: { mode: 'portable' },
+  expandLiveReasoning: { mode: 'portable' },
+  autoCollapseTurns: { mode: 'portable' },
+  collapseCompletedActivity: { mode: 'portable' },
+  collapseLiveActivity: { mode: 'portable' },
+  liveActivityFoldDelaySec: { mode: 'portable' },
+  pinUnfinishedTodos: { mode: 'portable' },
+  pinnedModels: { mode: 'excluded', reason: 'starred keys reference device-local provider ids' },
+  headerSessionTabs: { mode: 'excluded', reason: 'desktop window chrome layout preference' },
+  headerRecentMinutes: { mode: 'excluded', reason: 'desktop window chrome layout preference' },
+  chatWide: { mode: 'portable' },
+  navRailSide: { mode: 'portable' },
+  chatTypography: { mode: 'portable' },
+  notifyMainAgentOnly: { mode: 'portable' },
+  maxActiveCoworkers: { mode: 'portable' },
+  autoRetryLimit: { mode: 'portable' },
+  privacyMasking: {
+    mode: 'excluded',
+    reason: 'custom words and allow list may themselves be sensitive',
+  },
+  shell: {
+    mode: 'excluded',
+    reason: 'device-local command time limits and rollback switch',
+  },
+  generationStallTimeoutMin: { mode: 'portable' },
+  autoArchiveIdleDays: { mode: 'portable' },
+  autoArchiveMergedWorktrees: { mode: 'portable' },
+  autoDeleteArchivedDays: { mode: 'portable' },
+  activeRetentionMinutes: { mode: 'portable' },
+  backgroundImageEnabled: {
+    mode: 'excluded',
+    reason: 'background appearance activation could enable unavailable or private resources',
+  },
+  backgroundSourceType: {
+    mode: 'excluded',
+    reason: 'background appearance source is device-local or remote',
+  },
+  backgroundImagePath: { mode: 'excluded', reason: 'device-local background resource path' },
+  backgroundFolderPath: { mode: 'excluded', reason: 'device-local background resource path' },
+  backgroundUrlPath: { mode: 'excluded', reason: 'remote background resource URL' },
+  backgroundRandomEnabled: {
+    mode: 'excluded',
+    reason: 'background activation depends on an unavailable local or remote resource',
+  },
+  backgroundRandomInterval: { mode: 'portable' },
+  backgroundOpacity: { mode: 'portable' },
+  backgroundBlur: { mode: 'portable' },
+  backgroundBrightness: { mode: 'portable' },
+  backgroundSaturation: { mode: 'portable' },
+  backgroundMask: { mode: 'portable' },
+  borderOpacity: { mode: 'portable' },
+  backgroundComposerOpacity: { mode: 'portable' },
+  backgroundCodeOpacity: { mode: 'portable' },
+  backgroundSizeMode: { mode: 'portable' },
+  accentColor: { mode: 'portable' },
+  themeId: { mode: 'excluded', reason: 'theme may come from a device-local plugin' },
+  userCssEnabled: { mode: 'excluded', reason: 'user.css is a device-local file' },
+  backgroundRefreshNonce: { mode: 'excluded', reason: 'device appearance preference' },
+  providers: { mode: 'portable' },
+  defaultModel: { mode: 'portable' },
+  defaultModelFollowLast: { mode: 'portable' },
+  titleSummaryEnabled: { mode: 'portable' },
+  titleSummaryModel: { mode: 'portable' },
+  imageGenerationModel: { mode: 'portable' },
+  memoryDistillModel: { mode: 'portable' },
+  memoryChatModel: { mode: 'portable' },
+  memoryLanguage: { mode: 'portable' },
+  approvalReviewer: { mode: 'portable' },
+  approvalAutoManage: {
+    mode: 'excluded',
+    reason: 'device-local opt-in to skip human approval prompts',
+  },
+  approvalAllowThreshold: {
+    mode: 'excluded',
+    reason: 'device-local assistant approval risk preference',
+  },
+  lastApprovalMode: { mode: 'excluded', reason: 'last session choice' },
+  defaultReasoningEnabled: { mode: 'portable' },
+  defaultThinkingLevel: { mode: 'portable' },
+  subagentModelsEnabled: { mode: 'portable' },
+  subagentModels: { mode: 'portable' },
+  skills: { mode: 'portable' },
+  mcpServers: { mode: 'portable' },
+  instructions: { mode: 'portable' },
+  presets: { mode: 'portable' },
+  defaultPresetId: { mode: 'portable' },
+  agentTypes: { mode: 'portable' },
+  disabledBuiltinAgentTypes: { mode: 'portable' },
+  disabledBuiltinTools: { mode: 'portable' },
+  webSearchChain: {
+    mode: 'excluded',
+    // 链条目引用本机 provider 条目 id（自定义 provider 是安装期 uuid），跨机导出会悬空；
+    // 且候选可用性取决于本机凭证，按机器单独配置更不容易误配
+    reason: 'references per-installation provider entries',
+  },
+  disabledWorkflowPresets: {
+    mode: 'excluded',
+    reason: 'pairs with device-local custom workflow presets in userData',
+  },
+  subagentAllowedModes: { mode: 'portable' },
+  onboarded: { mode: 'excluded', reason: 'device onboarding state' },
+  keybindings: { mode: 'portable' },
+  projects: { mode: 'excluded', reason: 'device-local paths and authority records' },
+  projectGroups: { mode: 'excluded', reason: 'device-local project grouping' },
+  usageModelPricing: { mode: 'portable' },
+  virtualModels: { mode: 'excluded', reason: 'virtual model routing is not synced yet' },
+} as const satisfies Record<SettingsStateField, ConfigSyncFieldPolicy>;
+
+export const SYNC_FIELDS = SETTINGS_STATE_FIELDS.filter(
+  (field) => CONFIG_SYNC_FIELD_POLICY[field].mode === 'portable'
+);
+
+type TokenEntry = {
+  senderId: SenderKey;
+  expiresAt: number;
+  fileName: string;
+  bytes: Buffer;
+  encrypted: boolean;
+  bundle?: ConfigSyncBundle;
+  mode?: ConfigSyncMode;
+  fingerprint?: string;
+  plan?: ReturnType<typeof planImport>;
+};
+
+const tokens = new Map<string, TokenEntry>();
+
+function resultError(error: string): { ok: false; error: string } {
+  return { ok: false, error };
+}
+
+/** 可直接展示给用户的导出失败原因 */
+class ExportError extends Error {}
+
+const MISSING_SYSTEM_PROMPT = 'A preset uses a system prompt that is missing or empty.';
+const WRITE_FAILED = 'Could not write the export file. Check that the folder is writable.';
+const SYMLINK_TARGET = 'The selected file is a symbolic link. Choose a different location.';
+
+function stateOf(settings: Record<string, unknown> | null): Record<string, unknown> {
+  return persistedSettingsState(settings?.['enso-settings']) ?? {};
+}
+
+function referencedSystemPromptIds(value: unknown): Set<string> {
+  const ids = new Set<string>();
+  if (!Array.isArray(value)) return ids;
+  for (const preset of value) {
+    for (const id of collectPresetPromptIds(preset)) ids.add(id);
+  }
+  return ids;
+}
+
+function portableState(state: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const field of SYNC_FIELDS) {
+    if (field in state) result[field] = structuredClone(state[field]);
+  }
+  if ('editMode' in state || 'hashlineEditEnabled' in state) {
+    result.editMode = resolveEditMode(state.editMode, state.hashlineEditEnabled);
+    delete result.hashlineEditEnabled;
+  }
+  delete result.bashInterceptEnabled;
+  // 旧版本不认识 'theme' 会整包拒绝导入；它本就是默认值，缺省时导入方保留本机设置
+  if (result.accentColor === 'theme') delete result.accentColor;
+  for (const field of [
+    'providers',
+    'skills',
+    'mcpServers',
+    'instructions',
+    'presets',
+    'agentTypes',
+    'subagentModels',
+  ]) {
+    if (!(field in result)) result[field] = [];
+  }
+  for (const skill of Array.isArray(result.skills) ? result.skills : []) {
+    if (skill && typeof skill === 'object') (skill as Record<string, unknown>).path = '';
+  }
+  for (const instruction of Array.isArray(result.instructions) ? result.instructions : []) {
+    if (instruction && typeof instruction === 'object') {
+      delete (instruction as Record<string, unknown>).sourcePath;
+      (instruction as Record<string, unknown>).local = false;
+    }
+  }
+  // OAuth 登录态绝不可迁移，加密包也一样。保留省略标记，
+  // 让预览能展示原本无从触发的重新登录提醒。
+  for (const provider of Array.isArray(result.providers) ? result.providers : []) {
+    if (provider && typeof provider === 'object') {
+      const entry = provider as Record<string, unknown>;
+      for (const field of PROVIDER_DEVICE_FIELDS) delete entry[field];
+      if (entry.oauthAccountKey !== undefined) {
+        delete entry.oauthAccountKey;
+        const omitted = Array.isArray(entry.omittedFields)
+          ? entry.omittedFields.filter((field): field is string => typeof field === 'string')
+          : [];
+        entry.omittedFields = [...new Set([...omitted, 'oauthAccountKey'])];
+      }
+      if (entry.oauthAccountPool !== undefined) {
+        delete entry.oauthAccountPool;
+        const omitted = Array.isArray(entry.omittedFields) ? entry.omittedFields : [];
+        entry.omittedFields = [...new Set([...omitted, 'oauthAccountPool'])];
+      }
+    }
+  }
+  return result;
+}
+
+function collectBundle(secretsIncluded: boolean): {
+  bundle: ConfigSyncBundle;
+  skippedInstructions: string[];
+} {
+  const sourceState = stateOf(readSettings());
+  const state = portableState(sourceState);
+  const skills = [] as ConfigSyncBundle['resources']['skills'];
+  const instructions = [] as ConfigSyncBundle['resources']['instructions'];
+  const systemPrompts = [] as NonNullable<ConfigSyncBundle['resources']['systemPrompts']>;
+  const rawSkills = Array.isArray(sourceState.skills) ? sourceState.skills : [];
+  const portableSkills = Array.isArray(state.skills) ? state.skills : [];
+  const keptSkillIds = new Set<string>();
+  for (const value of rawSkills) {
+    if (!value || typeof value !== 'object') continue;
+    const skill = value as Record<string, unknown>;
+    if (typeof skill.id !== 'string' || typeof skill.path !== 'string' || !skill.path) continue;
+    try {
+      skills.push(collectSkillResource(skill.id, skill.path));
+      keptSkillIds.add(skill.id);
+    } catch {
+      // 跳过不可读、缺失或为符号链接的技能，保证包里其余内容照常导出。
+    }
+  }
+  state.skills = portableSkills.filter(
+    (item) =>
+      item && typeof item === 'object' && keptSkillIds.has(String((item as { id?: unknown }).id))
+  );
+  const pruneSkillIds = (value: unknown): unknown => {
+    if (!Array.isArray(value)) return value;
+    return value.filter((id) => typeof id === 'string' && keptSkillIds.has(id));
+  };
+  if (Array.isArray(state.presets)) {
+    state.presets = state.presets.map((item) => {
+      if (!item || typeof item !== 'object') return item;
+      const preset = item as Record<string, unknown>;
+      if (!('skillIds' in preset)) return preset;
+      return { ...preset, skillIds: pruneSkillIds(preset.skillIds) };
+    });
+  }
+  if (Array.isArray(state.agentTypes)) {
+    state.agentTypes = state.agentTypes.map((item) => {
+      if (!item || typeof item !== 'object') return item;
+      const agent = item as Record<string, unknown>;
+      if (!('skillIds' in agent)) return agent;
+      return { ...agent, skillIds: pruneSkillIds(agent.skillIds) };
+    });
+  }
+  const rawInstructions = Array.isArray(sourceState.instructions) ? sourceState.instructions : [];
+  const keptInstructionIds = new Set<string>();
+  const skippedInstructions: string[] = [];
+  for (const value of rawInstructions) {
+    if (!value || typeof value !== 'object') continue;
+    const instruction = value as Record<string, unknown>;
+    if (typeof instruction.id !== 'string') continue;
+    const local = instruction.local === true;
+    const sourcePath = typeof instruction.sourcePath === 'string' ? instruction.sourcePath : '';
+    const path = local
+      ? isValidId(instruction.id)
+        ? join(app.getPath('userData'), 'instructions', `${instruction.id}.md`)
+        : ''
+      : sourcePath;
+    let content: string;
+    try {
+      if (!path || !lstatSync(path).isFile()) throw new Error('Instruction source is unavailable');
+      content = readFileSync(path, 'utf8');
+    } catch {
+      // 源文件被删除/移走/不可读：跳过该条并报告，其余配置照常导出
+      skippedInstructions.push(
+        typeof instruction.name === 'string' && instruction.name ? instruction.name : instruction.id
+      );
+      continue;
+    }
+    const bytes = Buffer.byteLength(content, 'utf8');
+    const portable = (Array.isArray(state.instructions) ? state.instructions : []).find(
+      (item) =>
+        item && typeof item === 'object' && (item as Record<string, unknown>).id === instruction.id
+    ) as Record<string, unknown> | undefined;
+    if (portable) portable.bytes = bytes;
+    instructions.push({ id: instruction.id, content });
+    keptInstructionIds.add(instruction.id);
+  }
+  if (Array.isArray(state.instructions)) {
+    state.instructions = state.instructions.filter(
+      (item) =>
+        item &&
+        typeof item === 'object' &&
+        keptInstructionIds.has(String((item as { id?: unknown }).id))
+    );
+  }
+  if (Array.isArray(state.presets)) {
+    state.presets = state.presets.map((item) => {
+      if (!item || typeof item !== 'object') return item;
+      const preset = item as Record<string, unknown>;
+      if (
+        preset.instructionId === undefined ||
+        keptInstructionIds.has(String(preset.instructionId))
+      )
+        return preset;
+      const { instructionId: _dropped, ...rest } = preset;
+      return rest;
+    });
+  }
+  const collectedSystemPromptIds = new Set<string>();
+  for (const value of Array.isArray(state.presets) ? state.presets : []) {
+    for (const systemPromptId of collectPresetPromptIds(value)) {
+      if (collectedSystemPromptIds.has(systemPromptId)) continue;
+      const result = readStoredSystemPrompt(systemPromptId);
+      if (!result.ok) throw new ExportError(MISSING_SYSTEM_PROMPT);
+      collectedSystemPromptIds.add(systemPromptId);
+      systemPrompts.push({ id: systemPromptId, content: result.content });
+    }
+  }
+  return {
+    bundle: {
+      format: 'enso-config',
+      version: 1,
+      createdAt: new Date().toISOString(),
+      state,
+      resources: { skills, instructions, systemPrompts },
+      secretsIncluded,
+    } as unknown as ConfigSyncBundle,
+    skippedInstructions,
+  };
+}
+
+function assertToken(token: string, senderId: SenderKey): TokenEntry | null {
+  const entry = tokens.get(token);
+  if (!entry || entry.senderId !== senderId || entry.expiresAt <= Date.now()) {
+    if (entry?.expiresAt && entry.expiresAt <= Date.now()) tokens.delete(token);
+    return null;
+  }
+  return entry;
+}
+
+export async function exportConfigToPath(
+  options: ConfigSyncExportOptions,
+  filePath: string
+): Promise<ConfigSyncExportResult> {
+  try {
+    if (!options || typeof options.includeSecrets !== 'boolean')
+      return resultError('Invalid export options');
+    if (
+      options.includeSecrets &&
+      (!options.password || options.password.length < 8 || options.password.length > 1024)
+    ) {
+      return resultError('Export password must be between 8 and 1024 characters.');
+    }
+    const collected = collectBundle(options.includeSecrets);
+    let bundle = collected.bundle;
+    if (
+      !options.includeSecrets &&
+      (bundle.resources.skills.length > 0 ||
+        bundle.resources.instructions.length > 0 ||
+        (bundle.resources.systemPrompts?.length ?? 0) > 0)
+    ) {
+      return resultError(
+        'Skill, instruction, and system prompt contents require an encrypted export.'
+      );
+    }
+    if (!options.includeSecrets) bundle = redactBundle(bundle);
+    const bytes = await encodeBundle(bundle, options.includeSecrets ? options.password : undefined);
+    if (bytes.byteLength > MAX_PACKAGE_BYTES)
+      return resultError('Configuration package is too large.');
+    const existing = (() => {
+      try {
+        return lstatSync(filePath);
+      } catch {
+        return null;
+      }
+    })();
+    if (existing?.isSymbolicLink()) return resultError(SYMLINK_TARGET);
+    const tempPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
+    let fd: number | null = null;
+    try {
+      fd = openSync(tempPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+      writeFileSync(fd, bytes);
+      closeSync(fd);
+      fd = null;
+      renameSync(tempPath, filePath);
+    } catch (error) {
+      console.error('[configSync] export write failed', error);
+      return resultError(WRITE_FAILED);
+    } finally {
+      if (fd !== null) closeSync(fd);
+      rmSync(tempPath, { force: true });
+    }
+    return collected.skippedInstructions.length
+      ? { ok: true, filePath, skippedInstructions: collected.skippedInstructions }
+      : { ok: true, filePath };
+  } catch (error) {
+    console.error('[configSync] export failed', error);
+    if (error instanceof ExportError) return resultError(error.message);
+    return resultError('Unable to export configuration.');
+  }
+}
+
+export async function openImportForSender(
+  senderId: SenderKey,
+  filePath: string | null
+): Promise<ConfigSyncOpenResult> {
+  if (!filePath) return { ok: false, error: 'Import cancelled.', cancelled: true };
+  let fd: number | null = null;
+  try {
+    fd = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > MAX_PACKAGE_BYTES) {
+      return resultError('Invalid configuration package.');
+    }
+    const bytes = readFileSync(fd);
+    if (bytes.byteLength > MAX_PACKAGE_BYTES)
+      return resultError('Configuration package is too large.');
+    const token = randomUUID();
+    const entry: TokenEntry = {
+      senderId,
+      expiresAt: Date.now() + TOKEN_TTL_MS,
+      fileName: basename(filePath),
+      bytes,
+      encrypted: isEncryptedBundle(bytes),
+    };
+    tokens.set(token, entry);
+    const expiryTimer = setTimeout(() => {
+      if (tokens.get(token) === entry) tokens.delete(token);
+    }, TOKEN_TTL_MS);
+    expiryTimer.unref();
+    return { ok: true, token, encrypted: entry.encrypted, fileName: entry.fileName };
+  } catch {
+    return resultError('Unable to read configuration package.');
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
+
+export async function previewImportForSender(
+  senderId: SenderKey,
+  token: string,
+  password: string | undefined,
+  mode: ConfigSyncMode
+): Promise<ConfigSyncPreviewResult> {
+  const entry = assertToken(token, senderId);
+  if (!entry || (mode !== 'merge' && mode !== 'replace'))
+    return resultError('Import session expired.');
+  try {
+    if (entry.encrypted && entry.bundle) {
+      // 解密/校验成功的结果按这个绑定 sender 的 token 缓存。
+      // 切换模式不能迫使 renderer 保留或重发密码。
+      const current = stateOf(readSettings());
+      const plan = planImport(current, entry.bundle, mode);
+      entry.mode = mode;
+      entry.fingerprint = settingsFingerprint(readSettings());
+      entry.plan = plan;
+      return {
+        ok: true,
+        summary: plan.summary as ConfigSyncSummary[],
+        warnings: plan.warnings,
+        mode,
+      };
+    }
+    if (entry.encrypted && (!password || password.length < 8 || password.length > 1024))
+      return resultError('Import password must be between 8 and 1024 characters.');
+    const bundle = validateBundle(await decodeBundle(entry.bytes, password));
+    const current = stateOf(readSettings());
+    const plan = planImport(current, bundle, mode);
+    entry.bundle = bundle;
+    entry.mode = mode;
+    entry.fingerprint = settingsFingerprint(readSettings());
+    entry.plan = plan;
+    return {
+      ok: true,
+      summary: plan.summary as ConfigSyncSummary[],
+      warnings: plan.warnings,
+      mode,
+    };
+  } catch (error) {
+    if (error instanceof ConfigSyncCodecError) {
+      return resultError('Incorrect password or damaged configuration package.');
+    }
+    return resultError(
+      error instanceof Error && error.message
+        ? error.message
+        : 'Unable to apply this configuration package.'
+    );
+  }
+}
+
+export async function commitImportForSender(
+  senderId: SenderKey,
+  token: string,
+  mode: ConfigSyncMode
+): Promise<ConfigSyncCommitResult> {
+  const entry = assertToken(token, senderId);
+  if (!entry?.plan || !entry.bundle || entry.mode !== mode || !entry.fingerprint) {
+    return resultError('Import must be previewed before commit.');
+  }
+  let staged: {
+    batchRoot: string;
+    skillPaths: Map<string, string>;
+    instructionPaths: Map<string, string>;
+  } | null = null;
+  let stagedSystemPromptIds: string[] = [];
+  const rollbackSystemPrompts = (): void => {
+    for (const id of stagedSystemPromptIds) deleteSystemPrompt(id);
+    stagedSystemPromptIds = [];
+  };
+  try {
+    const currentState = stateOf(readSettings());
+    const previousSystemPromptIds = referencedSystemPromptIds(currentState.presets);
+    staged = stageResources(
+      app.getPath('userData'),
+      entry.bundle.resources.skills,
+      entry.bundle.resources.instructions
+    );
+    const patch: Record<string, unknown> = {};
+    for (const field of SYNC_FIELDS) {
+      if (field in entry.plan.state) patch[field] = entry.plan.state[field];
+    }
+    const skillPathByDestination = new Map<string, string>();
+    for (const [sourceId, destinationId] of Object.entries(entry.plan.skillIdMap)) {
+      const path = staged.skillPaths.get(sourceId);
+      if (path) skillPathByDestination.set(destinationId, path);
+    }
+    const instructionPathByDestination = new Map<string, string>();
+    for (const [sourceId, destinationId] of Object.entries(entry.plan.instructionIdMap)) {
+      const path = staged.instructionPaths.get(sourceId);
+      if (path) instructionPathByDestination.set(destinationId, path);
+    }
+    const skills = Array.isArray(patch.skills) ? patch.skills : [];
+    patch.skills = skills.map((value) => {
+      if (!value || typeof value !== 'object') return value;
+      const item = { ...(value as Record<string, unknown>) };
+      const path = skillPathByDestination.get(String(item.id));
+      if (path) item.path = path;
+      return item;
+    });
+    const instructions = Array.isArray(patch.instructions) ? patch.instructions : [];
+    patch.instructions = instructions.map((value) => {
+      if (!value || typeof value !== 'object') return value;
+      const item = { ...(value as Record<string, unknown>) };
+      const path = instructionPathByDestination.get(String(item.id));
+      if (path) {
+        item.local = false;
+        item.sourcePath = path;
+        item.bytes = Buffer.byteLength(
+          entry.bundle?.resources.instructions.find(
+            (resource: { id: string }) =>
+              entry.plan?.instructionIdMap[resource.id] === String(item.id)
+          )?.content ?? '',
+          'utf8'
+        );
+      }
+      return item;
+    });
+    const usedSystemPromptIds = new Set(previousSystemPromptIds);
+    const systemPromptIdMap = new Map<string, string>();
+    for (const resource of entry.bundle.resources.systemPrompts ?? []) {
+      let destinationId = randomUUID();
+      while (usedSystemPromptIds.has(destinationId) || readStoredSystemPrompt(destinationId).ok) {
+        destinationId = randomUUID();
+      }
+      usedSystemPromptIds.add(destinationId);
+      systemPromptIdMap.set(resource.id, destinationId);
+    }
+    const promptKeys = [
+      'systemPromptId',
+      'systemPromptTailId',
+      'boostPromptId',
+      'refusalRetryPromptId',
+    ] as const;
+    const importedPromptIdsByPreset = new Map<string, Record<string, string>>();
+    for (const preset of entry.bundle.state.presets) {
+      const presetId = entry.plan.presetIdMap[preset.id];
+      if (!presetId) continue;
+      const mapped: Record<string, string> = {};
+      for (const key of promptKeys) {
+        const oldId = preset[key];
+        if (typeof oldId !== 'string') continue;
+        const promptId = systemPromptIdMap.get(oldId);
+        if (!promptId) throw new Error('Unable to map system prompt resource');
+        mapped[key] = promptId;
+      }
+      if (Object.keys(mapped).length > 0) importedPromptIdsByPreset.set(presetId, mapped);
+    }
+    const presets = Array.isArray(patch.presets) ? patch.presets : [];
+    patch.presets = presets.map((value) => {
+      if (!value || typeof value !== 'object') return value;
+      const item = { ...(value as Record<string, unknown>) };
+      const mapped = importedPromptIdsByPreset.get(String(item.id));
+      if (mapped) Object.assign(item, mapped);
+      return item;
+    });
+    for (const resource of entry.bundle.resources.systemPrompts ?? []) {
+      const destinationId = systemPromptIdMap.get(resource.id);
+      if (!destinationId) throw new Error('Unable to map system prompt resource');
+      stagedSystemPromptIds.push(destinationId);
+      const written = writeSystemPrompt(destinationId, resource.content);
+      if (!written.ok) throw new Error('Unable to stage system prompt resource');
+    }
+    const committed = commitSettingsTransaction(entry.fingerprint, patch);
+    if (!committed.ok) {
+      cleanupStagedResources([staged.batchRoot]);
+      rollbackSystemPrompts();
+      return resultError(committed.error ?? 'Unable to commit configuration.');
+    }
+    stagedSystemPromptIds = [];
+    tokens.delete(token);
+    return { ok: true, backupPath: committed.backupPath ?? '', warnings: entry.plan.warnings };
+  } catch {
+    if (staged) cleanupStagedResources([staged.batchRoot]);
+    rollbackSystemPrompts();
+    return resultError('Unable to commit configuration.');
+  }
+}
+
+export function cancelImportForSender(senderId: SenderKey, token: string): void {
+  const entry = tokens.get(token);
+  if (entry?.senderId === senderId) tokens.delete(token);
+}
+
+export function clearConfigSyncTokens(): void {
+  tokens.clear();
+}

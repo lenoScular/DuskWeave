@@ -1,0 +1,43 @@
+.dusk-models { display: flex; min-height: 0; flex: 1; flex-direction: column; }
+.dusk-models-content { min-height: 0; flex: 1; overflow-y: auto; padding: 28px 32px 32px; }
+.dusk-models-content h1 { font: 600 40px/1.25 var(--dusk-display); }
+.dusk-models-summary { margin-top: 8px; color: var(--dusk-muted); }
+.dusk-models-tabs { display: flex; gap: 20px; margin: 24px 0 20px; border-bottom: 1px solid var(--dusk-line); color: var(--dusk-muted); }
+.dusk-models-tabs > * { padding: 0 8px 8px; }
+.dusk-models-tabs [aria-current] { border-bottom: 2px solid var(--dusk-primary); color: var(--dusk-primary); font-weight: 600; }
+.dusk-models-tabs button:hover { color: var(--dusk-ink); }
+.dusk-models-grid { display: grid; grid-template-columns: 246px minmax(0, 1fr); align-items: start; gap: 28px; }
+.dusk-models-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+.dusk-models-row h2, .dusk-models-row h3 { font-weight: 600; }
+.dusk-models-outline { display: inline-flex; min-height: 36px; align-items: center; gap: 8px; padding: 0 14px; border: 1px solid var(--dusk-line); border-radius: var(--dusk-radius); color: var(--dusk-muted); white-space: nowrap; }
+.dusk-models-outline:hover:not(:disabled) { border-color: var(--dusk-primary); color: var(--dusk-ink); }
+.dusk-models-services { margin-top: 12px; }
+.dusk-models-services button { display: grid; width: 100%; min-height: 60px; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; padding: 8px 12px; border-radius: var(--dusk-radius); text-align: left; }
+.dusk-models-services button:hover, .dusk-models-services button[aria-pressed=true] { background: var(--dusk-raised); }
+.dusk-models-services strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dusk-models-services span, .dusk-models-services small, .dusk-models-back { font-size: 12px; }
+.dusk-models-services span, .dusk-models-back { color: var(--dusk-primary); }
+.dusk-models-services small { grid-column: 1/-1; color: var(--dusk-quiet); }
+.dusk-models-back { display: inline-flex; align-items: center; gap: 6px; margin-top: 20px; padding: 0 8px; }
+.dusk-models-back:hover { text-decoration: underline; }
+.dusk-models-form { min-width: 0; padding: 20px; border-radius: var(--dusk-radius); background: var(--dusk-panel); }
+.dusk-models-form > h2 { font: 600 26px/1.25 var(--dusk-display); }
+.dusk-models-fields { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(0, 2fr) minmax(0, 1fr); gap: 12px; margin-top: 12px; }
+.dusk-models-fields label { min-width: 0; }
+.dusk-models-form input:not([type=checkbox]), .dusk-models-form select { display: block; width: 100%; height: 40px; margin-top: 8px; padding: 0 12px; border: 1px solid var(--dusk-line); border-radius: var(--dusk-radius); background: var(--dusk-surface); color: var(--dusk-ink); }
+.dusk-models-form input::placeholder { color: var(--dusk-quiet); }
+.dusk-models-key { display: block; max-width: 420px; margin-top: 12px; color: var(--dusk-muted); }
+.dusk-models-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--dusk-line); }
+.dusk-models-section p { margin-top: 4px; color: var(--dusk-quiet); font-size: 12px; }
+.dusk-models-form details { margin-top: 12px; color: var(--dusk-muted); font-size: 12px; }
+.dusk-models-form details > div { justify-content: flex-start; align-items: end; margin-top: 8px; }
+.dusk-models-catalog { margin-top: 12px; padding: 8px 12px; border-radius: var(--dusk-radius); background: var(--dusk-surface); }
+.dusk-models-catalog ul { max-height: 176px; overflow-y: auto; }
+.dusk-models-catalog li > label { display: flex; min-height: 36px; align-items: center; gap: 10px; border-bottom: 1px solid var(--dusk-line); }
+.dusk-models-search { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--dusk-line); color: var(--dusk-muted); }
+.dusk-models-search small { white-space: nowrap; }
+.dusk-models-form .dusk-models-search input { height: 32px; margin: 0; border: none; }
+.dusk-models-form input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--dusk-primary); }
+.dusk-models-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.dusk-models-actions .dusk-welcome-primary { height: 36px; }
+@media (max-width: 1100px) { .dusk-models-grid { grid-template-columns: 180px minmax(0, 1fr); gap: 16px; } .dusk-models-fields { grid-template-columns: 1fr; } }

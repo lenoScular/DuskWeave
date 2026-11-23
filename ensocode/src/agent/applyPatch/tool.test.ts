@@ -1,0 +1,116 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { SshExecutor } from '../ssh/executor';
+import { type ApplyPatchDetails, createApplyPatchTool, createRemoteApplyPatchIo } from './index';
+
+const input = '*** Begin Patch\n*** Add File: a.txt\n+a\n*** End Patch';
+
+describe('apply_patch tool 与 SSH IO', () => {
+  it('暴露完整且排他的 {input:string} schema，并在校验前归一', () => {
+    const tool = createApplyPatchTool({ cwd: '/tmp' });
+    expect(tool.name).toBe('apply_patch');
+    expect(tool.promptSnippet).not.toMatch(/atomic/i);
+    expect(tool.promptSnippet).toBe('The `apply_patch` tool can be used to edit files.');
+    expect(tool.description).toContain(tool.promptSnippet);
+    expect(tool.description).toContain('*** Add File: hello.txt');
+    expect(tool.description).toContain('+Hello world');
+    expect(tool.description).toContain('*** Update File: src/app.py');
+    expect(tool.description).toContain('*** Move to: src/main.py');
+    expect(tool.description).toContain('*** Delete File: obsolete.txt');
+    expect(tool.description).toContain(
+      'You must prefix new lines with `+` even when creating a new file'
+    );
+    expect(tool.description).not.toContain('start: begin_patch hunk+ end_patch');
+    expect(tool.description).not.toContain('add_hunk:');
+    expect(tool.description).not.toMatch(/%import common\.LF/);
+    expect(tool.description?.match(/\*\*\* Begin Patch/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(tool.parameters).toMatchObject({
+      type: 'object',
+      properties: {
+        input: {
+          type: 'string',
+          description: expect.stringContaining('*** Begin Patch'),
+        },
+      },
+      required: ['input'],
+      additionalProperties: false,
+    });
+    expect(tool.prepareArguments?.(input)).toEqual({ input });
+    expect(tool.description).toContain(
+      'The first line must be exactly `*** Begin Patch` and the last line exactly `*** End Patch`'
+    );
+    expect(tool.description).toContain('no extra asterisks on those marker lines');
+    expect(tool.description).toContain('not a git unified diff');
+    expect(tool.description).toContain('Do not emit git hunk headers');
+    expect(tool.description).toContain('Every Update must contain `-` or `+` lines');
+    expect(tool.promptGuidelines?.join('\n')).toContain(
+      'Every Update must contain `-` or `+` lines'
+    );
+    expect(tool.promptGuidelines?.join('\n')).toContain('exactly `*** Begin Patch`');
+    expect(tool.promptGuidelines?.join('\n')).toContain('not a git unified diff');
+    expect(tool.promptGuidelines?.join('\n')).toContain('do not close it between files');
+    expect(
+      (tool.parameters as { properties: { input: { description: string } } }).properties.input
+        .description
+    ).toContain('no trailing `***`');
+    expect(tool.prepareArguments?.(JSON.stringify({ input, path: 'bad' }))).toEqual({
+      input,
+      path: 'bad',
+    });
+  });
+
+  it('execute 也走同一归一且拒绝混入 path/edits', async () => {
+    const tool = createApplyPatchTool({ cwd: '/tmp' });
+    const result = await tool.execute(
+      'call',
+      { input, edits: [] } as never,
+      new AbortController().signal,
+      undefined,
+      undefined as never
+    );
+    expect(result.details).toMatchObject({
+      status: 'failed',
+      error: 'apply_patch accepts exactly one string property: input',
+      input,
+    });
+  });
+
+  it('失败 details 用 kind discriminator，不自创 isError', () => {
+    const details: ApplyPatchDetails = {
+      kind: 'apply_patch',
+      status: 'failed',
+      fileChanges: [],
+      applied: [],
+      failed: ['x'],
+      error: 'failure',
+      unattempted: [],
+      uncertain: [],
+    };
+    expect(details).not.toHaveProperty('isError');
+  });
+
+  it('远端命令使用固定脚本和独立 argv 传路径，不把路径插进 shell 文本', async () => {
+    const calls: Array<{ command: string[] | string; stdin?: string | Buffer }> = [];
+    const executor = {
+      host: 'mock',
+      exec: vi.fn(async (command: string[] | string, options?: { stdin?: string | Buffer }) => {
+        calls.push({ command, stdin: options?.stdin });
+        return { stdout: '', stderr: '', code: 0 };
+      }),
+      execRaw: vi.fn(async (command: string[] | string) => {
+        calls.push({ command });
+        return { stdout: Buffer.alloc(0), stderr: '', code: 1 };
+      }),
+      execStream: vi.fn(),
+    } as unknown as SshExecutor;
+    const dangerous = "dir/name'; echo PWN";
+    const io = createRemoteApplyPatchIo('/workspace', executor);
+    await io.write(dangerous, Buffer.from('safe'), { exclusive: true });
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(Array.isArray(call.command)).toBe(true);
+      const argv = call.command as string[];
+      expect(argv).toContain(dangerous);
+      expect(argv.slice(0, -1).join(' ')).not.toContain(dangerous);
+    }
+  });
+});

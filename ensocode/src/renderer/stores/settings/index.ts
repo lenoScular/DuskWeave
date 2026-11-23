@@ -1,0 +1,1455 @@
+import { DEFAULT_ACCENT_COLOR, resolveAccentColor } from '@shared/accentColor';
+import { parseApprovalAllowThreshold } from '@shared/approvalReviewRecord';
+import { DEFAULT_AUTO_RETRY_LIMIT, normalizeAutoRetryLimit } from '@shared/autoRetry';
+import {
+  DEFAULT_BOT_MAX_RUNNING_TURNS,
+  normalizeBotMaxRunningTurns,
+} from '@shared/bots/concurrency';
+import {
+  type ChatTypography,
+  chatTypographyCssVars,
+  DEFAULT_CHAT_TYPOGRAPHY,
+  normalizeChatTypography,
+} from '@shared/chatTypography';
+import {
+  type DefaultModelRef,
+  oauthCredentialBlock,
+  sanitizeDefaultModel,
+} from '@shared/defaultModel';
+import {
+  type FileOpenRule,
+  normalizeContextMenuOpen,
+  normalizeFileOpenRules,
+} from '@shared/fileOpening';
+import type { Locale } from '@shared/i18n';
+import { normalizeLocale } from '@shared/i18n';
+import { liveActivityFoldDelaySec as normalizeLiveActivityFoldDelaySec } from '@shared/liveActivityFoldDelay';
+import {
+  DEFAULT_MAX_ACTIVE_COWORKERS,
+  normalizeMaxActiveCoworkers,
+} from '@shared/maxActiveCoworkers';
+import {
+  DEFAULT_MEMORY_DISTILL_WINDOW_MINUTES,
+  normalizeMemoryDistillWindowMinutes,
+} from '@shared/memory/distillWindow';
+import {
+  DEFAULT_FORGETTING_SETTINGS,
+  normalizeForgettingSettings,
+} from '@shared/memory/forgetting';
+import {
+  DEFAULT_MEMORY_MODEL_IDLE_MINUTES,
+  normalizeMemoryModelIdleMinutes,
+} from '@shared/memory/modelIdle';
+import { directorySectionForAccount, materializeProviders } from '@shared/modelDirectory';
+import {
+  DEFAULT_PRIVACY_MASK_SETTINGS,
+  parsePrivacyMaskSettings,
+} from '@shared/privacyMask/settings';
+import { applyProjectGroupPatch } from '@shared/projectGroups';
+import { projectNameFromPath } from '@shared/projectName';
+import { applyIncomingProviders } from '@shared/providerIdentity';
+import { normalizeProxyMode, type ProxyMode } from '@shared/proxy';
+import { parseSmartCompactMode } from '@shared/smartCompactMode';
+import { DEFAULT_SSH_TIMEOUT_SECONDS, normalizeSshTimeoutSeconds } from '@shared/sshTimeout';
+import {
+  DEFAULT_STATUS_LINE_SEGMENTS,
+  normalizeStatusLineSegments,
+  type StatusLineSegmentId,
+} from '@shared/statusLine';
+import { parseTerminalShell } from '@shared/terminalShell';
+import { DEFAULT_THEME_KEY } from '@shared/theme/builtinThemes';
+import type { ThemeKey } from '@shared/theme/types';
+import { DEFAULT_DISABLED_BUILTIN_TOOLS } from '@shared/types';
+import type { AgentMode, SourceAuthorityProjection } from '@shared/types/agent';
+import { DEFAULT_UPDATE_CHANNEL } from '@shared/updater/channel';
+import type { AutoRestartMode } from '@shared/updater/idleRestart';
+import { parseUsageModelPricing } from '@shared/usage/pricing';
+import {
+  findVirtualModel,
+  isVirtualRef,
+  parseVirtualClassifier,
+  parseVirtualModels,
+  type VirtualClassifierConfig,
+  type VirtualModelEntry,
+} from '@shared/virtualModels';
+import { parseWebSearchChain, type WebSearchChainEntry } from '@shared/webSearchChain';
+import { parseWindowsLocalShell } from '@shared/windowsLocalShell';
+import { create } from 'zustand';
+import { createJSONStorage, persist } from 'zustand/middleware';
+import { resolveColorScheme } from '@/lib/colorScheme';
+import {
+  applyTerminalThemeToApp,
+  clearTerminalThemeFromApp,
+  isTerminalThemeDark,
+} from '@/lib/ghosttyTheme';
+import { useModelDirectoryStore } from '@/stores/modelDirectory';
+import {
+  type OauthCredentialSnapshot,
+  oauthCredentialContext,
+  useOauthCredentialStore,
+} from '@/stores/oauthCredentials';
+import {
+  DEFAULT_ACTIVE_RETENTION_MINUTES,
+  DEFAULT_HEADER_RECENT_MINUTES,
+  normalizeActiveRetentionMinutes,
+  normalizeHeaderRecentMinutes,
+} from './activeRetention';
+import {
+  DEFAULT_AUTO_ARCHIVE_IDLE_DAYS,
+  DEFAULT_AUTO_DELETE_ARCHIVED_DAYS,
+  normalizeAutoArchiveIdleDays,
+  normalizeAutoDeleteArchivedDays,
+} from './autoArchiveIdleDays';
+import { mergeSettingsState, migrateSettings, SETTINGS_VERSION } from './migrate';
+import { electronStorage, getWriteGeneration, openPersistWriteGate } from './storage';
+import type {
+  BackgroundSizeMode,
+  BackgroundSourceType,
+  DefaultModelRevalidation,
+  FontWeight,
+  SettingsState,
+  Theme,
+} from './types';
+
+function normalizeSubagentAllowedModes(modes: readonly AgentMode[]): AgentMode[] {
+  return (['task', 'coworker'] as const).filter((mode) => modes.includes(mode));
+}
+
+export * from './types';
+
+// 把终端字体设置应用到应用的 CSS 变量
+function applyTerminalFont(fontFamily: string, fontSize: number): void {
+  const root = document.documentElement;
+  root.style.setProperty('--font-family-mono', fontFamily);
+  root.style.setProperty('--font-size-base', `${fontSize}px`);
+}
+
+function applyChatTypography(typography: ChatTypography): void {
+  if (typeof document === 'undefined') return;
+  const style = document.documentElement?.style;
+  if (!style) return;
+  for (const [name, value] of Object.entries(chatTypographyCssVars(typography))) {
+    style.setProperty(name, value);
+  }
+}
+
+// 应用界面主题（深色/浅色模式）
+function applyAppTheme(theme: Theme, terminalTheme: string): void {
+  const isDark =
+    resolveColorScheme(theme, {
+      prefersDark: window.matchMedia('(prefers-color-scheme: dark)').matches,
+      terminalIsDark: isTerminalThemeDark(terminalTheme),
+    }) === 'dark';
+  document.documentElement.classList.toggle('dark', isDark);
+}
+
+// Apply settings side effects (theme / font / lang) — 初次加载与多窗口同步时调用
+function applySettings(state: {
+  theme: Theme;
+  terminalTheme: string;
+  terminalFontFamily: string;
+  terminalFontSize: number;
+  language: Locale;
+  chatWide?: boolean;
+  borderOpacity?: number;
+  chatTypography?: ChatTypography;
+}): void {
+  if (state.theme === 'sync-terminal') {
+    applyTerminalThemeToApp(state.terminalTheme, true);
+  } else {
+    clearTerminalThemeFromApp();
+    applyAppTheme(state.theme, state.terminalTheme);
+  }
+  applyTerminalFont(state.terminalFontFamily, state.terminalFontSize);
+  document.documentElement.style.setProperty(
+    '--ui-border-opacity',
+    String(state.borderOpacity ?? 1)
+  );
+  document.documentElement.lang = normalizeLocale(state.language) === 'zh' ? 'zh-CN' : 'en';
+  document.documentElement.classList.toggle('enso-chat-wide', Boolean(state.chatWide));
+  applyChatTypography(state.chatTypography ?? DEFAULT_CHAT_TYPOGRAPHY);
+}
+
+function getDefaultLocale(): Locale {
+  return normalizeLocale(navigator.language);
+}
+
+/** 数值设置项的防御：非法值落回缺省，越界值夹回范围 */
+function clampNumber(value: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, value));
+}
+
+const initialState = {
+  theme: 'system' as Theme,
+  themeId: DEFAULT_THEME_KEY as ThemeKey,
+  accentColor: DEFAULT_ACCENT_COLOR,
+  userCssEnabled: false,
+  language: getDefaultLocale(),
+  fileOpenRules: [] as FileOpenRule[],
+  contextMenuOpen: normalizeContextMenuOpen(undefined),
+  terminalTheme: 'Dracula',
+  terminalFontSize: 14,
+  terminalFontFamily: 'ui-monospace, SF Mono, Menlo, Monaco, Consolas, monospace',
+  terminalFontWeight: 'normal' as FontWeight,
+  terminalFontWeightBold: '500' as FontWeight,
+  terminalShell: 'auto' as const,
+  worktreeRoot: '',
+  favoriteTerminalThemes: [] as string[],
+  pinnedModels: [] as string[],
+  statusLineSegments: [...DEFAULT_STATUS_LINE_SEGMENTS] as StatusLineSegmentId[],
+  loadLocalSkills: true,
+  loadHarnessAssets: false,
+  windowsLocalShell: 'auto' as const,
+  exploreFoldEnabled: false,
+  rtkEnabled: true,
+  longCacheRetention: false,
+  computerPreview: true,
+  computerAllowAllApps: false,
+  openLinksInBuiltinBrowser: true,
+  protectedActionsInCode: false,
+  dcgEnabled: false,
+  editMode: 'apply_patch' as import('@shared/types').EditMode,
+  compactStrategy: 'standard' as import('@shared/compactStrategy').CompactStrategy,
+  smartCompactEnabled: false,
+  smartCompactModel: null as import('@shared/defaultModel').DefaultModelRef | null,
+  smartCompactMode: 'auto' as import('@shared/smartCompactMode').SmartCompactMode,
+  memoryEmbeddingModel: 'local:qwen3-0.6b-gguf',
+  memoryEmbeddingAutoDownload: false,
+  memoryModelIdleMinutes: DEFAULT_MEMORY_MODEL_IDLE_MINUTES,
+  memoryEmbeddingRemoteProviderId: null as string | null,
+  memoryDistillEnabled: false,
+  memoryDistillWindowMinutes: DEFAULT_MEMORY_DISTILL_WINDOW_MINUTES,
+  memoryKgEnabled: false,
+  memoryReconcileEnabled: false,
+  // 遗忘：默认只开「降权」。标记候选与自动归档都要用户显式打开，升级后不会突然归档任何东西。
+  memoryDecayEnabled: DEFAULT_FORGETTING_SETTINGS.enabled,
+  memoryDecayArchiveCandidates: DEFAULT_FORGETTING_SETTINGS.archiveCandidates,
+  memoryDecayAutoArchive: DEFAULT_FORGETTING_SETTINGS.autoArchive,
+  memoryDecayStaleDays: DEFAULT_FORGETTING_SETTINGS.staleDays,
+  memoryDecayMaxImportance: DEFAULT_FORGETTING_SETTINGS.maxImportance,
+  memoryDecayIntervalDays: DEFAULT_FORGETTING_SETTINGS.intervalDays,
+  botModeEnabled: false,
+  scratchSessionsEnabled: false,
+  dropShelfEnabled: false,
+  secretaryEnabled: false,
+  botRouteClassifier: null as VirtualClassifierConfig | null,
+  botAssistantModel: null as import('@shared/defaultModel').DefaultModelRef | null,
+  botMaxRunningTurns: DEFAULT_BOT_MAX_RUNNING_TURNS,
+  botDiscussModeEnabled: false,
+  autoUpdate: true,
+  autoRestartForUpdate: 'off' as AutoRestartMode,
+  updateChannel: DEFAULT_UPDATE_CHANNEL,
+  pluginAutoUpdate: true,
+  proxyMode: 'system' as ProxyMode,
+  customProxyUrl: '',
+  customCaCertPath: '',
+  openChangesOnFileEdit: false,
+  compactReadOnlyTools: true,
+  expandLiveEdits: true,
+  expandLiveReasoning: true,
+  autoCollapseTurns: false,
+  collapseCompletedActivity: true,
+  collapseLiveActivity: false,
+  liveActivityFoldDelaySec: 5,
+  pinUnfinishedTodos: true,
+  headerSessionTabs: false,
+  headerRecentMinutes: DEFAULT_HEADER_RECENT_MINUTES,
+  chatWide: false,
+  navRailSide: 'left' as const,
+  chatTypography: normalizeChatTypography(DEFAULT_CHAT_TYPOGRAPHY),
+  notifyMainAgentOnly: true,
+  maxActiveCoworkers: DEFAULT_MAX_ACTIVE_COWORKERS,
+  autoRetryLimit: DEFAULT_AUTO_RETRY_LIMIT,
+  privacyMasking: DEFAULT_PRIVACY_MASK_SETTINGS,
+  shell: {},
+  sshTimeoutSeconds: DEFAULT_SSH_TIMEOUT_SECONDS,
+  generationStallTimeoutMin: 0,
+  autoArchiveIdleDays: DEFAULT_AUTO_ARCHIVE_IDLE_DAYS,
+  autoArchiveMergedWorktrees: false,
+  autoDeleteArchivedDays: DEFAULT_AUTO_DELETE_ARCHIVED_DAYS,
+  activeRetentionMinutes: DEFAULT_ACTIVE_RETENTION_MINUTES,
+  backgroundImageEnabled: false,
+  backgroundSourceType: 'file' as BackgroundSourceType,
+  backgroundImagePath: '',
+  backgroundFolderPath: '',
+  backgroundUrlPath: '',
+  backgroundRandomEnabled: false,
+  backgroundRandomInterval: 300,
+  backgroundOpacity: 0.85,
+  backgroundBlur: 0,
+  backgroundBrightness: 1,
+  backgroundSaturation: 1,
+  backgroundMask: 0.5,
+  borderOpacity: 1,
+  backgroundComposerOpacity: 0.6,
+  backgroundCodeOpacity: 0.65,
+  backgroundSizeMode: 'cover' as BackgroundSizeMode,
+  backgroundRefreshNonce: 0,
+  providers: [] as import('@shared/types').ModelProvider[],
+  defaultModel: null,
+  defaultModelFollowLast: false,
+  titleSummaryEnabled: false,
+  titleSummaryModel: null as import('@shared/defaultModel').DefaultModelRef | null,
+  imageGenerationModel: null as import('@shared/defaultModel').DefaultModelRef | null,
+  memoryDistillModel: null as import('@shared/defaultModel').DefaultModelRef | null,
+  memoryChatModel: 'remote',
+  memoryLanguage: 'en',
+  approvalReviewer: null as import('@shared/defaultModel').DefaultModelRef | null,
+  approvalAutoManage: false,
+  approvalAllowThreshold: 0.9,
+  lastApprovalMode: null as import('@shared/types/agent').ApprovalMode | null,
+  defaultReasoningEnabled: true,
+  defaultThinkingLevel: 'medium' as import('@shared/types/agent').ThinkingLevel,
+  skills: [] as import('@shared/types').SkillEntry[],
+  mcpServers: [] as import('@shared/types').McpServerEntry[],
+  instructions: [] as import('@shared/types').InstructionEntry[],
+  presets: [] as import('@shared/types').Preset[],
+  defaultPresetId: 'default',
+  agentTypes: [] as import('@shared/types').AgentTypeEntry[],
+  subagentModelsEnabled: false,
+  subagentModels: [] as import('@shared/types').SubagentModelEntry[],
+  virtualModels: [] as VirtualModelEntry[],
+  disabledBuiltinAgentTypes: [] as string[],
+  disabledBuiltinTools: [...DEFAULT_DISABLED_BUILTIN_TOOLS] as string[],
+  webSearchChain: [] as WebSearchChainEntry[],
+  disabledWorkflowPresets: [] as string[],
+  subagentAllowedModes: ['task', 'coworker'] as import('@shared/types/agent').AgentMode[],
+  onboarded: false,
+  keybindings: {} as Record<string, string>,
+  projects: [] as import('@shared/types').Project[],
+  projectGroups: [] as import('@shared/types').ProjectGroup[],
+  usageModelPricing: {} as import('@shared/usage/pricing').PricingTable,
+};
+interface DefaultModelRevalidationState {
+  latest: DefaultModelRevalidation | null;
+}
+
+/** 默认失效说明是每个 Renderer 窗口的瞬时状态，不进入 settings.json。 */
+export const useDefaultModelRevalidationStore = create<DefaultModelRevalidationState>(() => ({
+  latest: null,
+}));
+
+function publishDefaultModelRevalidation(result: DefaultModelRevalidation): void {
+  useDefaultModelRevalidationStore.setState({ latest: result });
+}
+
+export const useSettingsStore = create<SettingsState>()(
+  persist(
+    (set, get) => ({
+      ...initialState,
+
+      setTheme: (theme) => {
+        const terminalTheme = get().terminalTheme;
+        if (theme === 'sync-terminal') {
+          applyTerminalThemeToApp(terminalTheme, true);
+        } else {
+          clearTerminalThemeFromApp();
+          applyAppTheme(theme, terminalTheme);
+        }
+        set({ theme });
+      },
+
+      setAccentColor: (accentColor) => {
+        set({ accentColor });
+      },
+
+      setThemeId: (themeId) => {
+        set({ themeId });
+      },
+
+      setUserCssEnabled: (userCssEnabled) => {
+        set({ userCssEnabled });
+      },
+
+      setLanguage: (language) => {
+        document.documentElement.lang = language === 'zh' ? 'zh-CN' : 'en';
+        set({ language });
+      },
+
+      setTerminalTheme: (terminalTheme) => {
+        if (get().theme === 'sync-terminal') {
+          applyTerminalThemeToApp(terminalTheme, true);
+        }
+        set({ terminalTheme });
+      },
+
+      setTerminalFontSize: (terminalFontSize) => {
+        applyTerminalFont(get().terminalFontFamily, terminalFontSize);
+        set({ terminalFontSize });
+      },
+
+      setTerminalFontFamily: (terminalFontFamily) => {
+        applyTerminalFont(terminalFontFamily, get().terminalFontSize);
+        set({ terminalFontFamily });
+      },
+
+      setTerminalFontWeight: (terminalFontWeight) => set({ terminalFontWeight }),
+      setTerminalFontWeightBold: (terminalFontWeightBold) => set({ terminalFontWeightBold }),
+      setTerminalShell: (terminalShell) =>
+        set({ terminalShell: parseTerminalShell(terminalShell) }),
+      setWorktreeRoot: (worktreeRoot) => set({ worktreeRoot: worktreeRoot.trim() }),
+      setFileOpenRules: (rules) => set({ fileOpenRules: normalizeFileOpenRules(rules) }),
+      setContextMenuOpen: (value) => set({ contextMenuOpen: normalizeContextMenuOpen(value) }),
+
+      toggleFavoriteTerminalTheme: (theme) =>
+        set((state) => ({
+          favoriteTerminalThemes: state.favoriteTerminalThemes.includes(theme)
+            ? state.favoriteTerminalThemes.filter((t) => t !== theme)
+            : [...state.favoriteTerminalThemes, theme],
+        })),
+
+      togglePinnedModel: (key) =>
+        set((state) => ({
+          pinnedModels: state.pinnedModels.includes(key)
+            ? state.pinnedModels.filter((k) => k !== key)
+            : [...state.pinnedModels, key],
+        })),
+
+      setLoadLocalSkills: (loadLocalSkills) => set({ loadLocalSkills }),
+      setLoadHarnessAssets: (loadHarnessAssets) => set({ loadHarnessAssets }),
+      setWindowsLocalShell: (windowsLocalShell) =>
+        set({ windowsLocalShell: parseWindowsLocalShell(windowsLocalShell) }),
+      setExploreFoldEnabled: (exploreFoldEnabled) => set({ exploreFoldEnabled }),
+      setRtkEnabled: (rtkEnabled) => set({ rtkEnabled }),
+      setLongCacheRetention: (longCacheRetention) => set({ longCacheRetention }),
+      setComputerPreview: (computerPreview) => set({ computerPreview }),
+      setComputerAllowAllApps: (computerAllowAllApps) => set({ computerAllowAllApps }),
+      setOpenLinksInBuiltinBrowser: (openLinksInBuiltinBrowser) =>
+        set({ openLinksInBuiltinBrowser }),
+      setProtectedActionsInCode: (protectedActionsInCode) => set({ protectedActionsInCode }),
+      setDcgEnabled: (dcgEnabled) => set({ dcgEnabled }),
+      setMemoryEmbeddingModel: (memoryEmbeddingModel) => set({ memoryEmbeddingModel }),
+      setMemoryEmbeddingAutoDownload: (memoryEmbeddingAutoDownload) =>
+        set({ memoryEmbeddingAutoDownload }),
+      setMemoryModelIdleMinutes: (value) =>
+        set({ memoryModelIdleMinutes: normalizeMemoryModelIdleMinutes(value) }),
+      setMemoryEmbeddingRemoteProviderId: (memoryEmbeddingRemoteProviderId) =>
+        set({ memoryEmbeddingRemoteProviderId }),
+      setMemoryDistillEnabled: (memoryDistillEnabled) => set({ memoryDistillEnabled }),
+      setMemoryDistillWindowMinutes: (value) =>
+        set({ memoryDistillWindowMinutes: normalizeMemoryDistillWindowMinutes(value) }),
+      setMemoryKgEnabled: (memoryKgEnabled) => set({ memoryKgEnabled }),
+      setMemoryReconcileEnabled: (memoryReconcileEnabled) => set({ memoryReconcileEnabled }),
+      setMemoryDecayEnabled: (memoryDecayEnabled) => set({ memoryDecayEnabled }),
+      setMemoryDecayArchiveCandidates: (memoryDecayArchiveCandidates) =>
+        set({ memoryDecayArchiveCandidates }),
+      setMemoryDecayAutoArchive: (memoryDecayAutoArchive) => set({ memoryDecayAutoArchive }),
+      setMemoryDecayStaleDays: (memoryDecayStaleDays) => set({ memoryDecayStaleDays }),
+      setMemoryDecayMaxImportance: (memoryDecayMaxImportance) => set({ memoryDecayMaxImportance }),
+      setMemoryDecayIntervalDays: (memoryDecayIntervalDays) => set({ memoryDecayIntervalDays }),
+      setBotModeEnabled: (botModeEnabled) => set({ botModeEnabled }),
+      setScratchSessionsEnabled: (scratchSessionsEnabled) => set({ scratchSessionsEnabled }),
+      setDropShelfEnabled: (dropShelfEnabled) => set({ dropShelfEnabled }),
+      setSecretaryEnabled: (secretaryEnabled) => set({ secretaryEnabled }),
+      setBotRouteClassifier: (botRouteClassifier) => set({ botRouteClassifier }),
+      setBotAssistantModel: (botAssistantModel) => set({ botAssistantModel }),
+      setBotMaxRunningTurns: (value) =>
+        set({ botMaxRunningTurns: normalizeBotMaxRunningTurns(value) }),
+      setBotDiscussModeEnabled: (botDiscussModeEnabled) =>
+        set({ botDiscussModeEnabled: botDiscussModeEnabled === true }),
+      setEditMode: (editMode) => set({ editMode }),
+      setCompactStrategy: (compactStrategy) =>
+        set({ compactStrategy, smartCompactEnabled: compactStrategy === 'smart' }),
+      setSmartCompactEnabled: (smartCompactEnabled) =>
+        set({ smartCompactEnabled, compactStrategy: smartCompactEnabled ? 'smart' : 'standard' }),
+      setSmartCompactModel: (smartCompactModel) => set({ smartCompactModel }),
+      setSmartCompactMode: (smartCompactMode) =>
+        set({
+          smartCompactMode: parseSmartCompactMode(smartCompactMode) ?? 'auto',
+        }),
+      setAutoUpdate: (autoUpdate) => set({ autoUpdate }),
+      setAutoRestartForUpdate: (autoRestartForUpdate) => set({ autoRestartForUpdate }),
+      setUpdateChannel: (updateChannel) => set({ updateChannel }),
+      setPluginAutoUpdate: (pluginAutoUpdate) =>
+        set({ pluginAutoUpdate: pluginAutoUpdate !== false }),
+      setProxyMode: (proxyMode) => set({ proxyMode: normalizeProxyMode(proxyMode) }),
+      setCustomProxyUrl: (customProxyUrl) => set({ customProxyUrl }),
+      setCustomCaCertPath: (customCaCertPath) => set({ customCaCertPath }),
+      setOpenChangesOnFileEdit: (openChangesOnFileEdit) => set({ openChangesOnFileEdit }),
+      setCompactReadOnlyTools: (compactReadOnlyTools) => set({ compactReadOnlyTools }),
+      setExpandLiveEdits: (expandLiveEdits) => set({ expandLiveEdits }),
+      setExpandLiveReasoning: (expandLiveReasoning) => set({ expandLiveReasoning }),
+      setAutoCollapseTurns: (autoCollapseTurns) => set({ autoCollapseTurns }),
+      setCollapseCompletedActivity: (collapseCompletedActivity) =>
+        set({ collapseCompletedActivity }),
+      setCollapseLiveActivity: (collapseLiveActivity) => set({ collapseLiveActivity }),
+      setLiveActivityFoldDelaySec: (seconds) =>
+        set({ liveActivityFoldDelaySec: normalizeLiveActivityFoldDelaySec(seconds) }),
+      setPinUnfinishedTodos: (pinUnfinishedTodos) => set({ pinUnfinishedTodos }),
+      setHeaderSessionTabs: (headerSessionTabs) => set({ headerSessionTabs }),
+      setHeaderRecentMinutes: (minutes) =>
+        set({ headerRecentMinutes: normalizeHeaderRecentMinutes(minutes) }),
+      setChatWide: (chatWide) => {
+        document.documentElement.classList.toggle('enso-chat-wide', chatWide);
+        set({ chatWide });
+      },
+      setNavRailSide: (navRailSide) =>
+        set({
+          navRailSide: navRailSide === 'right' || navRailSide === 'off' ? navRailSide : 'left',
+        }),
+      setChatTypography: (next) => {
+        const chatTypography = normalizeChatTypography(next);
+        applyChatTypography(chatTypography);
+        set({ chatTypography });
+      },
+      resetChatTypography: () => {
+        const chatTypography = normalizeChatTypography(DEFAULT_CHAT_TYPOGRAPHY);
+        applyChatTypography(chatTypography);
+        set({ chatTypography });
+      },
+      setNotifyMainAgentOnly: (notifyMainAgentOnly) => set({ notifyMainAgentOnly }),
+      setMaxActiveCoworkers: (value) =>
+        set({ maxActiveCoworkers: normalizeMaxActiveCoworkers(value) }),
+      setAutoRetryLimit: (value) => set({ autoRetryLimit: normalizeAutoRetryLimit(value) }),
+      setPrivacyMasking: (value) => set({ privacyMasking: parsePrivacyMaskSettings(value) }),
+      setSshTimeoutSeconds: (value) =>
+        set({ sshTimeoutSeconds: normalizeSshTimeoutSeconds(value) }),
+      setGenerationStallTimeoutMin: (minutes) =>
+        set({
+          generationStallTimeoutMin: Number.isFinite(minutes)
+            ? Math.min(120, Math.max(0, Math.round(minutes)))
+            : 0,
+        }),
+      setAutoArchiveIdleDays: (days) =>
+        set({ autoArchiveIdleDays: normalizeAutoArchiveIdleDays(days) }),
+      setAutoArchiveMergedWorktrees: (autoArchiveMergedWorktrees) =>
+        set({ autoArchiveMergedWorktrees }),
+      setAutoDeleteArchivedDays: (days) =>
+        set({ autoDeleteArchivedDays: normalizeAutoDeleteArchivedDays(days) }),
+      setActiveRetentionMinutes: (minutes) =>
+        set({ activeRetentionMinutes: normalizeActiveRetentionMinutes(minutes) }),
+
+      setBackgroundImageEnabled: (backgroundImageEnabled) => set({ backgroundImageEnabled }),
+      setBackgroundSourceType: (backgroundSourceType) => set({ backgroundSourceType }),
+      setBackgroundImagePath: (backgroundImagePath) => set({ backgroundImagePath }),
+      setBackgroundFolderPath: (backgroundFolderPath) => set({ backgroundFolderPath }),
+      setBackgroundUrlPath: (backgroundUrlPath) => set({ backgroundUrlPath }),
+      setBackgroundRandomEnabled: (backgroundRandomEnabled) => set({ backgroundRandomEnabled }),
+      setBackgroundRandomInterval: (seconds) =>
+        set({ backgroundRandomInterval: clampNumber(seconds, 5, 86400, 300) }),
+      setBackgroundOpacity: (opacity) =>
+        set({ backgroundOpacity: clampNumber(opacity, 0, 1, 0.85) }),
+      setBackgroundBlur: (blur) => set({ backgroundBlur: clampNumber(blur, 0, 20, 0) }),
+      setBackgroundBrightness: (brightness) =>
+        set({ backgroundBrightness: clampNumber(brightness, 0, 2, 1) }),
+      setBackgroundSaturation: (saturation) =>
+        set({ backgroundSaturation: clampNumber(saturation, 0, 2, 1) }),
+      setBackgroundMask: (mask) => set({ backgroundMask: clampNumber(mask, 0, 1, 0.5) }),
+      setBorderOpacity: (value) => {
+        const borderOpacity = clampNumber(value, 0, 1, 1);
+        document.documentElement.style.setProperty('--ui-border-opacity', String(borderOpacity));
+        set({ borderOpacity });
+      },
+      setBackgroundComposerOpacity: (opacity) =>
+        set({ backgroundComposerOpacity: clampNumber(opacity, 0, 1, 0.6) }),
+      setBackgroundCodeOpacity: (opacity) =>
+        set({ backgroundCodeOpacity: clampNumber(opacity, 0, 1, 0.65) }),
+      setBackgroundSizeMode: (backgroundSizeMode) => set({ backgroundSizeMode }),
+      bumpBackgroundRefresh: () =>
+        set((state) => ({ backgroundRefreshNonce: (state.backgroundRefreshNonce ?? 0) + 1 })),
+
+      setStatusLineSegments: (statusLineSegments) => set({ statusLineSegments }),
+      toggleStatusLineSegment: (id, enabled) =>
+        set((state) => ({
+          statusLineSegments: enabled
+            ? state.statusLineSegments.includes(id)
+              ? state.statusLineSegments
+              : [...state.statusLineSegments, id]
+            : state.statusLineSegments.filter((segment) => segment !== id),
+        })),
+
+      // Custom 与官方同 URL 不算同一条；撞车时合并模型而不是整条丢弃。
+      addProviders: (providers) => {
+        const { providers: next, added } = applyIncomingProviders(get().providers, providers);
+        if (added > 0) set({ providers: next });
+        return added;
+      },
+
+      updateProvider: (id, updates) => {
+        set((state) => ({
+          providers: state.providers.map((p) => {
+            if (p.id !== id) return p;
+            const next = { ...p, ...updates };
+            if ('headers' in updates && updates.headers === undefined) delete next.headers;
+            return next;
+          }),
+        }));
+        get().revalidateDefaultModel(useOauthCredentialStore.getState().snapshot);
+      },
+
+      removeProvider: (id) => {
+        set((state) => ({ providers: state.providers.filter((p) => p.id !== id) }));
+        get().revalidateDefaultModel(useOauthCredentialStore.getState().snapshot);
+      },
+
+      setDefaultModel: (defaultModel) => {
+        useDefaultModelRevalidationStore.setState({ latest: null });
+        set({ defaultModel, defaultModelFollowLast: false });
+      },
+
+      setDefaultModelFollowLast: (defaultModelFollowLast) => set({ defaultModelFollowLast }),
+
+      rememberDefaultModelFromSelection: (selection) => {
+        const state = get();
+        if (!state.defaultModelFollowLast) return;
+        if (
+          state.defaultModel?.providerId === selection.providerId &&
+          state.defaultModel?.modelId === selection.modelId
+        ) {
+          return;
+        }
+        useDefaultModelRevalidationStore.setState({ latest: null });
+        set({ defaultModel: selection });
+      },
+
+      setDefaultReasoningEnabled: (defaultReasoningEnabled) => set({ defaultReasoningEnabled }),
+      setDefaultThinkingLevel: (defaultThinkingLevel) => set({ defaultThinkingLevel }),
+
+      setTitleSummaryEnabled: (titleSummaryEnabled) => set({ titleSummaryEnabled }),
+      setTitleSummaryModel: (titleSummaryModel) => set({ titleSummaryModel }),
+      setImageGenerationModel: (imageGenerationModel) => set({ imageGenerationModel }),
+      setMemoryDistillModel: (memoryDistillModel) => set({ memoryDistillModel }),
+      setMemoryChatModel: (memoryChatModel) => set({ memoryChatModel }),
+      setMemoryLanguage: (memoryLanguage) => set({ memoryLanguage }),
+      setApprovalReviewer: (approvalReviewer) => set({ approvalReviewer }),
+      setApprovalAutoManage: (approvalAutoManage) => set({ approvalAutoManage }),
+      setApprovalAllowThreshold: (threshold) =>
+        set({ approvalAllowThreshold: parseApprovalAllowThreshold(threshold) }),
+      setLastApprovalMode: (lastApprovalMode) => set({ lastApprovalMode }),
+
+      revalidateDefaultModel: (snapshot: OauthCredentialSnapshot) => {
+        const defaultModel = get().defaultModel;
+        if (snapshot.revision !== useOauthCredentialStore.getState().snapshot.revision) {
+          const stale: DefaultModelRevalidation = {
+            status: 'stale',
+            defaultModel,
+            writeback: false,
+            notice: null,
+          };
+          publishDefaultModelRevalidation(stale);
+          return stale;
+        }
+
+        // 目录未覆盖默认模型所属的 OAuth 分区时（升级首启无缓存 / 发现从未成功），
+        // 物化视图只剩稀疏覆盖行，sanitize 会把默认模型误判成 model-missing 并写没。
+        // 与 OAuth 凭证未就绪同等对待：defer 不写回；目录到达后由订阅重验（见
+        // OauthCredentialBootstrap）。分区存在但 0 个模型同样视为冷态——
+        // 每个 OAuth 厂商的 catalog 都至少有一个模型，空分区只能是发现未就绪。
+        // 虚拟默认模型解析其全部成员引用，任一 OAuth 成员分区冷态即 defer。
+        if (defaultModel) {
+          const refs: DefaultModelRef[] = [];
+          if (isVirtualRef(defaultModel)) {
+            const entry = findVirtualModel(get().virtualModels, defaultModel);
+            if (entry)
+              refs.push(entry.primary, ...(entry.fast ? [entry.fast] : []), ...entry.fallbacks);
+          } else {
+            refs.push(defaultModel);
+          }
+          const directory = useModelDirectoryStore.getState().snapshot;
+          const cold = refs.some((ref) => {
+            if (isVirtualRef(ref)) return false;
+            const provider = get().providers.find((entry) => entry.id === ref.providerId);
+            if (!provider?.oauthAccountKey) return false;
+            const section = directorySectionForAccount(directory, provider.oauthAccountKey);
+            return !section || section.models.length === 0;
+          });
+          if (cold) {
+            const blocked = oauthCredentialBlock(oauthCredentialContext(snapshot));
+            const deferred: DefaultModelRevalidation = {
+              status: 'deferred',
+              defaultModel,
+              writeback: false,
+              notice: null,
+              ...(blocked ?? {
+                reason: 'oauth-credentials-loading' as const,
+                suggestedAction: 'wait-for-oauth-credentials' as const,
+              }),
+            };
+            publishDefaultModelRevalidation(deferred);
+            return deferred;
+          }
+        }
+
+        const sanitized = sanitizeDefaultModel({
+          defaultModel,
+          providers: materializeProviders(
+            get().providers,
+            useModelDirectoryStore.getState().snapshot
+          ),
+          credentials: oauthCredentialContext(snapshot),
+          virtualModels: get().virtualModels,
+        });
+        if (sanitized.status === 'unchanged') {
+          const unchanged: DefaultModelRevalidation = {
+            ...sanitized,
+            writeback: false,
+          };
+          publishDefaultModelRevalidation(unchanged);
+          return unchanged;
+        }
+        if (sanitized.status === 'deferred-oauth-unavailable') {
+          const deferred: DefaultModelRevalidation = {
+            ...sanitized,
+            status: 'deferred',
+            writeback: false,
+          };
+          publishDefaultModelRevalidation(deferred);
+          return deferred;
+        }
+
+        const result: DefaultModelRevalidation = {
+          ...sanitized,
+          writeback: true,
+        };
+        publishDefaultModelRevalidation(result);
+        set({ defaultModel: result.defaultModel });
+        return result;
+      },
+
+      // 技能以名称为标识去重，同时拦住同路径的重复登记
+      addSkills: (skills) => {
+        const nameKey = (name: string) => name.trim().toLowerCase();
+        const knownNames = new Set(get().skills.map((skill) => nameKey(skill.name)));
+        const knownPaths = new Set(get().skills.map((skill) => skill.path));
+        const fresh = skills.filter((skill) => {
+          const key = nameKey(skill.name);
+          if (knownNames.has(key) || knownPaths.has(skill.path)) return false;
+          knownNames.add(key);
+          knownPaths.add(skill.path);
+          return true;
+        });
+        if (fresh.length > 0) {
+          set((state) => ({ skills: [...state.skills, ...fresh] }));
+        }
+        return fresh.length;
+      },
+
+      updateSkill: (id, updates) =>
+        set((state) => ({
+          skills: state.skills.map((s) => (s.id === id ? { ...s, ...updates } : s)),
+        })),
+
+      setSkillsEnabled: (ids, enabled) => {
+        if (ids.length === 0) return;
+        const idSet = new Set(ids);
+        set((state) => ({
+          skills: state.skills.map((s) => (idSet.has(s.id) ? { ...s, enabled } : s)),
+        }));
+      },
+
+      removeSkill: (id) => set((state) => ({ skills: state.skills.filter((s) => s.id !== id) })),
+
+      // 按启动命令或 URL 去重
+      addMcpServers: (servers) => {
+        const fingerprint = (server: import('@shared/types').McpServerEntry) =>
+          server.url
+            ? `url::${server.url.replace(/\/+$/, '')}`
+            : `cmd::${server.command} ${(server.args ?? []).join(' ')}`.trim();
+        const known = new Set(get().mcpServers.map(fingerprint));
+        const fresh = servers.filter((server) => {
+          const key = fingerprint(server);
+          if (known.has(key)) return false;
+          known.add(key);
+          return true;
+        });
+        if (fresh.length > 0) {
+          set((state) => ({ mcpServers: [...state.mcpServers, ...fresh] }));
+        }
+        return fresh.length;
+      },
+
+      updateMcpServer: (id, updates) =>
+        set((state) => ({
+          mcpServers: state.mcpServers.map((s) => (s.id === id ? { ...s, ...updates } : s)),
+        })),
+
+      setMcpServersEnabled: (ids, enabled) => {
+        if (ids.length === 0) return;
+        const idSet = new Set(ids);
+        set((state) => ({
+          mcpServers: state.mcpServers.map((s) => (idSet.has(s.id) ? { ...s, enabled } : s)),
+        }));
+      },
+
+      removeMcpServer: (id) =>
+        set((state) => ({ mcpServers: state.mcpServers.filter((s) => s.id !== id) })),
+
+      // 按源文件路径去重；无文件的内联条目按名称+来源去重
+      addInstructions: (instructions) => {
+        const key = (item: import('@shared/types').InstructionEntry) =>
+          item.sourcePath ?? `${item.source}::${item.name}`;
+        const known = new Set(get().instructions.map(key));
+        const fresh = instructions.filter((item) => {
+          const value = key(item);
+          if (known.has(value)) return false;
+          known.add(value);
+          return true;
+        });
+        if (fresh.length > 0) {
+          // 单主源：已有启用条目时新导入的全部关闭；否则只留第一条启用
+          set((state) => {
+            const hasEnabled = state.instructions.some((i) => i.enabled);
+            const normalized = fresh.map((item, index) => ({
+              ...item,
+              enabled: !hasEnabled && index === 0,
+            }));
+            return { instructions: [...state.instructions, ...normalized] };
+          });
+        }
+        return fresh.length;
+      },
+
+      // 指令文件单主源：启用一条时其余自动关闭（同一时间只有一份注入会话）
+      updateInstruction: (id, updates) =>
+        set((state) => ({
+          instructions: state.instructions.map((i) =>
+            i.id === id
+              ? { ...i, ...updates }
+              : updates.enabled === true
+                ? { ...i, enabled: false }
+                : i
+          ),
+        })),
+
+      removeInstruction: (id) => {
+        // 只删本地副本，源文件不动
+        void window.electronAPI.instructions.delete(id);
+        set((state) => ({ instructions: state.instructions.filter((i) => i.id !== id) }));
+      },
+
+      addPreset: (preset) => {
+        const created = { ...preset, id: crypto.randomUUID() };
+        set((state) => ({ presets: [...state.presets, created] }));
+        return created;
+      },
+
+      updatePreset: (id, updates) => {
+        if (id === 'default') return;
+        set((state) => ({
+          presets: state.presets.map((p) => (p.id === id ? { ...p, ...updates } : p)),
+        }));
+      },
+
+      removePreset: (id) => {
+        if (id === 'default') return;
+        set((state) => ({
+          presets: state.presets.filter((p) => p.id !== id),
+          // 默认预设被删除时回落内置全局预设
+          ...(state.defaultPresetId === id ? { defaultPresetId: 'default' } : {}),
+        }));
+      },
+
+      setDefaultPresetId: (defaultPresetId) => set({ defaultPresetId }),
+
+      setSubagentModelsEnabled: (subagentModelsEnabled) => set({ subagentModelsEnabled }),
+
+      addSubagentModel: (entry) => {
+        const created = { ...entry, id: crypto.randomUUID() };
+        set((state) => ({ subagentModels: [...state.subagentModels, created] }));
+        return created;
+      },
+
+      updateSubagentModel: (id, updates) =>
+        set((state) => ({
+          subagentModels: state.subagentModels.map((entry) =>
+            entry.id === id ? { ...entry, ...updates } : entry
+          ),
+        })),
+
+      removeSubagentModel: (id) =>
+        set((state) => ({
+          subagentModels: state.subagentModels.filter((entry) => entry.id !== id),
+        })),
+
+      addVirtualModel: (entry) => {
+        const created = { ...entry, id: crypto.randomUUID() };
+        set((state) => ({ virtualModels: [...state.virtualModels, created] }));
+        return created;
+      },
+
+      updateVirtualModel: (id, updates) =>
+        set((state) => ({
+          virtualModels: state.virtualModels.map((entry) =>
+            entry.id === id ? { ...entry, ...updates } : entry
+          ),
+        })),
+
+      removeVirtualModel: (id) =>
+        set((state) => ({
+          virtualModels: state.virtualModels.filter((entry) => entry.id !== id),
+        })),
+
+      addAgentType: (entry) => {
+        const created = { ...entry, id: crypto.randomUUID() };
+        set((state) => ({ agentTypes: [...state.agentTypes, created] }));
+        return created;
+      },
+
+      updateAgentType: (id, updates) =>
+        set((state) => ({
+          agentTypes: state.agentTypes.map((t) => (t.id === id ? { ...t, ...updates } : t)),
+        })),
+
+      removeAgentType: (id) =>
+        set((state) => ({ agentTypes: state.agentTypes.filter((t) => t.id !== id) })),
+
+      toggleBuiltinAgentType: (name, enabled) =>
+        set((state) => ({
+          disabledBuiltinAgentTypes: enabled
+            ? state.disabledBuiltinAgentTypes.filter((n) => n !== name)
+            : [...new Set([...state.disabledBuiltinAgentTypes, name])],
+        })),
+
+      toggleBuiltinTool: (id, enabled) =>
+        set((state) => ({
+          disabledBuiltinTools: enabled
+            ? state.disabledBuiltinTools.filter((n) => n !== id)
+            : [...new Set([...state.disabledBuiltinTools, id])],
+        })),
+
+      setWebSearchChain: (entries) => set({ webSearchChain: parseWebSearchChain(entries) }),
+
+      toggleWorkflowPreset: (id, enabled) =>
+        set((state) => ({
+          disabledWorkflowPresets: enabled
+            ? state.disabledWorkflowPresets.filter((n) => n !== id)
+            : [...new Set([...state.disabledWorkflowPresets, id])],
+        })),
+
+      setSubagentAllowedModes: (modes) =>
+        set({ subagentAllowedModes: normalizeSubagentAllowedModes(modes) }),
+
+      setOnboarded: (onboarded) => set({ onboarded }),
+
+      setKeybinding: (action, binding) =>
+        set((state) => ({ keybindings: { ...state.keybindings, [action]: binding } })),
+      resetKeybinding: (action) =>
+        set((state) => {
+          const { [action]: _removed, ...rest } = state.keybindings;
+          return { keybindings: rest };
+        }),
+
+      // 项目执行权限只能经专用的 Main 注册表创建/移除。
+      addProject: async (path, remote, groupId) => {
+        const projection = await window.electronAPI.sourceAuthority.read();
+        const existing = projection.projects.find((project) => {
+          if (project.state !== 'active' || project.canonicalPath !== path) return false;
+          // 本地/远程不互认:ssh 项目还要同 host
+          return remote
+            ? project.sshConnectionId === remote.sshConnectionId
+            : project.kind !== 'ssh';
+        });
+        const result = existing
+          ? { accepted: true as const, value: existing }
+          : await window.electronAPI.sourceAuthority.createProject({
+              requestId: crypto.randomUUID(),
+              path,
+              ...(remote ? { kind: 'ssh' as const, sshConnectionId: remote.sshConnectionId } : {}),
+            });
+        if (!result.accepted) {
+          throw new Error(
+            ('error' in result && typeof result.error === 'string' && result.error) ||
+              'Failed to add project.'
+          );
+        }
+        const project = {
+          id: result.value.projectId,
+          name: projectNameFromPath(result.value.canonicalPath),
+          path: result.value.canonicalPath,
+          ...(groupId ? { groupId } : {}),
+          ...(result.value.kind === 'ssh'
+            ? {
+                kind: 'ssh' as const,
+                sshHost: result.value.sshHost,
+                sshConnectionId: result.value.sshConnectionId,
+                sshConnectionName: result.value.sshConnectionName,
+              }
+            : {}),
+        };
+        set((state) => {
+          const previous = state.projects.find((candidate) => candidate.id === project.id);
+          const nextProject = {
+            ...previous,
+            ...project,
+            ...(project.groupId
+              ? { groupId: project.groupId }
+              : previous?.groupId
+                ? { groupId: previous.groupId }
+                : {}),
+          };
+          return {
+            projects: [
+              ...state.projects.filter((candidate) => candidate.id !== project.id),
+              nextProject,
+            ],
+          };
+        });
+        return get().projects.find((candidate) => candidate.id === project.id) ?? project;
+      },
+
+      createProjectGroup: (input) => {
+        const name = input.name.trim();
+        const group = {
+          id: crypto.randomUUID(),
+          name: name || 'Untitled',
+          order: Math.max(-1, ...get().projectGroups.map((item) => item.order)) + 1,
+          ...(input.emoji ? { emoji: input.emoji } : {}),
+          ...(input.color ? { color: input.color } : {}),
+          ...(input.defaultModel
+            ? {
+                defaultModel: {
+                  providerId: input.defaultModel.providerId,
+                  modelId: input.defaultModel.modelId,
+                },
+                ...(typeof input.defaultReasoningEnabled === 'boolean'
+                  ? { defaultReasoningEnabled: input.defaultReasoningEnabled }
+                  : {}),
+                ...(input.defaultThinkingLevel
+                  ? { defaultThinkingLevel: input.defaultThinkingLevel }
+                  : {}),
+              }
+            : {}),
+        };
+        set((state) => ({ projectGroups: [...state.projectGroups, group] }));
+        return group;
+      },
+      updateProjectGroup: (id, patch) => {
+        set((state) => ({
+          projectGroups: state.projectGroups.map((group) =>
+            group.id === id ? applyProjectGroupPatch(group, patch) : group
+          ),
+        }));
+      },
+      removeProjectGroup: (id) => {
+        set((state) => ({
+          projectGroups: state.projectGroups.filter((group) => group.id !== id),
+          projects: state.projects.map((project) => {
+            if (project.groupId !== id) return project;
+            const { groupId: _removed, ...rest } = project;
+            return rest;
+          }),
+        }));
+      },
+      reorderProjectGroups: (activeId, overId) => {
+        if (activeId === overId) return;
+        set((state) => {
+          const ids = state.projectGroups
+            .slice()
+            .sort((a, b) => a.order - b.order)
+            .map((group) => group.id);
+          const from = ids.indexOf(activeId);
+          const to = ids.indexOf(overId);
+          if (from < 0 || to < 0) return state;
+          const next = [...ids];
+          const [moved] = next.splice(from, 1);
+          next.splice(to, 0, moved);
+          const order = new Map(next.map((id, index) => [id, index]));
+          return {
+            projectGroups: state.projectGroups.map((group) => ({
+              ...group,
+              order: order.get(group.id) ?? group.order,
+            })),
+          };
+        });
+      },
+      setProjectGroupId: (projectId, groupId) => {
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            if (!groupId) {
+              const { groupId: _removed, ...rest } = project;
+              return rest;
+            }
+            return { ...project, groupId };
+          }),
+        }));
+      },
+      setProjectAlias: (projectId, alias) => {
+        const next = alias?.trim();
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            if (!next) {
+              const { alias: _removed, ...rest } = project;
+              return rest;
+            }
+            return { ...project, alias: next };
+          }),
+        }));
+      },
+      setProjectDefaultModel: (projectId, model, reasoning) => {
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            if (!model) {
+              const {
+                defaultModel: _removed,
+                defaultReasoningEnabled: _reasoning,
+                defaultThinkingLevel: _thinking,
+                ...rest
+              } = project;
+              return rest;
+            }
+            return {
+              ...project,
+              defaultModel: { providerId: model.providerId, modelId: model.modelId },
+              ...(reasoning
+                ? {
+                    defaultReasoningEnabled: reasoning.reasoningEnabled,
+                    defaultThinkingLevel: reasoning.thinkingLevel,
+                  }
+                : {}),
+            };
+          }),
+        }));
+      },
+
+      setProjectDisabledBuiltinTools: (projectId, disabled) => {
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            if (!disabled) {
+              const { disabledBuiltinTools: _removed, ...rest } = project;
+              return rest;
+            }
+            return {
+              ...project,
+              disabledBuiltinTools: [...new Set(disabled.filter((id) => typeof id === 'string'))],
+            };
+          }),
+        }));
+      },
+
+      setProjectSubagentAllowedModes: (projectId, modes) => {
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            if (!modes) {
+              const { subagentAllowedModes: _removed, ...rest } = project;
+              return rest;
+            }
+            return {
+              ...project,
+              subagentAllowedModes: normalizeSubagentAllowedModes(modes),
+            };
+          }),
+        }));
+      },
+
+      setProjectTrustedCode: (projectId, sources) => {
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            if (!sources) {
+              const { trustedProjectCode: _removed, ...rest } = project;
+              return rest;
+            }
+            return { ...project, trustedProjectCode: [...new Set(sources)].sort() };
+          }),
+        }));
+      },
+
+      removeProject: async (id) => {
+        const projection = await window.electronAPI.sourceAuthority.read();
+        const project = projection.projects.find(
+          (candidate) => candidate.projectId === id && candidate.state === 'active'
+        );
+        if (!project) {
+          set((state) => ({ projects: state.projects.filter((candidate) => candidate.id !== id) }));
+          return true;
+        }
+        const result = await window.electronAPI.sourceAuthority.removeProject({
+          requestId: crypto.randomUUID(),
+          projectId: id,
+          version: project.version,
+        });
+        if (!result.accepted) return false;
+        set((state) => ({ projects: state.projects.filter((candidate) => candidate.id !== id) }));
+        return true;
+      },
+
+      setUsageModelPricing: (modelId, pricing) => {
+        const parsed = parseUsageModelPricing({ [modelId]: pricing });
+        const [id, next] = Object.entries(parsed)[0] ?? [];
+        if (!id || !next) return false;
+        set((state) => ({ usageModelPricing: { ...state.usageModelPricing, [id]: next } }));
+        return true;
+      },
+      removeUsageModelPricing: (modelId) => {
+        const id = modelId.trim();
+        if (!id) return;
+        set((state) => {
+          if (!(id in state.usageModelPricing)) return state;
+          const { [id]: _removed, ...rest } = state.usageModelPricing;
+          return { usageModelPricing: rest };
+        });
+      },
+    }),
+    {
+      name: 'enso-settings',
+      storage: createJSONStorage(() => electronStorage),
+      version: SETTINGS_VERSION,
+      migrate: (persisted, version) => migrateSettings(persisted, version) as SettingsState,
+      merge: (persisted, current) => mergeSettingsState(persisted, current),
+      partialize: (state) => ({
+        ...state,
+        fileOpenRules: normalizeFileOpenRules(state.fileOpenRules),
+        contextMenuOpen: normalizeContextMenuOpen(state.contextMenuOpen),
+        chatTypography: normalizeChatTypography(state.chatTypography),
+      }),
+      onRehydrateStorage: () => (state, error) => {
+        // merge 已完成：此后（含下面的补写）才允许落盘；读失败保持关闸
+        if (!error) openPersistWriteGate('enso-settings');
+        const s = state ?? useSettingsStore.getState();
+        applySettings(s);
+        const fileOpenRules = normalizeFileOpenRules(s.fileOpenRules);
+        if (JSON.stringify(fileOpenRules) !== JSON.stringify(s.fileOpenRules)) {
+          useSettingsStore.setState({ fileOpenRules });
+        }
+        // 持久化数据可能被外部污染；非法值会让设置弹层渲染 undefined 图标而白屏
+        const windowsLocalShell = parseWindowsLocalShell(s.windowsLocalShell);
+        if (windowsLocalShell !== s.windowsLocalShell) {
+          useSettingsStore.setState({ windowsLocalShell });
+        }
+        const terminalShell = parseTerminalShell(s.terminalShell);
+        if (terminalShell !== s.terminalShell) {
+          useSettingsStore.setState({ terminalShell });
+        }
+        const virtualModels = parseVirtualModels(s.virtualModels);
+        if (JSON.stringify(virtualModels) !== JSON.stringify(s.virtualModels)) {
+          useSettingsStore.setState({ virtualModels });
+        }
+        const botRouteClassifier = parseVirtualClassifier(s.botRouteClassifier) ?? null;
+        if (JSON.stringify(botRouteClassifier) !== JSON.stringify(s.botRouteClassifier ?? null)) {
+          useSettingsStore.setState({ botRouteClassifier });
+        }
+        const smartCompactMode = parseSmartCompactMode(s.smartCompactMode) ?? 'auto';
+        if (smartCompactMode !== s.smartCompactMode) {
+          useSettingsStore.setState({ smartCompactMode });
+        }
+        const accentColor = resolveAccentColor(s.accentColor);
+        if (accentColor !== s.accentColor) {
+          useSettingsStore.setState({ accentColor });
+        }
+        const segments = normalizeStatusLineSegments(s.statusLineSegments);
+        if (
+          segments.length !== s.statusLineSegments?.length ||
+          segments.some((id, i) => s.statusLineSegments[i] !== id)
+        ) {
+          useSettingsStore.setState({ statusLineSegments: segments });
+        }
+        const memoryModelIdleMinutes = normalizeMemoryModelIdleMinutes(s.memoryModelIdleMinutes);
+        if (memoryModelIdleMinutes !== s.memoryModelIdleMinutes) {
+          useSettingsStore.setState({ memoryModelIdleMinutes });
+        }
+        const memoryDistillWindowMinutes = normalizeMemoryDistillWindowMinutes(
+          s.memoryDistillWindowMinutes
+        );
+        if (memoryDistillWindowMinutes !== s.memoryDistillWindowMinutes) {
+          useSettingsStore.setState({ memoryDistillWindowMinutes });
+        }
+        // 遗忘阈值来自 settings.json，手改坏了要夹回范围，否则巡检按脏值跑
+        const forgetting = normalizeForgettingSettings(s);
+        if (
+          forgetting.staleDays !== s.memoryDecayStaleDays ||
+          forgetting.maxImportance !== s.memoryDecayMaxImportance ||
+          forgetting.intervalDays !== s.memoryDecayIntervalDays
+        ) {
+          useSettingsStore.setState({
+            memoryDecayStaleDays: forgetting.staleDays,
+            memoryDecayMaxImportance: forgetting.maxImportance,
+            memoryDecayIntervalDays: forgetting.intervalDays,
+          });
+        }
+        const maxActiveCoworkers = normalizeMaxActiveCoworkers(s.maxActiveCoworkers);
+        if (maxActiveCoworkers !== s.maxActiveCoworkers) {
+          useSettingsStore.setState({ maxActiveCoworkers });
+        }
+        const autoRetryLimit = normalizeAutoRetryLimit(s.autoRetryLimit);
+        if (autoRetryLimit !== s.autoRetryLimit) {
+          useSettingsStore.setState({ autoRetryLimit });
+        }
+        const privacyMasking = parsePrivacyMaskSettings(s.privacyMasking);
+        if (JSON.stringify(privacyMasking) !== JSON.stringify(s.privacyMasking)) {
+          useSettingsStore.setState({ privacyMasking });
+        }
+        const botMaxRunningTurns = normalizeBotMaxRunningTurns(s.botMaxRunningTurns);
+        if (botMaxRunningTurns !== s.botMaxRunningTurns) {
+          useSettingsStore.setState({ botMaxRunningTurns });
+        }
+        if (typeof s.botDiscussModeEnabled !== 'boolean') {
+          useSettingsStore.setState({ botDiscussModeEnabled: false });
+        }
+        if (typeof s.pluginAutoUpdate !== 'boolean') {
+          useSettingsStore.setState({ pluginAutoUpdate: true });
+        }
+        const sshTimeoutSeconds = normalizeSshTimeoutSeconds(s.sshTimeoutSeconds);
+        if (sshTimeoutSeconds !== s.sshTimeoutSeconds) {
+          useSettingsStore.setState({ sshTimeoutSeconds });
+        }
+        const autoArchiveIdleDays = normalizeAutoArchiveIdleDays(s.autoArchiveIdleDays);
+        if (autoArchiveIdleDays !== s.autoArchiveIdleDays) {
+          useSettingsStore.setState({ autoArchiveIdleDays });
+        }
+        const autoDeleteArchivedDays = normalizeAutoDeleteArchivedDays(s.autoDeleteArchivedDays);
+        if (autoDeleteArchivedDays !== s.autoDeleteArchivedDays) {
+          useSettingsStore.setState({ autoDeleteArchivedDays });
+        }
+        const activeRetentionMinutes = normalizeActiveRetentionMinutes(s.activeRetentionMinutes);
+        if (activeRetentionMinutes !== s.activeRetentionMinutes) {
+          useSettingsStore.setState({ activeRetentionMinutes });
+        }
+        const headerRecentMinutes = normalizeHeaderRecentMinutes(s.headerRecentMinutes);
+        if (headerRecentMinutes !== s.headerRecentMinutes) {
+          useSettingsStore.setState({ headerRecentMinutes });
+        }
+        if (s.autoArchiveMergedWorktrees !== true && s.autoArchiveMergedWorktrees !== false) {
+          useSettingsStore.setState({ autoArchiveMergedWorktrees: false });
+        }
+        // 老用户（升级前已有配置）视为已完成引导，避免被打扰
+        if (
+          !s.onboarded &&
+          (s.providers.length > 0 ||
+            s.skills.length > 0 ||
+            s.mcpServers.length > 0 ||
+            s.instructions.length > 0)
+        ) {
+          useSettingsStore.setState({ onboarded: true });
+        }
+        // OAuth bootstrap 可能先于 persist 水合完成；水合后必须用当时最新快照再校验一次。
+        useSettingsStore
+          .getState()
+          .revalidateDefaultModel(useOauthCredentialStore.getState().snapshot);
+        void refreshProjectAuthorityProjection();
+      },
+    }
+  )
+);
+
+// 水合前先写默认变量，避免首帧字号落空
+applyChatTypography(DEFAULT_CHAT_TYPOGRAPHY);
+
+type ProjectEntry = SettingsState['projects'][number];
+
+/**
+ * 投影里没有的字段：别名、分组、项目级默认模型/内置工具与 Agent 模式只存在于渲染侧设置。
+ * 重建 projects 时不原样带回就会被 source-authority 广播抹掉（新建对话必定触发一次广播）。
+ * 代码信任列表同理：Main spawn 时从 settings 读它决定是否加载 .pi/extensions，丢了就静默失效。
+ */
+const LOCAL_PROJECT_KEYS = [
+  'alias',
+  'groupId',
+  'defaultModel',
+  'defaultReasoningEnabled',
+  'defaultThinkingLevel',
+  'disabledBuiltinTools',
+  'subagentAllowedModes',
+  'trustedProjectCode',
+] as const satisfies readonly (keyof ProjectEntry)[];
+
+function localProjectFields(previous: ProjectEntry | undefined): Partial<ProjectEntry> {
+  const local: Partial<ProjectEntry> = {};
+  if (!previous) return local;
+  for (const key of LOCAL_PROJECT_KEYS) {
+    if (previous[key] !== undefined) Object.assign(local, { [key]: previous[key] });
+  }
+  return local;
+}
+
+function applyProjectAuthorityProjection(projection: SourceAuthorityProjection): void {
+  const previousById = new Map(
+    useSettingsStore.getState().projects.map((project) => [project.id, project])
+  );
+  const next = projection.projects
+    .filter((project) => project.state === 'active')
+    .map((project) => {
+      const previous = previousById.get(project.projectId);
+      return {
+        id: project.projectId,
+        name: projectNameFromPath(project.canonicalPath),
+        path: project.canonicalPath,
+        ...localProjectFields(previous),
+        ...(project.kind === 'ssh'
+          ? {
+              kind: 'ssh' as const,
+              sshHost: project.sshHost,
+              sshConnectionId: project.sshConnectionId,
+              sshConnectionName: project.sshConnectionName,
+            }
+          : project.kind === 'scratch'
+            ? { kind: 'scratch' as const, name: 'Temporary chats' }
+            : project.kind === 'secretary'
+              ? { kind: 'secretary' as const, name: 'Secretary' }
+              : {}),
+      };
+    });
+  // 投影未变时必须不写 state：persist 的每次 setState 都会落盘并广播 SETTINGS_CHANGED，
+  // 而收到广播的窗口 rehydrate 后又会重投影。无条件写会让两个窗口互相广播成死循环
+  // （单窗口不复现，因为广播 exclude-sender）。
+  if (sameProjectProjection(useSettingsStore.getState().projects, next)) return;
+  useSettingsStore.setState({ projects: next });
+}
+
+function sameProjectProjection(
+  current: SettingsState['projects'],
+  next: SettingsState['projects']
+): boolean {
+  if (current.length !== next.length) return false;
+  // 按 id 比对而非按下标：投影按 registry 插入顺序下发，本地数组顺序可能不同
+  // （项目删除后重建会错位）。按下标比会把纯顺序差异当成内容变化，每次广播都重写整个数组。
+  const currentById = new Map(current.map((project) => [project.id, project]));
+  return next.every((candidate) => {
+    const project = currentById.get(candidate.id);
+    return (
+      project !== undefined &&
+      project.name === candidate.name &&
+      project.path === candidate.path &&
+      project.kind === candidate.kind &&
+      project.sshHost === candidate.sshHost &&
+      project.sshConnectionId === candidate.sshConnectionId &&
+      project.sshConnectionName === candidate.sshConnectionName &&
+      project.groupId === candidate.groupId
+    );
+  });
+}
+
+async function refreshProjectAuthorityProjection(): Promise<void> {
+  applyProjectAuthorityProjection(await window.electronAPI.sourceAuthority.read());
+}
+
+window.electronAPI.sourceAuthority.onChanged(applyProjectAuthorityProjection);
+void refreshProjectAuthorityProjection();
+
+// 跟随系统明暗变化
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  const state = useSettingsStore.getState();
+  if (state.theme === 'system') {
+    applyAppTheme('system', state.terminalTheme);
+  }
+});
+
+/**
+ * 其它窗口写入后重读磁盘。rehydrate 是 `set(snapshot, true)` 整体替换：若本窗口在重读
+ * 在途时也写了一笔，回包（主进程先答复读、后处理写）会把那一笔从内存里盖掉，下次落盘
+ * 再把旧值写回去。所以只要重读期间本地有写，就再读一次拿含该写入的主进程缓存。
+ */
+async function syncSettingsFromMain(): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const generation = getWriteGeneration();
+    await useSettingsStore.persist.rehydrate();
+    if (getWriteGeneration() === generation) break;
+  }
+  await refreshProjectAuthorityProjection();
+}
+
+// 通用 settings 只负责展示层持久化；可执行的项目身份始终由 Main 重新投影。
+window.electronAPI.settings.onChanged(() => {
+  void syncSettingsFromMain();
+});
+
+// 目录晚于 settings 水合到达时，稀疏 OAuth 覆盖表不能把仍有效的默认模型判丢。
+useModelDirectoryStore.subscribe((state, prev) => {
+  if (state.snapshot === prev.snapshot) return;
+  useSettingsStore.getState().revalidateDefaultModel(useOauthCredentialStore.getState().snapshot);
+});

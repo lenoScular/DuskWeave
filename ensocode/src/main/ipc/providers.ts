@@ -1,0 +1,160 @@
+import { ipcMain } from '@platform';
+import {
+  parseOauthFlowControlRequest,
+  parseOauthFlowPromptResponse,
+  parseStartOauthWizardRequest,
+} from '@shared/oauthFlow';
+import { parseProviderHeaders } from '@shared/providers/providerHeaders';
+import type { ModelMetaQuery, ProviderApiConfig } from '@shared/types';
+import { IPC_CHANNELS } from '@shared/types';
+import { listClassifierModels } from '../services/classifierModels';
+import { queryModelMeta } from '../services/modelMeta';
+import { refreshModelCatalogNow } from '../services/modelsDevCatalog';
+import {
+  cancelOauthLogin,
+  getOauthAccountUsage,
+  importCodexOauthCredential,
+  listOauthProviders,
+  oauthLogout,
+  readStoredOauthCredentialKeys,
+  reopenOauthLogin,
+  respondOauthPrompt,
+  startOauthLogin,
+} from '../services/oauthProviders';
+import { listModels, testProvider } from '../services/providerApi';
+import { collectImport, scanLocalProviders } from '../services/providerScan';
+
+function toApiConfig(input: unknown): ProviderApiConfig | null {
+  if (!input || typeof input !== 'object') return null;
+  const { api, apiKey, baseUrl } = input as Record<string, unknown>;
+  if (typeof api !== 'string' || typeof apiKey !== 'string' || typeof baseUrl !== 'string') {
+    return null;
+  }
+  const headers = parseProviderHeaders((input as Record<string, unknown>).headers);
+  return {
+    api: api as ProviderApiConfig['api'],
+    apiKey,
+    baseUrl,
+    ...(headers ? { headers } : {}),
+  };
+}
+
+// 当前最大订阅 catalog 为 155 项；256 项留出增长余量，同时把单次 IPC 的字符串载荷
+// 限在 32 KiB。单个 wire id 超过 256 字符也没有现实用途，应在构造 Set/返回体前拒绝。
+const MAX_MODEL_IDS = 256;
+const MAX_MODEL_ID_LENGTH = 256;
+const MAX_MODEL_IDS_CHARACTERS = 32_768;
+
+function toModelMetaQuery(input: unknown): ModelMetaQuery | null {
+  if (!input || typeof input !== 'object') return null;
+  const { oauthAccountKey, modelIds } = input as Record<string, unknown>;
+  if (!Array.isArray(modelIds) || modelIds.length > MAX_MODEL_IDS) return null;
+  let totalCharacters = 0;
+  for (const id of modelIds) {
+    if (typeof id !== 'string' || id.length === 0 || id.length > MAX_MODEL_ID_LENGTH) return null;
+    totalCharacters += id.length;
+    if (totalCharacters > MAX_MODEL_IDS_CHARACTERS) return null;
+  }
+  const parsedModelIds = modelIds as string[];
+  if (oauthAccountKey !== undefined) {
+    if (
+      typeof oauthAccountKey !== 'string' ||
+      oauthAccountKey.length === 0 ||
+      oauthAccountKey.length > MAX_MODEL_ID_LENGTH
+    ) {
+      return null;
+    }
+    return { oauthAccountKey, modelIds: parsedModelIds };
+  }
+  // 空数组会返回整个 catalog，只允许 service 层已授权的订阅账号使用。
+  if (parsedModelIds.length === 0) return null;
+  return { modelIds: parsedModelIds };
+}
+
+export function registerProviderHandlers(): void {
+  ipcMain.handle(IPC_CHANNELS.PROVIDERS_SCAN_LOCAL, async () => {
+    return scanLocalProviders();
+  });
+
+  ipcMain.handle(
+    IPC_CHANNELS.PROVIDERS_COLLECT_IMPORT,
+    (_event, scanId: unknown, candidateIds: unknown) => {
+      if (typeof scanId !== 'string' || !Array.isArray(candidateIds)) return [];
+      return collectImport(
+        scanId,
+        candidateIds.filter((id): id is string => typeof id === 'string')
+      );
+    }
+  );
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDERS_LIST_MODELS, (_event, config: unknown) => {
+    const parsed = toApiConfig(config);
+    if (!parsed) return { ok: false, models: [], error: 'Invalid config' };
+    return listModels(parsed);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDERS_TEST, (_event, config: unknown, modelId: unknown) => {
+    const parsed = toApiConfig(config);
+    if (!parsed) return { ok: false, latencyMs: 0, message: 'Invalid config' };
+    return testProvider(parsed, typeof modelId === 'string' ? modelId : undefined);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDERS_MODEL_META, (_event, query: unknown) => {
+    const parsed = toModelMetaQuery(query);
+    if (!parsed) return { ok: false, models: [], error: 'Invalid query' };
+    return queryModelMeta(parsed);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDERS_REFRESH_MODEL_CATALOG, () => refreshModelCatalogNow());
+
+  ipcMain.handle(IPC_CHANNELS.PROVIDERS_CLASSIFIER_MODELS, (_event, providerId: unknown) =>
+    listClassifierModels(providerId)
+  );
+
+  ipcMain.handle(IPC_CHANNELS.OAUTH_PROVIDERS_LIST, () => listOauthProviders());
+  ipcMain.handle(IPC_CHANNELS.OAUTH_CREDENTIAL_KEYS_LIST, async () => [
+    ...(await readStoredOauthCredentialKeys()),
+  ]);
+
+  ipcMain.handle(IPC_CHANNELS.OAUTH_LOGIN, (event, raw: unknown) => {
+    const request = parseStartOauthWizardRequest(raw);
+    if (!request) {
+      return { status: 'failed', code: 'invalid-request', message: 'Invalid OAuth login request' };
+    }
+    return startOauthLogin(request.providerId, event.sender);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.OAUTH_LOGIN_RESPOND, (event, raw: unknown) => {
+    const request = parseOauthFlowPromptResponse(raw);
+    if (!request || request.locator.ownerWebContentsId !== event.sender.id) return false;
+    return respondOauthPrompt(request.locator, request.requestId, request.value);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.OAUTH_LOGIN_CANCEL, (event, raw: unknown) => {
+    const request = parseOauthFlowControlRequest(raw);
+    return request && request.locator.ownerWebContentsId === event.sender.id
+      ? cancelOauthLogin(request.locator)
+      : false;
+  });
+  ipcMain.handle(IPC_CHANNELS.OAUTH_LOGIN_REOPEN, (event, raw: unknown) => {
+    const request = parseOauthFlowControlRequest(raw);
+    return request && request.locator.ownerWebContentsId === event.sender.id
+      ? reopenOauthLogin(request.locator)
+      : false;
+  });
+
+  ipcMain.handle(IPC_CHANNELS.OAUTH_LOGOUT, (event, accountKey: unknown) => {
+    if (typeof accountKey !== 'string') return;
+    return oauthLogout(accountKey, event.sender);
+  });
+
+  // 不接受任何入参：Codex 路径由 Main 固定推导，Renderer 不能指定磁盘路径
+  ipcMain.handle(IPC_CHANNELS.OAUTH_IMPORT_CODEX, (event) =>
+    importCodexOauthCredential(event.sender)
+  );
+
+  ipcMain.handle(IPC_CHANNELS.OAUTH_ACCOUNT_INFO, (_event, accountKey: unknown) => {
+    if (typeof accountKey !== 'string') return { key: '', windows: [], error: 'Invalid account' };
+    return getOauthAccountUsage(accountKey);
+  });
+}

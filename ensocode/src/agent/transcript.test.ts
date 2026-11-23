@@ -1,0 +1,153 @@
+import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import { describe, expect, it } from 'vitest';
+import { transcriptMessages } from './transcript';
+
+type Msg = Extract<SessionEntry, { type: 'message' }>;
+const msg = (id: string, role: string, text: string, parentId: string | null): Msg =>
+  ({
+    type: 'message',
+    id,
+    parentId,
+    timestamp: `2026-01-01T00:00:0${id}Z`,
+    message: { role, content: [{ type: 'text', text }] },
+  }) as unknown as Msg;
+const compaction = (
+  id: string,
+  parentId: string,
+  summary: string,
+  tokensBefore: number,
+  firstKeptEntryId?: string,
+  fromHook?: boolean,
+  details?: unknown
+): SessionEntry =>
+  ({
+    type: 'compaction',
+    id,
+    parentId,
+    timestamp: `2026-01-01T00:00:0${id}Z`,
+    summary,
+    tokensBefore,
+    ...(firstKeptEntryId ? { firstKeptEntryId } : {}),
+    ...(fromHook ? { fromHook } : {}),
+    ...(details !== undefined ? { details } : {}),
+  }) as unknown as SessionEntry;
+
+describe('transcriptMessages', () => {
+  it('user 投影带持久化 entryId，但不修改原上下文', () => {
+    const entries: SessionEntry[] = [msg('1', 'user', 'a', null), msg('2', 'assistant', 'b', '1')];
+    const context = entries.map((e) => (e as Msg).message);
+    const result = transcriptMessages({ getBranch: () => entries }, context);
+    expect(result).toEqual([{ ...context[0], entryId: '1' }, context[1]]);
+    expect(context[0]).not.toHaveProperty('entryId');
+  });
+
+  it('重复正文按消息身份绑定 ID，不给未持久化的继续冒认 ID', () => {
+    const entries = [msg('1', 'user', 'continue', null), msg('2', 'user', 'continue', '1')];
+    const pending = { ...entries[1].message };
+    const result = transcriptMessages({ getBranch: () => entries }, [entries[1].message, pending]);
+    expect(result).toEqual([{ ...entries[1].message, entryId: '2' }, pending]);
+    expect(result[1]).not.toHaveProperty('entryId');
+  });
+
+  it('compaction 之前被摘要掉的历史补回到 context 前面，summary 落在原位', () => {
+    const entries: SessionEntry[] = [
+      msg('1', 'user', 'old-q', null),
+      msg('2', 'assistant', 'old-a', '1'),
+      msg('3', 'user', 'kept-q', '2'),
+      msg('4', 'assistant', 'kept-a', '3'),
+      compaction('5', '4', 'SUMMARY', 1000, '3'),
+      msg('6', 'user', 'new-q', '5'),
+    ];
+    // pi 的 context 视图：summary + firstKept 起的条目 + compaction 之后的条目
+    const context = [
+      { role: 'compactionSummary', summary: 'SUMMARY', tokensBefore: 1000 },
+      (entries[2] as Msg).message,
+      (entries[3] as Msg).message,
+      (entries[5] as Msg).message,
+    ];
+    const result = transcriptMessages({ getBranch: () => entries }, context) as {
+      role: string;
+      content?: { text: string }[];
+    }[];
+    expect(result.map((m) => m.role)).toEqual([
+      'user',
+      'assistant',
+      'compactionSummary',
+      'user',
+      'assistant',
+      'user',
+    ]);
+    expect(result[0].content?.[0].text).toBe('old-q');
+    expect(result[3].content?.[0].text).toBe('kept-q');
+    expect(result[0]).toHaveProperty('entryId', '1');
+    expect(result[3]).toHaveProperty('entryId', '3');
+    expect(result[5]).toHaveProperty('entryId', '6');
+  });
+
+  it('fromHook compaction 把 verified 标到对应 summary', () => {
+    const entries: SessionEntry[] = [
+      msg('1', 'user', 'old', null),
+      compaction('2', '1', 'S', 10, undefined, true),
+      msg('3', 'user', 'new', '2'),
+    ];
+    const context = [{ role: 'compactionSummary', summary: 'S', tokensBefore: 10 }];
+    const result = transcriptMessages({ getBranch: () => entries }, context) as {
+      role: string;
+      fromHook?: boolean;
+    }[];
+    expect(result.find((m) => m.role === 'compactionSummary')?.fromHook).toBe(true);
+  });
+
+  it('om.folded compaction 标 memory；智能压缩兜底的 hook compaction 不标', () => {
+    const entries: SessionEntry[] = [
+      msg('1', 'user', 'old', null),
+      compaction('2', '1', 'M', 10, undefined, true, { type: 'om.folded', version: 1 }),
+      msg('3', 'user', 'mid', '2'),
+      compaction('4', '3', 'S', 20, '3', true, { type: 'enso-compact' }),
+      msg('5', 'user', 'new', '4'),
+    ];
+    // 第二次压缩后 pi context 只剩最新 summary + 新消息；M 由 branch 回填
+    const context = [
+      { role: 'compactionSummary', summary: 'S', tokensBefore: 20 },
+      { role: 'user', content: 'new' },
+    ];
+    const result = transcriptMessages({ getBranch: () => entries }, context) as {
+      role: string;
+      fromHook?: boolean;
+      compactionSource?: string;
+    }[];
+    const summaries = result.filter((m) => m.role === 'compactionSummary');
+    expect(summaries.map((m) => m.compactionSource)).toEqual(['memory', undefined]);
+    expect(summaries.every((m) => m.fromHook)).toBe(true);
+  });
+
+  it('firstKeptEntryId 缺失（全部摘要）时补回 compaction 之前的全部历史', () => {
+    const entries: SessionEntry[] = [
+      msg('1', 'user', 'a', null),
+      msg('2', 'assistant', 'b', '1'),
+      compaction('3', '2', 'S', 10),
+    ];
+    const context = [{ role: 'compactionSummary', summary: 'S', tokensBefore: 10 }];
+    const result = transcriptMessages({ getBranch: () => entries }, context) as { role: string }[];
+    expect(result.map((m) => m.role)).toEqual(['user', 'assistant', 'compactionSummary']);
+  });
+
+  it('多次 compaction：更早的 compaction 也以 summary 消息出现在历史中', () => {
+    const entries: SessionEntry[] = [
+      msg('1', 'user', 'a', null),
+      compaction('2', '1', 'S1', 10),
+      msg('3', 'user', 'b', '2'),
+      compaction('4', '3', 'S2', 20),
+      msg('5', 'user', 'c', '4'),
+    ];
+    const context = [
+      { role: 'compactionSummary', summary: 'S2', tokensBefore: 20 },
+      (entries[4] as Msg).message,
+    ];
+    const result = transcriptMessages({ getBranch: () => entries }, context) as {
+      role: string;
+      summary?: string;
+    }[];
+    expect(result.map((m) => m.summary ?? m.role)).toEqual(['user', 'S1', 'user', 'S2', 'user']);
+  });
+});

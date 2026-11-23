@@ -1,0 +1,550 @@
+import os from 'node:os';
+import {
+  attachHeartbeat,
+  backoffDelay,
+  claimPairing,
+  createFrameReplay,
+  DirectLink,
+  type FrameReplay,
+  fromBase64Url,
+  type Heartbeat,
+  type HostToPhone,
+  type HostToRemote,
+  isConnectStuck,
+  isHostRemoteFrame,
+  isReplayHello,
+  type PairedDevice,
+  type PhoneToHost,
+  parsePairUri,
+  RELAY_CONNECT_TIMEOUT_MS,
+  type RemoteToHost,
+  revokePairing,
+  shouldReplaceOnNudge,
+  toBase64Url,
+  toWebSocketUrl,
+} from '@enso/pair';
+import { powerMonitor } from '@platform';
+import type {
+  NodeActionResult,
+  NodePairResult,
+  NodesStatus,
+  RemoteNodeStatus,
+} from '@shared/types/nodes';
+import {
+  adoptHostname,
+  isNodeStoreSecure,
+  loadNodes,
+  type RemoteNode,
+  removeNode as removeFromList,
+  renameNode as renameInList,
+  saveNodes,
+  upsertNode,
+} from './nodeStore';
+import { PAIR_DIRECT_ENABLED } from './pairDirectConfig';
+import { isDirectPeerAvailable, mainDirectPeerFactory, preloadDirectPeer } from './pairDirectPeer';
+import { startPairNetworkWatch } from './pairNetworkWatch';
+import { seedRelayHostCache } from './pairRelayLookup';
+import { openPairRelayWebSocket } from './pairRelayOpen';
+import { loadRelayHostCache } from './pairStore';
+
+/**
+ * 「连接到节点」guest 端：本机连到别的 EnsoCode 桌面（对方是 pairHost）。
+ * 与 pairHost 对称——每个节点一条 role=guest 的 WSS、心跳、退避重连；解密后的远程界面帧交给 nodeRemote 隧道。
+ * 密钥与连接都留在 main：界面刷新不掉线，contentKey 不进渲染层。
+ */
+
+interface Connection {
+  node: RemoteNode;
+  contentKey: Uint8Array;
+  ws: WebSocket | null;
+  heartbeat: Heartbeat | null;
+  /** 立即拆掉当前中继链并走重连，不等 close 事件（半开链的 close 可能永不到达） */
+  dropRelay: (() => void) | null;
+  /** WebRTC 直连：业务帧优先出口；信令与在线态仍走中继 */
+  direct: DirectLink;
+  hostOnline: boolean;
+  /** 当前业务通道 RTT（ms）；切通道时清空 */
+  rttMs: number | null;
+  hostname?: string;
+  appVersion?: string;
+  attempt: number;
+  timer: NodeJS.Timeout | null;
+  closed: boolean;
+  generation: number;
+  probeNonce: number;
+  probeSentAt: number | null;
+  /** 直连和中继共用：一帧只封一次 */
+  replay: FrameReplay;
+  /** 直连和中继共用的收帧链：解密是异步的，并发解密会让后到的小帧越过前面的大帧 */
+  receiveQueue: Promise<void>;
+}
+
+const connections = new Map<string, Connection>();
+let onStatusChange: ((status: NodesStatus) => void) | null = null;
+
+/** 远程节点界面的 rpc 隧道（nodeRemote）：远程 renderer 帧与宿主在线变化 */
+export interface NodeRemoteHooks {
+  frame(nodeId: string, frame: HostToRemote): void;
+  /** online=true 也会在已在线时重复触发（中继重建），隧道据此重新 hello */
+  online(nodeId: string, online: boolean): void;
+  removed(nodeId: string): void;
+  /** 节点列表/状态变化：远程节点主界面里的节点切换器列的也是本机的节点 */
+  status(status: NodesStatus): void;
+}
+let remoteHooks: NodeRemoteHooks | null = null;
+
+export function setNodeRemoteHooks(hooks: NodeRemoteHooks): void {
+  remoteHooks = hooks;
+}
+
+export function isNodeHostOnline(nodeId: string): boolean {
+  return connections.get(nodeId)?.hostOnline ?? false;
+}
+
+export function sendRemoteToNode(nodeId: string, frame: RemoteToHost): void {
+  const conn = connections.get(nodeId);
+  if (conn) void sendFrame(conn, frame as PhoneToHost);
+}
+
+export function setNodesStatusListener(listener: (status: NodesStatus) => void): void {
+  onStatusChange = listener;
+}
+
+export function getNodesStatus(): NodesStatus {
+  return {
+    nodes: loadNodes().map((node): RemoteNodeStatus => {
+      const conn = connections.get(node.nodeId);
+      return {
+        nodeId: node.nodeId,
+        label: node.label,
+        relayUrl: node.relayUrl,
+        pairedAt: node.pairedAt,
+        connected: conn?.ws?.readyState === 1,
+        hostOnline: conn?.hostOnline ?? false,
+        transport: conn?.direct.transport() ?? 'relay',
+        ...(conn?.hostOnline && conn.rttMs != null ? { rttMs: conn.rttMs } : {}),
+        ...(conn?.hostname ? { hostname: conn.hostname } : {}),
+        ...(conn?.appVersion ? { appVersion: conn.appVersion } : {}),
+      };
+    }),
+    secureStorage: isNodeStoreSecure(),
+  };
+}
+
+function notifyStatus(): void {
+  if (!onStatusChange && !remoteHooks) return;
+  const status = getNodesStatus();
+  onStatusChange?.(status);
+  remoteHooks?.status(status);
+}
+
+// ── 生命周期 ──────────────────────────────────────────────────────────
+
+let resumeHooked = false;
+let stopNetworkWatch: (() => void) | null = null;
+let cacheSeeded = false;
+
+function ensureRelayCacheSeeded(): void {
+  if (cacheSeeded) return;
+  cacheSeeded = true;
+  seedRelayHostCache(loadRelayHostCache());
+}
+
+export function startPairGuest(): void {
+  ensureRelayCacheSeeded();
+  if (!resumeHooked) {
+    resumeHooked = true;
+    // 睡眠唤醒后 TCP 多半已死但 close 事件不会来：活链立即探测，死链立即重连
+    powerMonitor.on('resume', () => reviveAll('resume'));
+    stopNetworkWatch = startPairNetworkWatch({ onChange: () => reviveAll('network-change') });
+  }
+  void preloadDirectPeer().finally(() => {
+    for (const node of loadNodes()) openConnection(node);
+  });
+}
+
+function reviveAll(reason: 'resume' | 'network-change'): void {
+  for (const conn of connections.values()) {
+    if (conn.closed) continue;
+    if (reason === 'network-change') conn.direct.networkChange();
+    if (shouldReplaceOnNudge(reason, conn.ws !== null, conn.ws?.readyState ?? null)) {
+      if (conn.timer) clearTimeout(conn.timer);
+      conn.attempt = 0;
+      if (conn.dropRelay) conn.dropRelay();
+      else connect(conn);
+      continue;
+    }
+    conn.heartbeat?.probe();
+  }
+}
+
+export function stopPairGuest(): void {
+  stopNetworkWatch?.();
+  stopNetworkWatch = null;
+  for (const conn of connections.values()) closeConnection(conn);
+  connections.clear();
+}
+
+function closeConnection(conn: Connection): void {
+  conn.closed = true;
+  if (conn.timer) clearTimeout(conn.timer);
+  conn.heartbeat?.stop();
+  conn.heartbeat = null;
+  conn.direct.close();
+  try {
+    conn.ws?.close();
+  } catch {}
+  conn.ws = null;
+}
+
+// ── 配对 / 解绑 / 重命名 ──────────────────────────────────────────────
+
+/**
+ * 认领失败是否属于中继的业务拒绝（链接过期 / 已被认领），而不是网络不可达。
+ * postJson 对 4xx 直接抛中继给的错误文案（不带状态码前缀），网络失败抛 fetch 错误。
+ * `no pending`：中继按 TTL 清掉未认领的配对码后，晚到的认领只会拿到这句。
+ */
+export function isPairClaimRejected(detail: string): boolean {
+  return /relay 4\d\d|not found|no pending|expired|claimed|authorized/i.test(detail);
+}
+
+/** 粘贴对方的配对链接：认领 → 存凭据 → 立即连接。deviceName 报本机主机名，对方设备列表据此区分手机与电脑 */
+export async function pairNode(inviteUri: string): Promise<NodePairResult> {
+  let invite: ReturnType<typeof parsePairUri>;
+  try {
+    invite = parsePairUri(inviteUri);
+  } catch {
+    return { ok: false, error: 'invalid-uri' };
+  }
+  let claimed: Awaited<ReturnType<typeof claimPairing>>;
+  try {
+    claimed = await claimPairing(invite.relay, invite.publicKey, os.hostname());
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      error: isPairClaimRejected(detail) ? 'expired-or-claimed' : 'relay-unreachable',
+      detail,
+    };
+  }
+  const device: PairedDevice = {
+    pairId: claimed.pairId,
+    token: claimed.deviceToken,
+    contentKey: toBase64Url(claimed.contentKey),
+    deviceName: os.hostname(),
+    relayUrl: invite.relay,
+    pairedAt: Date.now(),
+  };
+  const list = upsertNode(loadNodes(), device, undefined);
+  saveNodes(list);
+  const node = list.find((n) => n.nodeId === device.pairId);
+  if (!node) return { ok: false, error: 'relay-unreachable', detail: 'store failed' };
+  openConnection(node);
+  notifyStatus();
+  const status = getNodesStatus().nodes.find((n) => n.nodeId === node.nodeId);
+  return status
+    ? { ok: true, node: status }
+    : { ok: false, error: 'relay-unreachable', detail: 'status missing' };
+}
+
+/** 解绑：通知中继清房（对方重连即被拒）+ 本地清凭据 + 断连接 */
+export async function removeNode(nodeId: string): Promise<NodeActionResult> {
+  const node = loadNodes().find((n) => n.nodeId === nodeId);
+  if (!node) return { ok: false, error: 'node not found' };
+  try {
+    await revokePairing(node.relayUrl, node.pairId, node.token);
+  } catch {
+    // 已被对端解绑或中继不可达：本地照样清
+  }
+  forgetNode(nodeId);
+  notifyStatus();
+  return { ok: true };
+}
+
+export function renameNode(nodeId: string, label: string): NodeActionResult {
+  const list = loadNodes();
+  if (!list.some((n) => n.nodeId === nodeId)) return { ok: false, error: 'node not found' };
+  const next = renameInList(list, nodeId, label);
+  saveNodes(next);
+  const conn = connections.get(nodeId);
+  if (conn) conn.node = next.find((n) => n.nodeId === nodeId) ?? conn.node;
+  notifyStatus();
+  return { ok: true };
+}
+
+function forgetNode(nodeId: string): void {
+  const conn = connections.get(nodeId);
+  if (conn) {
+    closeConnection(conn);
+    connections.delete(nodeId);
+  }
+  saveNodes(removeFromList(loadNodes(), nodeId));
+  remoteHooks?.removed(nodeId);
+}
+
+// ── 连接 ──────────────────────────────────────────────────────────────
+
+function openConnection(node: RemoteNode): void {
+  const existing = connections.get(node.nodeId);
+  if (existing) {
+    // 重新配对同一节点（凭据换了）：先断旧的
+    closeConnection(existing);
+    connections.delete(node.nodeId);
+  }
+  const conn: Connection = {
+    node,
+    contentKey: fromBase64Url(node.contentKey),
+    ws: null,
+    heartbeat: null,
+    dropRelay: null,
+    direct: null as unknown as DirectLink,
+    hostOnline: false,
+    rttMs: null,
+    attempt: 0,
+    timer: null,
+    closed: false,
+    generation: 0,
+    probeNonce: 0,
+    probeSentAt: null,
+    replay: createFrameReplay(),
+    receiveQueue: Promise.resolve(),
+  };
+  conn.direct = new DirectLink({
+    role: 'guest',
+    // openConnection 在 preloadDirectPeer 之后：原生模块缺失就别对 host-info 白跑协商
+    factory: PAIR_DIRECT_ENABLED && isDirectPeerAvailable() ? mainDirectPeerFactory : null,
+    sendSignal: (signal) => void sendViaRelay(conn, signal as PhoneToHost),
+    onFrame: (frame) => enqueueFrame(conn, frame),
+    onTransportChange: () => {
+      conn.rttMs = null;
+      notifyStatus();
+    },
+    onRtt: (ms) => {
+      conn.rttMs = ms;
+      notifyStatus();
+    },
+    // 切通道瞬间旧通道在途帧可能丢：远程界面隧道重新 hello，宿主按 seq 补发（界面不感知通道切换）
+    onResync: () => remoteHooks?.online(conn.node.nodeId, true),
+    onDiagnostic: (line) => console.log(`[nodes] ${conn.node.label}: ${line}`),
+    onNeedRelayProbe: () => {
+      conn.probeNonce = (conn.probeNonce + 1) >>> 0;
+      conn.probeSentAt = Date.now();
+      void sendViaRelay(conn, { type: 'probe', nonce: conn.probeNonce });
+    },
+  });
+  connections.set(node.nodeId, conn);
+  connect(conn);
+}
+
+function connect(conn: Connection): void {
+  if (conn.closed) return;
+  const generation = ++conn.generation;
+  const base = toWebSocketUrl(conn.node.relayUrl);
+  const url = `${base}/v1/pair/${encodeURIComponent(conn.node.pairId)}?role=guest&token=${encodeURIComponent(conn.node.token)}`;
+  void openPairRelayWebSocket(url)
+    .then((ws) => attachGuestSocket(conn, ws, generation))
+    .catch(() => {
+      if (!conn.closed && conn.generation === generation) scheduleReconnect(conn);
+    });
+}
+
+function attachGuestSocket(conn: Connection, ws: WebSocket, generation: number): void {
+  if (conn.closed || conn.generation !== generation) {
+    try {
+      ws.close();
+    } catch {}
+    return;
+  }
+  ws.binaryType = 'arraybuffer';
+  conn.ws = ws;
+
+  // 半开死链的 close 事件可能永不到达：心跳判死后直接走关闭路径，幂等防双跑
+  let settled = false;
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  const closed = (code: number | null): void => {
+    if (settled) return;
+    settled = true;
+    if (connectTimer) clearTimeout(connectTimer);
+    if (conn.ws !== ws) return;
+    conn.heartbeat?.stop();
+    conn.heartbeat = null;
+    conn.ws = null;
+    conn.dropRelay = null;
+    conn.hostOnline = false;
+    remoteHooks?.online(conn.node.nodeId, false);
+    // 1008 = 中继明确告知凭据已失效（对方解绑）。网络波动不是 1008，仍需重连。
+    if (code === 1008) {
+      dropRevoked(conn);
+      return;
+    }
+    notifyStatus();
+    scheduleReconnect(conn);
+  };
+  const drop = (): void => {
+    try {
+      ws.close();
+    } catch {}
+    closed(null);
+  };
+  conn.dropRelay = drop;
+  conn.heartbeat = attachHeartbeat(ws, drop, (ms) => {
+    if (conn.direct.transport() === 'relay') {
+      conn.rttMs = ms;
+      notifyStatus();
+    }
+  });
+  // 心跳只管 OPEN：握手卡住（固定 IP 链路 headersTimeout 为 0）时靠这里拆链重连
+  connectTimer = setTimeout(() => {
+    if (isConnectStuck(ws.readyState, RELAY_CONNECT_TIMEOUT_MS)) drop();
+  }, RELAY_CONNECT_TIMEOUT_MS);
+
+  ws.onopen = () => {
+    if (connectTimer) clearTimeout(connectTimer);
+    conn.attempt = 0;
+    notifyStatus();
+  };
+
+  ws.onmessage = (event) => {
+    if (typeof event.data === 'string') {
+      // 中继明文控制帧
+      try {
+        const control = JSON.parse(event.data) as { type?: string };
+        if (control.type === 'host-online') {
+          // 防重放只在这里重置：host 进房时同样收到 peer-joined 一起重置。中继重连尝试不能重置，
+          // 否则直连上的帧退回随机 nonce，被仍锁定旧前缀的 host 静默丢弃
+          conn.replay.peerReset();
+          conn.hostOnline = true;
+          conn.direct.peerOnline(true);
+          notifyStatus();
+          remoteHooks?.online(conn.node.nodeId, true);
+        } else if (control.type === 'host-offline') {
+          conn.hostOnline = false;
+          conn.direct.peerOnline(false);
+          notifyStatus();
+          remoteHooks?.online(conn.node.nodeId, false);
+        } else if (control.type === 'revoked') {
+          dropRevoked(conn);
+        }
+      } catch {}
+      return;
+    }
+    enqueueFrame(conn, new Uint8Array(event.data as ArrayBuffer));
+  };
+
+  ws.onclose = (event) => closed(event.code);
+
+  ws.onerror = () => {
+    try {
+      ws.close();
+    } catch {}
+  };
+}
+
+/** 配对已被对端解除：清干净并通知渲染层，不再重连 */
+function dropRevoked(conn: Connection): void {
+  forgetNode(conn.node.nodeId);
+  notifyStatus();
+}
+
+function scheduleReconnect(conn: Connection): void {
+  if (conn.closed) return;
+  if (conn.timer) clearTimeout(conn.timer);
+  const delay = backoffDelay(conn.attempt++);
+  conn.timer = setTimeout(() => connect(conn), delay);
+}
+
+// ── 收：解密 → 远程界面帧交给隧道，其余只取连接元信息 ──────────────────
+
+/** 按到达顺序逐帧处理（同 pairHost）：否则大快照后紧跟的 status 会先应用，再被快照盖回旧状态 */
+function enqueueFrame(conn: Connection, frame: Uint8Array): void {
+  const task = conn.receiveQueue.then(async () => {
+    if (!conn.closed) await handleFrame(conn, frame);
+  });
+  conn.receiveQueue = task.catch((error) => {
+    console.warn('[nodes] receive failed', error);
+  });
+}
+
+async function handleFrame(conn: Connection, frame: Uint8Array): Promise<void> {
+  // 收到加密帧即证明对方在房间里（控制帧可能因时序丢失）
+  if (!conn.hostOnline) {
+    conn.hostOnline = true;
+    notifyStatus();
+    remoteHooks?.online(conn.node.nodeId, true);
+  }
+  let payload: HostToPhone;
+  try {
+    const opened = await conn.replay.open(conn.contentKey, frame);
+    if (opened === undefined) return;
+    payload = opened as HostToPhone;
+  } catch {
+    console.warn('[nodes] frame decrypt failed, dropped');
+    return;
+  }
+  if (conn.replay.takeHello()) void sendFrame(conn, { type: 'replay-hello' } as PhoneToHost);
+  if (isReplayHello(payload)) return;
+  if (typeof payload !== 'object' || payload === null || typeof payload.type !== 'string') return;
+  if (isHostRemoteFrame(payload)) {
+    remoteHooks?.frame(conn.node.nodeId, payload as HostToRemote);
+    return;
+  }
+  switch (payload.type) {
+    case 'host-info': {
+      conn.hostname = payload.hostname;
+      conn.appVersion = payload.appVersion;
+      // 默认「节点 N」换成对方主机名（用户改过名的不动）
+      const next = adoptHostname(loadNodes(), conn.node.nodeId, payload.hostname);
+      const updated = next.find((n) => n.nodeId === conn.node.nodeId);
+      if (updated && updated.label !== conn.node.label) {
+        saveNodes(next);
+        conn.node = updated;
+      }
+      conn.direct.hostInfo(payload);
+      notifyStatus();
+      return;
+    }
+    case 'direct-answer':
+    case 'direct-ice':
+      conn.direct.handleSignal(payload);
+      return;
+    case 'probe-ack':
+      if (payload.nonce === conn.probeNonce && conn.probeSentAt !== null) {
+        conn.direct.noteRelayRtt(Date.now() - conn.probeSentAt);
+        conn.probeSentAt = null;
+      }
+      return;
+  }
+}
+
+// ── 发：加密上行 ──────────────────────────────────────────────────────
+
+async function sendFrame(conn: Connection, command: PhoneToHost): Promise<NodeActionResult> {
+  const direct = conn.direct.transport() === 'direct';
+  if (!direct && conn.ws?.readyState !== 1) return { ok: false, error: 'offline' };
+  try {
+    const frame = await conn.replay.seal(conn.contentKey, command);
+    if (frame.byteLength > 1_000_000) {
+      return { ok: false, error: 'frame over relay limit' };
+    }
+    // 直连优先；背压/刚好断掉时无缝退回中继
+    if (conn.direct.send(frame)) return { ok: true };
+    return sendFrameViaRelay(conn, frame) ? { ok: true } : { ok: false, error: 'offline' };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+function sendFrameViaRelay(conn: Connection, frame: Uint8Array): boolean {
+  if (conn.ws?.readyState !== 1) return false;
+  conn.ws.send(new Uint8Array(frame).slice().buffer as ArrayBuffer);
+  return true;
+}
+
+/** 直连信令只能走中继 */
+async function sendViaRelay(conn: Connection, command: PhoneToHost): Promise<void> {
+  try {
+    sendFrameViaRelay(conn, await conn.replay.seal(conn.contentKey, command));
+  } catch (error) {
+    console.warn('[nodes] signal send failed', error);
+  }
+}

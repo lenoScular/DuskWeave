@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:; frame-src about:"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+      iframe {
+        display: block;
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <script type="text/plain" id="enso-view-bridge">
+      // 跑在内层 sandbox srcdoc 里：和主界面不同源，只认外层壳转发的第一条初始化消息。
+      // enso.storage 与 localStorage 读初始快照，写入经 MessagePort 交给宿主持久化。
+      (() => {
+        let port = null;
+        let seq = 0;
+        let theme = 'light';
+        let file = null;
+        let session = null;
+        const pending = new Map();
+        const themeListeners = new Set();
+        const fileListeners = new Set();
+        const sessionListeners = new Set();
+        const eventListeners = new Map();
+        const emitView = (name, data) => {
+          const set = eventListeners.get(name);
+          if (!set) return;
+          for (const listener of [...set]) {
+            try {
+              listener(data);
+            } catch {
+              /* 单个订阅失败不影响其余 */
+            }
+          }
+        };
+        const applyTheme = (next) => {
+          const value = next === 'dark' ? 'dark' : 'light';
+          const changed = value !== theme;
+          theme = value;
+          if (document.documentElement) document.documentElement.dataset.theme = theme;
+          if (!changed) return;
+          for (const listener of [...themeListeners]) {
+            try {
+              listener(theme);
+            } catch {
+              /* 单个订阅失败不影响其余 */
+            }
+          }
+        };
+        // 全局页面跨会话常驻：宿主在当前会话变化时推 enso-view-session
+        const applySession = (next, notify) => {
+          const value =
+            next && typeof next.sessionId === 'string'
+              ? Object.freeze({
+                  sessionId: next.sessionId,
+                  projectId: typeof next.projectId === 'string' ? next.projectId : null,
+                })
+              : null;
+          const changed =
+            (value ? value.sessionId : null) !== (session ? session.sessionId : null) ||
+            (value ? value.projectId : null) !== (session ? session.projectId : null);
+          session = value;
+          if (!changed || !notify) return;
+          for (const listener of [...sessionListeners]) {
+            try {
+              listener(session);
+            } catch {
+              /* 单个订阅失败不影响其余 */
+            }
+          }
+        };
+        const store = Object.create(null);
+        const persist = (patch) => {
+          if (port) port.postMessage({ type: 'enso-storage', patch });
+        };
+        const storage = {
+          getItem(key) {
+            const name = String(key);
+            return Object.hasOwn(store, name) ? String(store[name]) : null;
+          },
+          setItem(key, value) {
+            const name = String(key);
+            const text = String(value);
+            store[name] = text;
+            persist({ [name]: text });
+          },
+          removeItem(key) {
+            const name = String(key);
+            delete store[name];
+            persist({ [name]: null });
+          },
+          clear() {
+            const patch = {};
+            for (const name of Object.keys(store)) patch[name] = null;
+            for (const name of Object.keys(patch)) delete store[name];
+            persist(patch);
+          },
+          key(index) {
+            return Object.keys(store)[index] ?? null;
+          },
+          get length() {
+            return Object.keys(store).length;
+          },
+        };
+        try {
+          Object.defineProperty(window, 'localStorage', {
+            configurable: true,
+            enumerable: true,
+            value: storage,
+          });
+        } catch {
+          /* 原生 localStorage 不可替换时仍提供 enso.storage */
+        }
+        // 文件查看器才有：宿主推送当前内容，update 把新内容交回宿主（进编辑区草稿，由用户保存）
+        const fileApi = Object.freeze({
+          get rel() {
+            return file ? file.rel : '';
+          },
+          get text() {
+            return file ? file.text : '';
+          },
+          onChange(listener) {
+            if (typeof listener !== 'function') return () => {};
+            fileListeners.add(listener);
+            return () => fileListeners.delete(listener);
+          },
+          update(text) {
+            if (!file || !port) return;
+            file = { rel: file.rel, text: String(text) };
+            port.postMessage({ type: 'enso-file-edit', text: file.text });
+          },
+        });
+        Object.defineProperty(window, 'enso', {
+          configurable: false,
+          enumerable: false,
+          writable: false,
+          value: Object.freeze({
+            get theme() {
+              return theme;
+            },
+            get file() {
+              return file ? fileApi : null;
+            },
+            get session() {
+              return session;
+            },
+            onSession(listener) {
+              if (typeof listener !== 'function') return () => {};
+              sessionListeners.add(listener);
+              return () => sessionListeners.delete(listener);
+            },
+            onTheme(listener) {
+              if (typeof listener !== 'function') return () => {};
+              themeListeners.add(listener);
+              return () => themeListeners.delete(listener);
+            },
+            on(name, listener) {
+              if (typeof name !== 'string' || name.length === 0 || typeof listener !== 'function')
+                return () => {};
+              let set = eventListeners.get(name);
+              if (!set) {
+                set = new Set();
+                eventListeners.set(name, set);
+              }
+              set.add(listener);
+              return () => set.delete(listener);
+            },
+            call(method, args) {
+              if (!port) return Promise.reject(new Error('bridge not ready'));
+              const id = ++seq;
+              return new Promise((resolve, reject) => {
+                pending.set(id, { resolve, reject });
+                port.postMessage({
+                  id,
+                  method: String(method),
+                  args: args === undefined ? null : args,
+                });
+              });
+            },
+            storage: Object.freeze({
+              get(key) {
+                return storage.getItem(key);
+              },
+              set(key, value) {
+                storage.setItem(key, value);
+              },
+              remove(key) {
+                storage.removeItem(key);
+              },
+            }),
+          }),
+        });
+        const onInit = (event) => {
+          const data = event.data;
+          if (port || event.source !== window.parent || !data || data.type !== 'enso-view-init') return;
+          if (!event.ports?.[0]) return;
+          window.removeEventListener('message', onInit);
+          port = event.ports[0];
+          theme = data.theme === 'dark' ? 'dark' : 'light';
+          if (data.file && typeof data.file.rel === 'string' && typeof data.file.text === 'string')
+            file = { rel: data.file.rel, text: data.file.text };
+          applySession(data.session, false);
+          const incoming = data.storage && typeof data.storage === 'object' ? data.storage : {};
+          for (const name of Object.keys(store)) delete store[name];
+          for (const name of Object.keys(incoming)) {
+            if (typeof incoming[name] === 'string') store[name] = incoming[name];
+          }
+          port.onmessage = (message) => {
+            const reply = message.data;
+            if (reply && reply.type === 'enso-theme') {
+              if (reply.theme === 'dark' || reply.theme === 'light') applyTheme(reply.theme);
+              return;
+            }
+            if (reply && reply.type === 'enso-view-event') {
+              if (typeof reply.name === 'string') emitView(reply.name, reply.data);
+              return;
+            }
+            if (reply && reply.type === 'enso-view-session') {
+              applySession(reply, true);
+              return;
+            }
+            if (reply && reply.type === 'enso-file') {
+              if (!file || typeof reply.rel !== 'string' || typeof reply.text !== 'string') return;
+              if (reply.rel === file.rel && reply.text === file.text) return;
+              file = { rel: reply.rel, text: reply.text };
+              for (const listener of [...fileListeners]) {
+                try {
+                  listener({ rel: file.rel, text: file.text });
+                } catch {
+                  /* 单个订阅失败不影响其余 */
+                }
+              }
+              return;
+            }
+            const entry = reply && pending.get(reply.id);
+            if (!entry) return;
+            pending.delete(reply.id);
+            if (reply.ok) entry.resolve(reply.value);
+            else entry.reject(new Error(String(reply.error)));
+          };
+          document.open();
+          document.write(String(data.html));
+          document.close();
+          document.documentElement.dataset.theme = theme;
+        };
+        window.addEventListener('message', onInit);
+        // 每次内层重新加载都请求一次初始化
+        window.parent.postMessage({ type: 'enso-view-ready' }, '*');
+      })();
+    </script>
+    <script>
+      // 外层不加 sandbox，PWA 的 Service Worker 才能把本文件送到 iframe。
+      // 插件页面跑在内层：srcdoc 继承本页 CSP，不继承主界面那条禁止内联脚本的策略。
+      const code = document.getElementById('enso-view-bridge').textContent;
+      const inner = document.createElement('iframe');
+      inner.setAttribute('sandbox', 'allow-scripts');
+      const csp =
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; media-src data: blob:";
+      let ready = false;
+      window.addEventListener('message', (event) => {
+        // 插件页面和桥在同一个窗口，能再发 ready；只转发第一次，避免冲掉已经接上的端口
+        if (event.source === inner.contentWindow && event.data?.type === 'enso-view-ready') {
+          if (ready) return;
+          ready = true;
+          window.parent.postMessage({ type: 'enso-view-ready' }, '*');
+          return;
+        }
+        const port = event.ports?.[0];
+        if (
+          event.source !== window.parent ||
+          event.data?.type !== 'enso-view-init' ||
+          !port ||
+          !inner.contentWindow
+        )
+          return;
+        inner.contentWindow.postMessage(event.data, '*', [port]);
+      });
+      document.body.append(inner);
+      inner.srcdoc =
+        '<!doctype html><html><head><meta charset="utf-8">' +
+        '<meta http-equiv="Content-Security-Policy" content="' +
+        csp +
+        '"><' +
+        'script>' +
+        code.split('</' + 'script').join('<\\/' + 'script') +
+        '</' +
+        'script></head><body></body></html>';
+    </script>
+  </body>
+</html>

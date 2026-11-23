@@ -1,0 +1,3436 @@
+import {
+  DragOverlay,
+  useDndContext,
+  useDndMonitor,
+  useDraggable,
+  useDroppable,
+} from '@dnd-kit/core';
+import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import {
+  type ArchiveScope,
+  archivedTotal,
+  archiveScopeForTab,
+  archiveSecretaryIds,
+  filterArchivedByScope,
+} from '@shared/archiveScope';
+import { conversationDotTone } from '@shared/conversationDotTone';
+import {
+  ALL_GROUP_ID,
+  filterProjectsByGroup,
+  RECENT_GROUP_ID,
+  sectionsForAllView,
+  UNGROUPED_GROUP_ID,
+} from '@shared/projectGroups';
+import { projectDisplayName, projectNameFromPath } from '@shared/projectName';
+import { conversationThemeState } from '@shared/theme/themeState';
+import type { Project } from '@shared/types';
+import type { SessionWorktree, WorktreeStatus } from '@shared/types/worktree';
+import { AnimatePresence, motion } from 'framer-motion';
+import {
+  Archive,
+  ArchiveRestore,
+  Bell,
+  BellOff,
+  ChevronRight,
+  CircleAlert,
+  Ellipsis,
+  Eraser,
+  FileText,
+  FolderGit2,
+  FolderInput,
+  FolderOpen,
+  FolderPlus,
+  Folders,
+  GitBranchPlus,
+  HardDriveDownload,
+  Loader2,
+  MessageSquarePlus,
+  PanelLeftClose,
+  Pencil,
+  Pin,
+  PinOff,
+  Plus,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Settings,
+  Smartphone,
+  TextSearch,
+  Trash2,
+} from 'lucide-react';
+import type * as React from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useWindowChromeKind } from '@/components/app/WindowChrome';
+import { BackgroundTaskMarker } from '@/components/backgroundTasks/BackgroundTaskMarker';
+import { BackgroundTasksButton } from '@/components/backgroundTasks/BackgroundTasksButton';
+import { AddProjectDialog } from '@/components/chat/AddProjectDialog';
+import { ArchiveEntryButton, ArchiveScopeChip } from '@/components/chat/ArchiveEntryButton';
+import { ConfirmDialog } from '@/components/chat/ConfirmDialog';
+import { ConversationStatusIndicator } from '@/components/chat/ConversationStatusIndicator';
+import { ConversationTitleEdit } from '@/components/chat/ConversationTitleEdit';
+import { matchesQuery } from '@/components/chat/chatSearch';
+import { insertComposerMention } from '@/components/chat/composerMentionBridge';
+import {
+  activeChatDragId,
+  chatDragId,
+  type DragPayload,
+  PINNED_DROP_ID,
+  pinnedChatDragId,
+  projectDragId,
+  projectGroupDragId,
+  routeDrop,
+  UNGROUPED_GROUP_DROP_ID,
+} from '@/components/chat/dragDrop';
+import { GroupChips } from '@/components/chat/GroupChips';
+import { GroupEditorDialog } from '@/components/chat/GroupEditorDialog';
+import { ImportProjectSessionsDialog } from '@/components/chat/ImportProjectSessionsDialog';
+import { ImportSessionDialog } from '@/components/chat/ImportSessionDialog';
+import {
+  canMoveConversationFrom,
+  moveConversationFromMenu,
+  moveConversationTargets,
+} from '@/components/chat/moveConversationAction';
+import { openDirectoryFromMenu, openDirectoryLabel } from '@/components/chat/openDirectoryAction';
+import { ProjectSettingsDialog } from '@/components/chat/ProjectSettingsDialog';
+import {
+  reloadConversationFromMenu,
+  restartConversationFromMenu,
+} from '@/components/chat/reloadConversationAction';
+import { NodeSwitcher } from '@/components/nodes/NodeSwitcher';
+import { PhoneDeviceChip, PhoneLinkStatus } from '@/components/nodes/PhoneLinkStatus';
+import { phoneLinkEntry, showCompactButton } from '@/components/nodes/phoneLinkEntry';
+import { SecretaryOriginBadge, showsMutedBell } from '@/components/secretary/SecretaryOriginBadge';
+import { SecretaryResetDialog } from '@/components/secretary/SecretaryResetDialog';
+import {
+  type RunningOrigins,
+  runningByOrigin,
+  runningBySecretary,
+  SecretaryDispatchBadge,
+} from '@/components/secretary/SecretaryRunningOrigins';
+import {
+  SecretaryCollapsedButton,
+  SecretaryGroupHeader,
+  SecretarySidebarSection,
+  sidebarProjects,
+} from '@/components/secretary/SecretarySidebarSection';
+import { SecretaryTakeoverBadge, useTakeover } from '@/components/secretary/SecretaryTakeover';
+import { secretarySectionView } from '@/components/secretary/secretaryView';
+import {
+  ContextMenu,
+  ContextMenuItem,
+  ContextMenuPopup,
+  ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubPopup,
+  ContextMenuSubTrigger,
+  ContextMenuTrigger,
+} from '@/components/ui/context-menu';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogPanel,
+  DialogTitle,
+} from '@/components/ui/dialog';
+import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
+import {
+  Menu,
+  MenuItem,
+  MenuPopup,
+  MenuSeparator,
+  MenuSub,
+  MenuSubPopup,
+  MenuSubTrigger,
+  MenuTrigger,
+} from '@/components/ui/menu';
+import { addToast } from '@/components/ui/toast';
+import { Tooltip, TooltipPopup, TooltipTrigger } from '@/components/ui/tooltip';
+import { useI18n } from '@/i18n';
+import {
+  importLocalProject,
+  readCollapsedProjects,
+  subscribeCollapsedProjects,
+} from '@/lib/importLocalProject';
+import { effectiveKeybindings, formatBinding, IS_MAC } from '@/lib/keybindings';
+import { heightVariants, springStandard } from '@/lib/motion';
+import { openSecretary } from '@/lib/openSecretary';
+import { secretaryConversationIds } from '@/lib/secretaryEntry';
+import { openSecretarySettings } from '@/lib/secretarySettingsLink';
+import { formatRelativeTime } from '@/lib/time';
+import { cn } from '@/lib/utils';
+import { Z_INDEX } from '@/lib/z-index';
+import { closeBackgroundTasks } from '@/stores/backgroundTasksView';
+import { useSecretaryStore } from '@/stores/secretary';
+import { useSessionsStore } from '@/stores/sessions';
+import {
+  activeConversationIds,
+  activeRetentionRemainingMs,
+  archivedConversationGroups,
+  headerSessionTabIds,
+  pinnedConversationIds,
+  projectConversationIds,
+  RECENT_PROJECT_WINDOW_DAYS,
+  recentProjects,
+  SIDEBAR_TICK_MS,
+  staleArchivedConversationIds,
+} from '@/stores/sessions/pinned';
+import {
+  COLLAPSED_SESSION_LIMIT,
+  nextRevealedExtra,
+  prevRevealedExtra,
+  sessionSwitchSlotIds,
+  shownConversationCount,
+} from '@/stores/sessions/sessionSwitchSlots';
+import { publishSessionSwitch, useSessionSwitchState } from '@/stores/sessions/sessionSwitchState';
+import { selectSidebarConversations } from '@/stores/sessions/sidebarDirectory';
+import { DIRTY_MAIN_TREE, worktreeHasPendingWork } from '@/stores/sessions/worktree';
+import { useSettingsStore } from '@/stores/settings';
+import {
+  applyProjectOrder,
+  moveProject,
+  partitionPinnedProjects,
+  projectReorderScope,
+  togglePinnedProjectId,
+} from '@/stores/settings/projectOrder';
+import {
+  ARCHIVED_PROJECTS_KEY,
+  PINNED_ORDER_KEY,
+  PINNED_PROJECTS_KEY,
+  PROJECT_ORDER_KEY,
+  readSidebarOrder,
+  subscribeSidebarOrder,
+  writeSidebarOrder,
+} from '@/stores/settings/sidebarOrderStorage';
+import { SessionTabCounts } from './SessionTabCounts';
+import {
+  GROUP_EDIT_BUTTON_CLASS,
+  PROJECT_ROW_ACTION_CLASS,
+  PROJECT_ROW_MENU_CLASS,
+} from './sidebarRowActions';
+import { WorktreeBadge } from './WorktreeBadge';
+import { WorktreeRenameDialog } from './WorktreeRenameDialog';
+
+const ARCHIVE_PURGE_DAYS = [7, 15, 30] as const;
+const SHOW_MORE_CLASS =
+  'h-6.5 rounded-lg px-2 text-xs text-subtle-foreground transition-colors hover:bg-foreground/5 hover:text-foreground';
+const SCRATCH_COLLAPSED_KEY = 'enso-collapsed-scratch';
+const SECRETARY_COLLAPSED_KEY = 'enso-collapsed-secretary';
+/** 多个秘书时整块折叠的记录；单个秘书沿用上面那条，升级前后行为不变 */
+const SECRETARY_GROUP_COLLAPSED_KEY = 'enso-collapsed-secretary-group';
+/** 每个秘书各自的折叠记录（值是折叠着的秘书 id 列表） */
+const SECRETARY_FOLDS_KEY = 'enso-collapsed-secretaries';
+/** 秘书伪项目默认只列最近几条，其余折叠 */
+const SECRETARY_VISIBLE_LIMIT = 3;
+
+const ICON_BUTTON_CLASS =
+  'flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground';
+/** 分区标题右侧的悬停按钮；无悬停的触屏常显 */
+const SECTION_ACTION_CLASS =
+  '-my-0.5 flex size-5 shrink-0 items-center justify-center rounded-[5px] text-subtle-foreground opacity-0 transition-opacity hover:bg-foreground/5 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 [@media(hover:none)]:opacity-100';
+
+interface SidebarProps {
+  width?: number;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
+  onOpenSearch?: () => void;
+  /** 用户点了某个会话（窄屏抽屉据此收起，即使点的是当前会话） */
+  onNavigate?: () => void;
+}
+
+export function Sidebar({
+  width,
+  collapsed,
+  onToggleCollapse,
+  onOpenSearch,
+  onNavigate,
+}: SidebarProps) {
+  const { t, locale } = useI18n();
+  const projects = useSettingsStore((state) => state.projects);
+  const chromeKind = useWindowChromeKind();
+  const mobile = chromeKind === 'mobile';
+  const phoneEntry = phoneLinkEntry(window.electronAPI.remote);
+  const compactButton = showCompactButton(window.electronAPI.remote);
+  const scratchSessionsEnabled = useSettingsStore((state) => state.scratchSessionsEnabled);
+  const projectGroups = useSettingsStore((state) => state.projectGroups);
+  const createProjectGroup = useSettingsStore((state) => state.createProjectGroup);
+  const updateProjectGroup = useSettingsStore((state) => state.updateProjectGroup);
+  const removeProjectGroup = useSettingsStore((state) => state.removeProjectGroup);
+  const reorderProjectGroups = useSettingsStore((state) => state.reorderProjectGroups);
+  const setProjectGroupId = useSettingsStore((state) => state.setProjectGroupId);
+  const keybindings = useSettingsStore((state) => state.keybindings);
+  const activeRetentionMinutes = useSettingsStore((state) => state.activeRetentionMinutes);
+  const headerRecentMinutes = useSettingsStore((state) => state.headerRecentMinutes);
+  const headerDismissed = useSessionSwitchState((state) => state.dismissed);
+  const searchBinding = effectiveKeybindings(keybindings)['search-workspace'];
+  const searchShortcut = searchBinding ? formatBinding(searchBinding) : '';
+  const addProject = useSettingsStore((state) => state.addProject);
+  const removeProject = useSettingsStore((state) => state.removeProject);
+  const conversations = useSessionsStore((state) =>
+    selectSidebarConversations(state.conversations)
+  );
+  const order = useSessionsStore((state) => state.order);
+  const activeId = useSessionsStore((state) => state.activeId);
+  const newConversation = useSessionsStore((state) => state.newConversation);
+  const selectConversationInStore = useSessionsStore((state) => state.selectConversation);
+  const onNavigateRef = useRef(onNavigate);
+  onNavigateRef.current = onNavigate;
+  const selectConversation = useCallback(
+    (id: string) => {
+      onNavigateRef.current?.();
+      closeBackgroundTasks();
+      selectConversationInStore(id);
+    },
+    [selectConversationInStore]
+  );
+  const removeConversation = useSessionsStore((state) => state.removeConversation);
+  const togglePinConversation = useSessionsStore((state) => state.togglePinConversation);
+  const toggleArchiveConversation = useSessionsStore((state) => state.toggleArchiveConversation);
+  const moveConversationToWorktree = useSessionsStore((state) => state.moveConversationToWorktree);
+  const cleanupWorktree = useSessionsStore((state) => state.cleanupWorktree);
+  const refreshWorktreeStatuses = useSessionsStore((state) => state.refreshWorktreeStatuses);
+  const worktreeStatuses = useSessionsStore((state) => state.worktreeStatuses);
+
+  // 折叠的项目分组（记忆到 localStorage）
+  const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('enso-collapsed-projects') ?? '{}');
+    } catch {
+      return {};
+    }
+  });
+  const toggleProject = (id: string) => {
+    setCollapsedProjects((prev) => {
+      const next = { ...prev, [id]: !prev[id] };
+      localStorage.setItem('enso-collapsed-projects', JSON.stringify(next));
+      return next;
+    });
+  };
+  const [scratchCollapsed, setScratchCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(SCRATCH_COLLAPSED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const persistScratchCollapsed = (collapsed: boolean) => {
+    try {
+      localStorage.setItem(SCRATCH_COLLAPSED_KEY, collapsed ? '1' : '0');
+    } catch {
+      // 隐私模式或配额满时只保留本次内存状态
+    }
+  };
+  const toggleScratchCollapsed = () => {
+    setScratchCollapsed((prev) => {
+      const next = !prev;
+      persistScratchCollapsed(next);
+      return next;
+    });
+  };
+  const expandScratch = () => {
+    setScratchCollapsed((prev) => {
+      if (!prev) return prev;
+      persistScratchCollapsed(false);
+      return false;
+    });
+  };
+
+  // 项目自定义顺序(拖拽重排,存 localStorage;新项目追加末尾)
+  const [projectOrderIds, setProjectOrderIds] = useState<string[]>(() =>
+    readSidebarOrder(PROJECT_ORDER_KEY)
+  );
+  const orderedProjects = applyProjectOrder(sidebarProjects(projects), projectOrderIds);
+  const scratchProject = projects.find((project) => project.kind === 'scratch');
+
+  // 秘书是置顶伪项目：单独渲染，不参与分组筛选、拖拽排序与项目设置
+  const secretaryState = useSecretaryStore((state) => state.secretary);
+  const secretaryList = useSecretaryStore((state) => state.secretaries);
+  const secretaryStates = useSecretaryStore((state) => state.states);
+  /** 多个秘书时整块渲染；清单还没到时按单秘书画，升级后的第一眼与原来一致 */
+  const multiSecretary = secretaryList.length > 1;
+  const secretaryView = useMemo(() => secretarySectionView(secretaryState, t), [secretaryState, t]);
+  const secretaryEntries = useMemo(() => {
+    if (!multiSecretary) return [];
+    return secretaryList.flatMap((entry) => {
+      const state = secretaryStates[entry.id];
+      const view = state ? secretarySectionView(state, t, entry.id) : null;
+      return view ? [{ id: entry.id, projectId: entry.projectId, view }] : [];
+    });
+  }, [multiSecretary, secretaryList, secretaryStates, t]);
+  // 每个秘书只按自己的看板分组，计数和悬停列表都不跨分区
+  const secretaryRunning = useMemo(() => {
+    const known = (id: string) => conversations[id] !== undefined;
+    return {
+      single: runningByOrigin(secretaryState.board, known),
+      byId: multiSecretary ? runningBySecretary(secretaryList, secretaryStates, known) : {},
+    };
+  }, [multiSecretary, secretaryList, secretaryStates, secretaryState.board, conversations]);
+  const runningLink = (origins: RunningOrigins | undefined) =>
+    origins && {
+      groups: origins.groups,
+      titleOf: (id: string) => conversations[id]?.title,
+      onSelect: selectConversation,
+    };
+  const [secretaryGroupFolded, setSecretaryGroupFolded] = useState(() => {
+    try {
+      return localStorage.getItem(SECRETARY_GROUP_COLLAPSED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleSecretaryGroupFolded = () => {
+    setSecretaryGroupFolded((prev) => {
+      try {
+        localStorage.setItem(SECRETARY_GROUP_COLLAPSED_KEY, prev ? '0' : '1');
+      } catch {
+        // 隐私模式或配额满时只保留本次内存状态
+      }
+      return !prev;
+    });
+  };
+  const [secretaryFolds, setSecretaryFolds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(SECRETARY_FOLDS_KEY);
+      const parsed: unknown = raw ? JSON.parse(raw) : [];
+      // 升级前只有一个秘书，沿用旧的整行折叠记录
+      if (
+        Array.isArray(parsed) &&
+        parsed.length === 0 &&
+        localStorage.getItem(SECRETARY_COLLAPSED_KEY) === '1'
+      ) {
+        return ['default'];
+      }
+      return Array.isArray(parsed) ? parsed.filter((entry) => typeof entry === 'string') : [];
+    } catch {
+      return [];
+    }
+  });
+  const toggleSecretaryFold = (secretaryId: string) => {
+    setSecretaryFolds((prev) => {
+      const next = prev.includes(secretaryId)
+        ? prev.filter((entry) => entry !== secretaryId)
+        : [...prev, secretaryId];
+      try {
+        localStorage.setItem(SECRETARY_FOLDS_KEY, JSON.stringify(next));
+      } catch {
+        // 同上
+      }
+      return next;
+    });
+  };
+  const [secretaryFolded, setSecretaryFolded] = useState(() => {
+    try {
+      return localStorage.getItem(SECRETARY_COLLAPSED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleSecretaryFolded = () => {
+    setSecretaryFolded((prev) => {
+      try {
+        localStorage.setItem(SECRETARY_COLLAPSED_KEY, prev ? '0' : '1');
+      } catch {
+        // 隐私模式或配额满时只保留本次内存状态
+      }
+      return !prev;
+    });
+  };
+  const [secretaryRevealed, setSecretaryRevealed] = useState(false);
+  /** 非 null 时弹出重来确认框，值是要重来的秘书 id（单秘书时为 null 语义走默认） */
+  const [secretaryResetId, setSecretaryResetId] = useState<string | null>(null);
+  const secretaryIds = useMemo(
+    () => secretaryConversationIds(secretaryState.projectId, order, conversations),
+    [order, conversations, secretaryState.projectId]
+  );
+  const shownSecretaryIds = secretaryRevealed
+    ? secretaryIds
+    : secretaryIds.slice(0, SECRETARY_VISIBLE_LIMIT);
+
+  // 项目归档(项目层标记,存 localStorage):整个项目移到底部 Archived 栏目,
+  // 不碰其下会话的 archived/pinned——恢复后会话分布与归档前完全一致,
+  // 不会把之前单独归档的会话一并“还原”回项目组
+  const [archivedProjectIds, setArchivedProjectIds] = useState<string[]>(() =>
+    readSidebarOrder(ARCHIVED_PROJECTS_KEY)
+  );
+  useEffect(
+    () => subscribeCollapsedProjects(() => setCollapsedProjects(readCollapsedProjects())),
+    []
+  );
+  useEffect(
+    () =>
+      subscribeSidebarOrder(() => {
+        setArchivedProjectIds(readSidebarOrder(ARCHIVED_PROJECTS_KEY));
+      }),
+    []
+  );
+  const [pinnedProjectIds, setPinnedProjectIds] = useState<string[]>(() =>
+    readSidebarOrder(PINNED_PROJECTS_KEY)
+  );
+  const persistPinnedProjects = (next: string[]) => {
+    setPinnedProjectIds(next);
+    writeSidebarOrder(PINNED_PROJECTS_KEY, next);
+  };
+  const togglePinProject = (id: string) => {
+    persistPinnedProjects(togglePinnedProjectId(pinnedProjectIds, id));
+    if (!pinnedProjectIds.includes(id) && archivedProjectIds.includes(id)) {
+      const next = archivedProjectIds.filter((entry) => entry !== id);
+      setArchivedProjectIds(next);
+      writeSidebarOrder(ARCHIVED_PROJECTS_KEY, next);
+    }
+  };
+  const toggleArchiveProject = (id: string) => {
+    const next = archivedProjectIds.includes(id)
+      ? archivedProjectIds.filter((entry) => entry !== id)
+      : [...archivedProjectIds, id];
+    setArchivedProjectIds(next);
+    writeSidebarOrder(ARCHIVED_PROJECTS_KEY, next);
+    if (!archivedProjectIds.includes(id) && pinnedProjectIds.includes(id)) {
+      persistPinnedProjects(pinnedProjectIds.filter((entry) => entry !== id));
+    }
+  };
+  const [selectedGroupId, setSelectedGroupId] = useState(() => {
+    try {
+      return localStorage.getItem('enso-selected-project-group') ?? ALL_GROUP_ID;
+    } catch {
+      return ALL_GROUP_ID;
+    }
+  });
+  const [collapsedGroupIds, setCollapsedGroupIds] = useState<Record<string, boolean>>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('enso-collapsed-project-groups') ?? '{}');
+    } catch {
+      return {};
+    }
+  });
+  const selectGroup = (id: string) => {
+    setSelectedGroupId(id);
+    localStorage.setItem('enso-selected-project-group', id);
+  };
+  const toggleGroupSection = (id: string) => {
+    setCollapsedGroupIds((prev) => {
+      const next = { ...prev, [id]: !prev[id] };
+      localStorage.setItem('enso-collapsed-project-groups', JSON.stringify(next));
+      return next;
+    });
+  };
+  const resolvedGroupId =
+    selectedGroupId === ALL_GROUP_ID ||
+    selectedGroupId === RECENT_GROUP_ID ||
+    selectedGroupId === UNGROUPED_GROUP_ID ||
+    projectGroups.some((group) => group.id === selectedGroupId)
+      ? selectedGroupId
+      : ALL_GROUP_ID;
+  const recentView = resolvedGroupId === RECENT_GROUP_ID;
+  const defaultGroupId = projectGroups.find((group) => group.id === resolvedGroupId)?.id;
+
+  const slicedProjects = filterProjectsByGroup(
+    orderedProjects,
+    projectGroups,
+    archivedProjectIds,
+    resolvedGroupId
+  );
+  const recentActiveProjects = recentProjects(
+    filterProjectsByGroup(orderedProjects, projectGroups, archivedProjectIds, ALL_GROUP_ID),
+    order,
+    conversations,
+    Date.now()
+  );
+  const { pinned: pinnedProjects, rest: unpinnedProjects } = recentView
+    ? { pinned: [], rest: recentActiveProjects }
+    : partitionPinnedProjects(slicedProjects, pinnedProjectIds);
+  const groupSections = sectionsForAllView(unpinnedProjects, projectGroups, []);
+  const activeProjects = [...pinnedProjects, ...unpinnedProjects];
+  const activeProjectIds = activeProjects.map((project) => project.id);
+  const slicedIdSet = new Set(activeProjectIds);
+
+  // 置顶组的手动顺序(组内拖拽重排;未收录的新置顶按活跃时间追加)
+  const [pinnedOrderIds, setPinnedOrderIds] = useState<string[]>(() =>
+    readSidebarOrder(PINNED_ORDER_KEY)
+  );
+
+  // 拖拽中的源对象(用于 Overlay 预览与临时 Pinned 落点)
+  const { active: dndActive } = useDndContext();
+  const dragPayload = dndActive?.data.current as DragPayload | undefined;
+
+  useDndMonitor({
+    onDragEnd: (event) => {
+      const payload = event.active.data.current as DragPayload | undefined;
+      if (!payload) return;
+      const overId = event.over ? String(event.over.id) : null;
+      const action = routeDrop(payload, overId, activeId ?? undefined, {
+        projectGroupId: (projectId) =>
+          projects.find((project) => project.id === projectId)?.groupId,
+      });
+      if (!action) return;
+      switch (action.kind) {
+        case 'move-project-to-group': {
+          if (recentView && action.beforeProjectId) break;
+          setProjectGroupId(action.projectId, action.groupId);
+          if (action.beforeProjectId) {
+            const next = moveProject(
+              projects,
+              projectOrderIds,
+              action.projectId,
+              action.beforeProjectId
+            );
+            setProjectOrderIds(next);
+            writeSidebarOrder(PROJECT_ORDER_KEY, next);
+          }
+          break;
+        }
+        case 'reorder-groups':
+          reorderProjectGroups(action.activeId, action.overId);
+          break;
+        case 'reorder-projects': {
+          if (recentView) break;
+          const scope = projectReorderScope(action.activeId, action.overId, pinnedProjectIds);
+          if (scope === 'pinned') {
+            const next = moveProject(
+              pinnedProjectIds.map((id) => ({ id })),
+              pinnedProjectIds,
+              action.activeId,
+              action.overId
+            );
+            persistPinnedProjects(next);
+            break;
+          }
+          if (scope !== 'order') break;
+          const next = moveProject(projects, projectOrderIds, action.activeId, action.overId);
+          setProjectOrderIds(next);
+          writeSidebarOrder(PROJECT_ORDER_KEY, next);
+          break;
+        }
+        case 'insert-file-mention':
+          insertComposerMention({
+            kind: 'file',
+            id: action.path,
+            label: action.label,
+            relativePath: action.path,
+          });
+          break;
+        case 'insert-chat-mention':
+          insertComposerMention({
+            kind: 'chat',
+            id: action.conversationId,
+            label: action.label,
+            sessionFile: action.sessionFile,
+          });
+          break;
+        case 'pin-conversation':
+          togglePinConversation(action.conversationId);
+          break;
+        case 'reorder-pinned': {
+          const next = moveProject(
+            pinnedIds.map((id) => ({ id })),
+            pinnedOrderIds,
+            action.activeId,
+            action.overId
+          );
+          setPinnedOrderIds(next);
+          writeSidebarOrder(PINNED_ORDER_KEY, next);
+          break;
+        }
+      }
+    },
+  });
+
+  const [groupEditor, setGroupEditor] = useState<
+    { mode: 'create' } | { mode: 'edit'; id: string } | null
+  >(null);
+  const [projectSettingsId, setProjectSettingsId] = useState<string | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [listSearchOpen, setListSearchOpen] = useState(false);
+  const [pendingProject, setPendingProject] = useState<{
+    name: string;
+    path: string;
+    sshHost?: string;
+  } | null>(null);
+  const handleAddProject = (request: {
+    path: string;
+    sshConnectionId?: string;
+    sshHost?: string;
+    groupId?: string;
+  }) => {
+    if (!request.sshConnectionId) {
+      void importLocalProject(request.path, {
+        groupId: request.groupId ?? defaultGroupId,
+        onSelect: selectConversation,
+      }).catch((error: unknown) => {
+        addToast({
+          type: 'error',
+          title: t('Failed to add project'),
+          description: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return;
+    }
+    const knownIds = new Set(projects.map((project) => project.id));
+    setPendingProject({
+      name: projectNameFromPath(request.path),
+      path: request.path,
+      sshHost: request.sshHost,
+    });
+    void addProject(
+      request.path,
+      { sshConnectionId: request.sshConnectionId },
+      request.groupId ?? defaultGroupId
+    )
+      .then((project) => {
+        if (!project) return;
+        if (archivedProjectIds.includes(project.id)) {
+          const next = archivedProjectIds.filter((id) => id !== project.id);
+          setArchivedProjectIds(next);
+          writeSidebarOrder(ARCHIVED_PROJECTS_KEY, next);
+        }
+        if (knownIds.has(project.id)) {
+          setCollapsedProjects((prev) => {
+            if (prev[project.id] !== true) return prev;
+            const next = { ...prev, [project.id]: false };
+            localStorage.setItem('enso-collapsed-projects', JSON.stringify(next));
+            return next;
+          });
+          const latest = projectConversationIds(order, conversations, project.id)[0];
+          if (latest) {
+            void selectConversation(latest);
+            return;
+          }
+        }
+        void newConversation(project.id);
+      })
+      .catch((error: unknown) => {
+        addToast({
+          type: 'error',
+          title: t('Failed to add project'),
+          description: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => setPendingProject(null));
+  };
+
+  const [importProject, setImportProject] = useState<Project | null>(null);
+  const [importSessionsProject, setImportSessionsProject] = useState<Project | null>(null);
+  // 项目行展开了次级操作(设置/导入/归档/删除)的项目 id
+  // 待确认的删除动作(项目连带其对话 / 单个对话)
+  const [pendingRemove, setPendingRemove] = useState<
+    | { kind: 'project'; project: Project; conversationIds: string[] }
+    | { kind: 'conversation'; id: string; worktreeWarning?: string }
+    | { kind: 'archived'; days: number; conversationIds: string[]; projectName?: string }
+    | null
+  >(null);
+  // 删除隔离会话前先查 worktree 有无未落地成果，确认文案里告知
+  const openRemoveConversation = async (id: string) => {
+    const conversation = conversations[id];
+    let worktreeWarning: string | undefined;
+    if (conversation?.worktree) {
+      const status = await freshWorktreeStatus(id);
+      if (worktreeHasPendingWork(status)) worktreeWarning = worktreeWarningText(status);
+    }
+    setPendingRemove({ kind: 'conversation', id, worktreeWarning });
+  };
+  // 项目已额外露出的条数(会话级状态,重启回到折叠上限)
+  const [revealedExtras, setRevealedExtras] = useState<Record<string, number>>({});
+  // 临时会话分组同理,与整组折叠(scratchCollapsed)互不影响
+  const [scratchRevealedExtra, setScratchRevealedExtra] = useState(0);
+  const [listQuery, setListQuery] = useState('');
+  const modHeld = useSessionSwitchState((state) => state.modHeld);
+  const setModHeld = useCallback((value: boolean) => {
+    useSessionSwitchState.setState({ modHeld: value });
+  }, []);
+
+  // 相对时间每分钟自刷（“3 分钟前”不随时间僵住；活跃中留存窗口也随之过期）
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNowTick(Date.now()), SIDEBAR_TICK_MS);
+    return () => clearInterval(timer);
+  }, []);
+  const activeRetention = { now: nowTick, ms: activeRetentionMinutes * 60_000 };
+  const activeIds = activeConversationIds(
+    order,
+    conversations,
+    archivedProjectIds,
+    activeRetention
+  );
+  const activeHoverTitle = (id: string) => {
+    const projectName = hoverProjectName(projects, conversations[id].projectId);
+    const remaining = activeRetentionRemainingMs(id, conversations, activeRetention);
+    if (remaining === undefined) return projectName;
+    const hint = t('Stays in Active for about {{count}} more min', {
+      count: Math.ceil(remaining / 60_000),
+    });
+    return projectName ? `${projectName}\n${hint}` : hint;
+  };
+  const pinnedIds = pinnedConversationIds(order, conversations, pinnedOrderIds, archivedProjectIds);
+  const archivedGroups = archivedConversationGroups(
+    order,
+    conversations,
+    orderedProjects.map((project) => project.id),
+    archivedProjectIds
+  ).filter((group) => scratchSessionsEnabled || group.projectId !== scratchProject?.id);
+  const searching = listQuery.trim().length > 0;
+  const convMatches = (id: string) =>
+    matchesQuery(listQuery, [conversations[id]?.title || t('New conversation')]);
+  const scratchVisibleIds = scratchProject
+    ? projectConversationIds(order, conversations, scratchProject.id).filter(
+        (id) => !searching || convMatches(id)
+      )
+    : [];
+  // 搜索时强制展开，避免命中的临时会话被收起状态挡住
+  const scratchFolded = searching ? false : scratchCollapsed;
+  // 搜索时全量列出命中项,不受条数折叠限制,与项目分组一致
+  const scratchShownCount = searching
+    ? scratchVisibleIds.length
+    : shownConversationCount(scratchVisibleIds.length, scratchRevealedExtra);
+  const scratchHiddenIds = scratchVisibleIds.slice(scratchShownCount);
+  const inActiveGroup = (id: string) => {
+    const projectId = conversations[id]?.projectId;
+    return !projectId || slicedIdSet.has(projectId);
+  };
+  const visibleActiveIds = (searching ? activeIds.filter(convMatches) : activeIds).filter(
+    inActiveGroup
+  );
+  const sidebarSlots = sessionSwitchSlotIds({
+    order,
+    conversations,
+    pinnedOrderIds,
+    projectIds: activeProjectIds,
+    archivedProjectIds,
+    collapsedProjects,
+    revealedExtras,
+    searching,
+    matches: convMatches,
+    projectMatches: (projectId) => {
+      const project = orderedProjects.find((item) => item.id === projectId);
+      return Boolean(
+        project && matchesQuery(listQuery, [project.alias ?? '', project.name, project.path])
+      );
+    },
+    leadingIds: visibleActiveIds,
+  });
+  const headerTabIds = headerSessionTabIds(
+    activeIds.filter(inActiveGroup),
+    order,
+    conversations,
+    archivedProjectIds,
+    { now: nowTick, ms: headerRecentMinutes * 60_000 },
+    inActiveGroup,
+    headerDismissed
+  );
+  if (activeId && conversations[activeId] && !conversations[activeId].parentId) {
+    if (!headerTabIds.includes(activeId)) headerTabIds.push(activeId);
+  }
+  const headerMounted = useSessionSwitchState((state) => state.headerMounted);
+  const switchSlots = headerMounted ? headerTabIds.slice(0, 9) : sidebarSlots;
+  const switchSlotsRef = useRef(switchSlots);
+  switchSlotsRef.current = switchSlots;
+  useEffect(() => publishSessionSwitch(headerTabIds, switchSlots));
+  const visiblePinnedIds = (searching ? pinnedIds.filter(convMatches) : pinnedIds).filter(
+    inActiveGroup
+  );
+  const visiblePinnedSet = new Set(visiblePinnedIds);
+  const visibleActiveSet = new Set(visibleActiveIds);
+  const switchHintFor = (id: string, surface: 'active' | 'pinned' | 'project') => {
+    if (collapsed || !modHeld) return undefined;
+    const index = switchSlots.indexOf(id);
+    if (index < 0) return undefined;
+    const owner: 'active' | 'pinned' | 'project' = visibleActiveSet.has(id)
+      ? 'active'
+      : visiblePinnedSet.has(id)
+        ? 'pinned'
+        : 'project';
+    if (owner !== surface) return undefined;
+    return formatBinding(`mod+${index + 1}`);
+  };
+  // 已归档弹窗(缺省关闭,重启回到关闭);搜索框独立于侧栏搜索
+  const [archiveOpen, setArchiveOpen] = useState(false);
+  const [archiveQuery, setArchiveQuery] = useState('');
+  const [archiveCleanupOpen, setArchiveCleanupOpen] = useState<string | null>(null);
+  // 入口按当前 tab 的范围计数；弹窗里可临时切到全部归档或某个秘书派出的
+  const tabArchiveScope = archiveScopeForTab(resolvedGroupId, projectGroups);
+  const [archiveScopeOverride, setArchiveScopeOverride] = useState<ArchiveScope | null>(null);
+  const archiveScope = archiveScopeOverride ?? tabArchiveScope;
+  const archiveScopeContext = { projects, projectGroups, conversations };
+  // 搜索时:归档项目名命中则整组保留(与活动项目一致),否则只留命中的会话
+  const visibleArchivedGroups = archiveQuery.trim()
+    ? archivedGroups
+        .map((group) => {
+          const project = projects.find((item) => item.id === group.projectId);
+          const projectHit =
+            group.projectArchived === true &&
+            Boolean(
+              project &&
+                matchesQuery(archiveQuery, [project.alias ?? '', project.name, project.path])
+            );
+          return projectHit
+            ? group
+            : {
+                ...group,
+                ids: group.ids.filter((id) =>
+                  matchesQuery(archiveQuery, [conversations[id]?.title || t('New conversation')])
+                ),
+              };
+        })
+        .filter((group) => group.ids.length > 0)
+    : archivedGroups;
+  const slicedArchivedGroups = filterArchivedByScope(
+    visibleArchivedGroups,
+    archiveScope,
+    archiveScopeContext
+  );
+  const archivedCount = archivedTotal(
+    filterArchivedByScope(archivedGroups, tabArchiveScope, archiveScopeContext)
+  );
+  const scopedArchivedCount = archivedTotal(
+    filterArchivedByScope(archivedGroups, archiveScope, archiveScopeContext)
+  );
+  const archiveSecretaries = archiveSecretaryIds(archivedGroups, conversations);
+  const secretaryName = (id: string) =>
+    (multiSecretary
+      ? secretaryEntries.find((entry) => entry.id === id)?.view.name
+      : secretaryView?.name) ?? t('Secretary');
+  const tabScopeLabel =
+    tabArchiveScope.kind === 'group'
+      ? (projectGroups.find((group) => group.id === tabArchiveScope.groupId)?.name ?? '')
+      : tabArchiveScope.kind === 'ungrouped'
+        ? t('Ungrouped')
+        : t('All archived');
+  const archiveScopeHint =
+    archiveScope.kind === 'group'
+      ? t('Archived in group “{{name}}”', { name: tabScopeLabel })
+      : archiveScope.kind === 'ungrouped'
+        ? t('Archived in ungrouped projects')
+        : archiveScope.kind === 'secretary'
+          ? t('Archived sessions dispatched by {{name}}', {
+              name: secretaryName(archiveScope.secretaryId),
+            })
+          : archiveScope.fallbackFrom === 'recent'
+            ? t('“Recent” has no archive scope; showing all archived')
+            : t('Showing all archived');
+  const openArchive = () => {
+    setArchiveQuery('');
+    setArchiveScopeOverride(null);
+    setArchiveOpen(true);
+  };
+
+  useEffect(() => {
+    if (resolvedGroupId === selectedGroupId) return;
+    setSelectedGroupId(ALL_GROUP_ID);
+    localStorage.setItem('enso-selected-project-group', ALL_GROUP_ID);
+  }, [resolvedGroupId, selectedGroupId]);
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const mod = IS_MAC ? e.metaKey : e.ctrlKey;
+      const switchMode = mod && !e.shiftKey && !e.altKey;
+      setModHeld(switchMode);
+      if (!switchMode || e.repeat) return;
+      const n = Number(e.key);
+      if (n < 1 || n > 9) return;
+      const id = switchSlotsRef.current[n - 1];
+      if (!id) return;
+      e.preventDefault();
+      selectConversation(id);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      const mod = IS_MAC ? e.metaKey : e.ctrlKey;
+      setModHeld(mod && !e.shiftKey && !e.altKey);
+    };
+    const clear = () => setModHeld(false);
+    const onVis = () => {
+      if (document.hidden) clear();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', clear);
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', clear);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [selectConversation, setModHeld]);
+
+  // worktree 徽标状态：挂载 + 窗口聚焦 + 30s 轻量轮询（只查隔离会话，不每帧跑 git）
+  useEffect(() => {
+    void refreshWorktreeStatuses();
+    const timer = setInterval(() => void refreshWorktreeStatuses(), 30_000);
+    const onFocus = () => void refreshWorktreeStatuses();
+    window.addEventListener('focus', onFocus);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [refreshWorktreeStatuses]);
+
+  // 隔离会话有未落地成果时的清理/归档拦截确认
+  const [pendingWorktreeAction, setPendingWorktreeAction] = useState<{
+    kind: 'cleanup' | 'archive';
+    id: string;
+    status?: WorktreeStatus;
+  } | null>(null);
+  // 主树有未提交改动时的切隔离二次确认（改动不会丢，只是不跟随会话）
+  const [pendingDirtyMove, setPendingDirtyMove] = useState<string | null>(null);
+
+  const freshWorktreeStatus = async (id: string): Promise<WorktreeStatus | undefined> => {
+    const result = await window.electronAPI.worktree.status(id);
+    return result.ok ? result.value : undefined;
+  };
+
+  const runCleanup = async (id: string, archiveAfter: boolean) => {
+    const error = await cleanupWorktree(id);
+    if (error) {
+      addToast({ type: 'error', title: t('Failed to clean up worktree'), description: error });
+      return;
+    }
+    if (archiveAfter) toggleArchiveConversation(id);
+    void refreshWorktreeStatuses();
+  };
+
+  const handleCleanupWorktree = async (id: string) => {
+    const status = await freshWorktreeStatus(id);
+    if (worktreeHasPendingWork(status)) {
+      setPendingWorktreeAction({ kind: 'cleanup', id, status });
+      return;
+    }
+    await runCleanup(id, false);
+  };
+
+  const handleToggleArchive = async (id: string) => {
+    const conversation = conversations[id];
+    if (!conversation) return;
+    // 只有「归档隔离会话」需要拦截；取消归档/本地会话直接走
+    if (conversation.archived || !conversation.worktree) {
+      toggleArchiveConversation(id);
+      return;
+    }
+    const status = await freshWorktreeStatus(id);
+    if (worktreeHasPendingWork(status)) {
+      setPendingWorktreeAction({ kind: 'archive', id, status });
+      return;
+    }
+    await runCleanup(id, true);
+  };
+
+  // 批量归档：顺序执行，复用单条归档的 worktree 处理逻辑
+  const handleArchiveMany = async (ids: string[]) => {
+    for (const id of ids) {
+      if (!conversations[id] || conversations[id].archived) continue;
+      await handleToggleArchive(id);
+    }
+  };
+
+  const handleMoveToWorktree = async (id: string, allowDirtyMainTree = false) => {
+    const error = await moveConversationToWorktree(id, { allowDirtyMainTree });
+    if (error === DIRTY_MAIN_TREE) {
+      setPendingDirtyMove(id);
+      return;
+    }
+    if (error) {
+      addToast({ type: 'error', title: t('Failed to move to worktree'), description: error });
+      return;
+    }
+    void refreshWorktreeStatuses();
+  };
+
+  const worktreeWarningText = (status?: WorktreeStatus): string => {
+    const parts: string[] = [];
+    if (status?.dirty) parts.push(t('Uncommitted changes'));
+    if (status && status.ahead > 0)
+      parts.push(t('{{n}} unmerged commits (branch is kept)', { n: status.ahead }));
+    return parts.join('; ');
+  };
+
+  return (
+    <motion.aside
+      initial={false}
+      animate={{ width: collapsed ? 48 : width }}
+      transition={springStandard}
+      data-enso="sidebar"
+      className="flex shrink-0 flex-col overflow-hidden"
+    >
+      {collapsed && (
+        <div className="flex w-full flex-1 flex-col items-center gap-1 py-2">
+          {/* 展开/折叠与搜索常驻窗口顶栏（App），折叠栏只留其余入口 */}
+          {(multiSecretary ? secretaryEntries.length > 0 : secretaryView) && (
+            <SecretaryCollapsedButton
+              view={
+                multiSecretary && secretaryEntries[0]
+                  ? {
+                      ...secretaryEntries[0].view,
+                      needsYou: secretaryEntries.reduce(
+                        (sum, entry) => sum + entry.view.needsYou,
+                        0
+                      ),
+                      running: secretaryEntries.reduce((sum, entry) => sum + entry.view.running, 0),
+                    }
+                  : (secretaryView as NonNullable<typeof secretaryView>)
+              }
+              onClick={() => openSecretary()}
+            />
+          )}
+          <button
+            type="button"
+            onClick={() => setAddOpen(true)}
+            className={ICON_BUTTON_CLASS}
+            title={t('Add project')}
+          >
+            <FolderPlus className="h-4 w-4" />
+          </button>
+          <div className="flex-1" />
+          {phoneEntry === 'devices' && <PhoneDeviceChip compact />}
+          {phoneEntry === 'info' && <PhoneLinkStatus />}
+          <BackgroundTasksButton className={ICON_BUTTON_CLASS} />
+          <ArchiveEntryButton
+            count={archivedCount}
+            onClick={openArchive}
+            className={ICON_BUTTON_CLASS}
+          />
+          {compactButton && (
+            <button
+              type="button"
+              onClick={() => window.electronAPI.remote?.exitDesk?.()}
+              className={ICON_BUTTON_CLASS}
+              title={t('Compact view')}
+            >
+              <Smartphone className="h-4 w-4" />
+            </button>
+          )}
+          <button
+            type="button"
+            data-enso="settings-button"
+            onClick={() => window.electronAPI.window.openSettings()}
+            className={ICON_BUTTON_CLASS}
+            title={t('Settings')}
+          >
+            <Settings className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+      <div
+        className={cn('flex h-full min-h-0 flex-col', mobile && 'pt-3', collapsed && 'hidden')}
+        style={{ width }}
+      >
+        <GroupChips
+          groups={projectGroups}
+          selectedId={resolvedGroupId}
+          counts={Object.fromEntries(
+            projectGroups.map((group) => [
+              group.id,
+              filterProjectsByGroup(orderedProjects, projectGroups, archivedProjectIds, group.id)
+                .length,
+            ])
+          )}
+          totalCount={
+            filterProjectsByGroup(orderedProjects, projectGroups, archivedProjectIds, ALL_GROUP_ID)
+              .length
+          }
+          recentCount={recentActiveProjects.length}
+          ungroupedCount={
+            filterProjectsByGroup(
+              orderedProjects,
+              projectGroups,
+              archivedProjectIds,
+              UNGROUPED_GROUP_ID
+            ).length
+          }
+          query={listQuery}
+          onQueryChange={setListQuery}
+          searchOpen={listSearchOpen}
+          onSearchOpenChange={setListSearchOpen}
+          onSelect={selectGroup}
+          onAddGroup={() => setGroupEditor({ mode: 'create' })}
+          onEditGroup={(id) => setGroupEditor({ mode: 'edit', id })}
+        />
+
+        {/* 右侧不留 padding：8px 滚动条槽就是右边距，滚动条不再多占一列、挤到卡片边上 */}
+        <div className="min-h-0 flex-1 overflow-y-auto pt-0.5 pb-2 pl-1.5 [scrollbar-gutter:stable]">
+          {multiSecretary && secretaryEntries.length > 0 ? (
+            <div>
+              <SecretaryGroupHeader
+                count={secretaryEntries.length}
+                folded={secretaryGroupFolded}
+                needsYou={secretaryEntries.reduce((sum, entry) => sum + entry.view.needsYou, 0)}
+                onToggleFold={toggleSecretaryGroupFolded}
+                onCreate={() => {
+                  void useSecretaryStore.getState().createSecretary();
+                }}
+              />
+              {!secretaryGroupFolded &&
+                secretaryEntries.map((entry, index) => {
+                  const folded = secretaryFolds.includes(entry.id);
+                  const ids = secretaryConversationIds(entry.projectId, order, conversations);
+                  const shown = folded ? [] : ids.slice(0, SECRETARY_VISIBLE_LIMIT);
+                  return (
+                    <SecretarySidebarSection
+                      key={entry.id}
+                      view={entry.view}
+                      folded={folded}
+                      divider={index === secretaryEntries.length - 1}
+                      onToggleFold={() => toggleSecretaryFold(entry.id)}
+                      onOpen={() => openSecretary(entry.id)}
+                      onNewConversation={() => {
+                        void useSecretaryStore
+                          .getState()
+                          .newSecretaryConversation({ secretaryId: entry.id });
+                      }}
+                      onOpenSettings={() => openSecretarySettings(entry.id)}
+                      onReset={() => setSecretaryResetId(entry.id)}
+                      secretaryId={entry.id}
+                      keepAvatar
+                      runningOrigins={runningLink(secretaryRunning.byId[entry.id])}
+                    >
+                      {shown.map((id) => (
+                        <ConversationRow
+                          key={id}
+                          id={id}
+                          conversation={conversations[id]}
+                          active={activeId === id}
+                          dispatchRunning={secretaryRunning.byId[entry.id]?.counts[id]}
+                          switchHint={switchHintFor(id, 'project')}
+                          locale={locale}
+                          nowTick={nowTick}
+                          hoverTitle={entry.view.name}
+                          onSelect={selectConversation}
+                          onTogglePin={togglePinConversation}
+                          onToggleArchive={(conversationId) =>
+                            void handleToggleArchive(conversationId)
+                          }
+                          onCleanupWorktree={(conversationId) =>
+                            void handleCleanupWorktree(conversationId)
+                          }
+                          onMoveToWorktree={(conversationId) =>
+                            void handleMoveToWorktree(conversationId)
+                          }
+                          onRemove={(conversationId) => void openRemoveConversation(conversationId)}
+                        />
+                      ))}
+                    </SecretarySidebarSection>
+                  );
+                })}
+            </div>
+          ) : (
+            secretaryView && (
+              <SecretarySidebarSection
+                view={secretaryView}
+                folded={secretaryFolded}
+                onToggleFold={toggleSecretaryFolded}
+                onOpen={openSecretary}
+                onNewConversation={() => {
+                  void useSecretaryStore.getState().newSecretaryConversation();
+                }}
+                onOpenSettings={() =>
+                  void window.electronAPI.window.openSettings({
+                    category: 'secretary',
+                    rowId: 'secretary.root',
+                  })
+                }
+                onReset={() => setSecretaryResetId('default')}
+                runningOrigins={runningLink(secretaryRunning.single)}
+              >
+                {shownSecretaryIds.map((id) => (
+                  <ConversationRow
+                    key={id}
+                    id={id}
+                    conversation={conversations[id]}
+                    active={activeId === id}
+                    dispatchRunning={secretaryRunning.single.counts[id]}
+                    switchHint={switchHintFor(id, 'project')}
+                    locale={locale}
+                    nowTick={nowTick}
+                    hoverTitle={secretaryView.name}
+                    onSelect={selectConversation}
+                    onTogglePin={togglePinConversation}
+                    onToggleArchive={(conversationId) => void handleToggleArchive(conversationId)}
+                    onCleanupWorktree={(conversationId) =>
+                      void handleCleanupWorktree(conversationId)
+                    }
+                    onMoveToWorktree={(conversationId) => void handleMoveToWorktree(conversationId)}
+                    onRemove={(conversationId) => void openRemoveConversation(conversationId)}
+                  />
+                ))}
+                {!secretaryFolded && secretaryIds.length > SECRETARY_VISIBLE_LIMIT && (
+                  <div className="flex items-center gap-1 px-2">
+                    <button
+                      type="button"
+                      onClick={() => setSecretaryRevealed((prev) => !prev)}
+                      className={SHOW_MORE_CLASS}
+                    >
+                      {secretaryRevealed
+                        ? t('Collapse')
+                        : t('Show {{n}} more', {
+                            n: secretaryIds.length - SECRETARY_VISIBLE_LIMIT,
+                          })}
+                    </button>
+                  </div>
+                )}
+              </SecretarySidebarSection>
+            )
+          )}
+          {orderedProjects.length === 0 && (
+            <button
+              type="button"
+              onClick={() => setAddOpen(true)}
+              className="mt-2 w-full rounded-lg border border-dashed px-3 py-6 text-center text-sm text-muted-foreground transition-colors hover:border-brand/50 hover:text-foreground"
+            >
+              {t('Add a project to start')}
+            </button>
+          )}
+          {orderedProjects.length === 0 && scratchSessionsEnabled && scratchProject && (
+            <button
+              type="button"
+              onClick={() => {
+                expandScratch();
+                void newConversation(scratchProject.id);
+              }}
+              className="mt-1 w-full rounded-lg px-3 py-2 text-center text-sm text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+            >
+              {t('Start a temporary chat')}
+            </button>
+          )}
+          {visibleActiveIds.length > 0 && (
+            <div data-slot="active-section">
+              <SidebarSectionLabel section="active">{t('Active')}</SidebarSectionLabel>
+              <div className="flex flex-col">
+                {visibleActiveIds.map((id) => (
+                  <DraggableChat
+                    key={id}
+                    id={id}
+                    dragId={activeChatDragId(id)}
+                    conversation={conversations[id]}
+                  >
+                    <ConversationRow
+                      id={id}
+                      conversation={conversations[id]}
+                      active={activeId === id}
+                      switchHint={switchHintFor(id, 'active')}
+                      locale={locale}
+                      nowTick={nowTick}
+                      hoverTitle={activeHoverTitle(id)}
+                      worktreeStatus={conversations[id].worktree ? worktreeStatuses[id] : undefined}
+                      isolated={Boolean(conversations[id].worktree)}
+                      onSelect={selectConversation}
+                      onTogglePin={togglePinConversation}
+                      onToggleArchive={(conversationId) => void handleToggleArchive(conversationId)}
+                      onCleanupWorktree={(conversationId) =>
+                        void handleCleanupWorktree(conversationId)
+                      }
+                      onMoveToWorktree={(conversationId) =>
+                        void handleMoveToWorktree(conversationId)
+                      }
+                      onRemove={(conversationId) => void openRemoveConversation(conversationId)}
+                    />
+                  </DraggableChat>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* 无置顶会话时,拖动会话中露出临时落点条 */}
+          {pinnedIds.length === 0 && dragPayload?.type === 'chat' && !dragPayload.pinned && (
+            <PinnedDropZone>
+              <div className="flex items-center justify-center gap-1.5 rounded-lg border border-dashed px-2 py-2 text-xs text-muted-foreground">
+                <Pin className="h-3.5 w-3.5" />
+                {t('Drop here to pin')}
+              </div>
+            </PinnedDropZone>
+          )}
+          {visiblePinnedIds.length > 0 && (
+            <PinnedDropZone data-slot="pinned-section">
+              <SidebarSectionLabel section="pinned">{t('Pinned')}</SidebarSectionLabel>
+              <div className="flex flex-col">
+                <SortableContext
+                  items={visiblePinnedIds.map((id) => pinnedChatDragId(id))}
+                  strategy={verticalListSortingStrategy}
+                >
+                  {visiblePinnedIds.map((id) => (
+                    <SortablePinnedChat key={id} id={id} conversation={conversations[id]}>
+                      <ConversationRow
+                        id={id}
+                        conversation={conversations[id]}
+                        active={activeId === id}
+                        switchHint={switchHintFor(id, 'pinned')}
+                        locale={locale}
+                        nowTick={nowTick}
+                        hoverTitle={hoverProjectName(projects, conversations[id].projectId)}
+                        worktreeStatus={
+                          conversations[id].worktree ? worktreeStatuses[id] : undefined
+                        }
+                        isolated={Boolean(conversations[id].worktree)}
+                        onSelect={selectConversation}
+                        onTogglePin={togglePinConversation}
+                        onToggleArchive={(conversationId) =>
+                          void handleToggleArchive(conversationId)
+                        }
+                        onCleanupWorktree={(conversationId) =>
+                          void handleCleanupWorktree(conversationId)
+                        }
+                        onMoveToWorktree={(conversationId) =>
+                          void handleMoveToWorktree(conversationId)
+                        }
+                        onRemove={(conversationId) => void openRemoveConversation(conversationId)}
+                      />
+                    </SortablePinnedChat>
+                  ))}
+                </SortableContext>
+              </div>
+            </PinnedDropZone>
+          )}
+          {scratchSessionsEnabled && scratchProject && (
+            <div data-slot="scratch-section">
+              <div
+                data-enso="section-header"
+                data-section="scratch"
+                className="group flex items-center gap-1 pt-3.5 pr-1 pb-1 pl-2 text-[0.8214rem] font-medium text-subtle-foreground"
+              >
+                <button
+                  type="button"
+                  onClick={toggleScratchCollapsed}
+                  aria-expanded={!scratchFolded}
+                  className="flex min-w-0 flex-1 items-center gap-1 text-left transition-colors hover:text-foreground"
+                >
+                  <span className="min-w-0 truncate">{t('Temporary chats')}</span>
+                  <ChevronRight
+                    data-enso="tree-chevron"
+                    data-expanded={!scratchFolded || undefined}
+                    className={cn(
+                      'size-3 shrink-0 text-subtle-foreground transition-[opacity,transform] duration-150',
+                      !scratchFolded
+                        ? 'rotate-90 opacity-70 group-hover:opacity-100'
+                        : 'opacity-100'
+                    )}
+                  />
+                  <span className="ml-auto shrink-0 font-normal text-[0.7857rem] tabular-nums">
+                    {scratchVisibleIds.length}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className={SECTION_ACTION_CLASS}
+                  title={t('Start a temporary chat')}
+                  aria-label={t('Start a temporary chat')}
+                  onClick={() => {
+                    expandScratch();
+                    void newConversation(scratchProject.id);
+                  }}
+                >
+                  <Plus className="size-3.25" />
+                </button>
+              </div>
+              <AnimatePresence initial={false}>
+                {!scratchFolded && (
+                  <motion.div
+                    key="scratch-conversations"
+                    initial="initial"
+                    animate="animate"
+                    exit="exit"
+                    variants={heightVariants}
+                    className="overflow-hidden"
+                  >
+                    <div className="flex flex-col">
+                      {scratchVisibleIds.slice(0, scratchShownCount).map((id) => (
+                        <ConversationRow
+                          key={id}
+                          id={id}
+                          conversation={conversations[id]}
+                          active={activeId === id}
+                          switchHint={switchHintFor(id, 'project')}
+                          locale={locale}
+                          nowTick={nowTick}
+                          onSelect={selectConversation}
+                          onTogglePin={togglePinConversation}
+                          onToggleArchive={(conversationId) =>
+                            void handleToggleArchive(conversationId)
+                          }
+                          onCleanupWorktree={(conversationId) =>
+                            void handleCleanupWorktree(conversationId)
+                          }
+                          onMoveToWorktree={(conversationId) =>
+                            void handleMoveToWorktree(conversationId)
+                          }
+                          onRemove={(conversationId) => void openRemoveConversation(conversationId)}
+                        />
+                      ))}
+                      {!searching && scratchVisibleIds.length > COLLAPSED_SESSION_LIMIT && (
+                        <div className="flex items-center gap-1 pl-2">
+                          {scratchHiddenIds.length > 0 && (
+                            <ContextMenu>
+                              <ContextMenuTrigger
+                                render={
+                                  (
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setScratchRevealedExtra((prev) =>
+                                          nextRevealedExtra(scratchVisibleIds.length, prev)
+                                        )
+                                      }
+                                      className={SHOW_MORE_CLASS}
+                                    >
+                                      {t('Show {{n}} more', { n: scratchHiddenIds.length })}
+                                    </button>
+                                  ) as React.ReactElement<Record<string, unknown>>
+                                }
+                              />
+                              <ContextMenuPopup className="min-w-36">
+                                <ContextMenuItem
+                                  onClick={() => void handleArchiveMany(scratchHiddenIds)}
+                                >
+                                  <Archive />
+                                  {t('Archive {{n}} conversations', {
+                                    n: scratchHiddenIds.length,
+                                  })}
+                                </ContextMenuItem>
+                              </ContextMenuPopup>
+                            </ContextMenu>
+                          )}
+                          {scratchRevealedExtra > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => setScratchRevealedExtra(prevRevealedExtra)}
+                              className={SHOW_MORE_CLASS}
+                            >
+                              {t('Collapse')}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          )}
+          {orderedProjects.length > 0 && (
+            <SidebarSectionLabel
+              section="projects"
+              actions={
+                <>
+                  <button
+                    type="button"
+                    onClick={() => setListSearchOpen(true)}
+                    className={cn(
+                      SECTION_ACTION_CLASS,
+                      (listSearchOpen || searching) && 'bg-foreground/5 text-foreground opacity-100'
+                    )}
+                    title={t('Search conversations...')}
+                    aria-label={t('Search conversations...')}
+                  >
+                    <TextSearch className="size-3.25" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAddOpen(true)}
+                    className={SECTION_ACTION_CLASS}
+                    title={t('Add project')}
+                    aria-label={t('Add project')}
+                  >
+                    <Plus className="size-3.25" />
+                  </button>
+                </>
+              }
+            >
+              {t('Projects')}
+            </SidebarSectionLabel>
+          )}
+          {pendingProject && (
+            <div className="flex h-8 w-full items-center gap-2 rounded-lg px-2 text-muted-foreground">
+              <span className="flex size-4 shrink-0 items-center justify-center">
+                <Loader2 className="size-4 animate-spin" />
+              </span>
+              <span
+                className="min-w-0 flex-1 truncate text-[0.9286rem] font-medium"
+                title={pendingProject.path}
+              >
+                {pendingProject.name}
+                {pendingProject.sshHost && (
+                  <span className="ml-1.5 rounded bg-muted px-1 py-0.5 text-[10px] font-normal">
+                    {pendingProject.sshHost}
+                  </span>
+                )}
+              </span>
+              <span className="shrink-0 text-xs">{t('Adding...')}</span>
+            </div>
+          )}
+          <SortableContext
+            items={[
+              ...(resolvedGroupId === ALL_GROUP_ID
+                ? groupSections.map((section) =>
+                    section.groupId === UNGROUPED_GROUP_ID
+                      ? UNGROUPED_GROUP_DROP_ID
+                      : projectGroupDragId(section.groupId)
+                  )
+                : []),
+              ...activeProjectIds.map((id) => projectDragId(id)),
+            ]}
+            strategy={verticalListSortingStrategy}
+          >
+            {(() => {
+              const projectNode = (project: Project) => {
+                const projectConversations = projectConversationIds(
+                  order,
+                  conversations,
+                  project.id
+                );
+                const projectHit = matchesQuery(listQuery, [
+                  project.alias ?? '',
+                  project.name,
+                  project.path,
+                ]);
+                const visibleConversations =
+                  !searching || projectHit
+                    ? projectConversations
+                    : projectConversations.filter(convMatches);
+                if (searching && visibleConversations.length === 0) return null;
+                const folded = searching ? false : collapsedProjects[project.id] === true;
+                const revealedExtra = revealedExtras[project.id] ?? 0;
+                const shownCount = searching
+                  ? visibleConversations.length
+                  : shownConversationCount(visibleConversations.length, revealedExtra);
+                const hiddenIds = visibleConversations.slice(shownCount);
+                // 项目右键菜单项;抽成数据是为了把动态分组列表与固定项平铺在一起
+                const projectPinned = pinnedProjectIds.includes(project.id);
+                const projectActions: ProjectAction[] = [
+                  {
+                    kind: 'item',
+                    key: 'pin',
+                    label: projectPinned ? t('Unpin project') : t('Pin project'),
+                    icon: projectPinned ? <PinOff /> : <Pin />,
+                    onSelect: () => togglePinProject(project.id),
+                  },
+                  {
+                    kind: 'item',
+                    key: 'settings',
+                    label: t('Project settings'),
+                    icon: <Settings />,
+                    onSelect: () => setProjectSettingsId(project.id),
+                  },
+                  ...(project.kind !== 'ssh'
+                    ? [
+                        {
+                          kind: 'item' as const,
+                          key: 'reveal',
+                          label: t(openDirectoryLabel(window.electronAPI.env.platform)),
+                          icon: <FolderOpen />,
+                          onSelect: () => openDirectoryFromMenu({ projectId: project.id }, t),
+                        },
+                      ]
+                    : []),
+                  {
+                    kind: 'item',
+                    key: 'import',
+                    label: t('Import session'),
+                    icon: <HardDriveDownload />,
+                    onSelect: () => setImportProject(project),
+                  },
+                  ...(project.kind !== 'scratch' && project.kind !== 'secretary'
+                    ? [
+                        {
+                          kind: 'item' as const,
+                          key: 'import-project-sessions',
+                          label: t('Import conversations from another project…'),
+                          icon: <FolderInput />,
+                          onSelect: () => setImportSessionsProject(project),
+                        },
+                      ]
+                    : []),
+                  { kind: 'separator', key: 'sep-group' },
+                  // 分组列表是动态的,收进二级菜单,否则分组一多主菜单就被撑长
+                  {
+                    kind: 'submenu',
+                    key: 'move-to-group',
+                    label: t('Move to group'),
+                    icon: <GroupGlyph />,
+                    items: [
+                      {
+                        kind: 'item',
+                        key: 'ungrouped',
+                        label: t('Ungrouped'),
+                        icon: <GroupGlyph />,
+                        onSelect: () => setProjectGroupId(project.id, null),
+                      },
+                      ...projectGroups.map<ProjectAction>((group) => ({
+                        kind: 'item',
+                        key: `group-${group.id}`,
+                        label: group.name,
+                        icon: <GroupGlyph emoji={group.emoji} color={group.color} />,
+                        onSelect: () => setProjectGroupId(project.id, group.id),
+                      })),
+                    ],
+                  },
+                  {
+                    kind: 'item',
+                    key: 'new-group',
+                    label: t('New group'),
+                    icon: <FolderPlus />,
+                    onSelect: () => setGroupEditor({ mode: 'create' }),
+                  },
+                  { kind: 'separator', key: 'sep-danger' },
+                  {
+                    kind: 'item',
+                    key: 'archive',
+                    label: t('Archive project'),
+                    icon: <Archive />,
+                    onSelect: () => toggleArchiveProject(project.id),
+                  },
+                  {
+                    kind: 'item',
+                    key: 'remove',
+                    label: t('Remove project'),
+                    icon: <Trash2 />,
+                    destructive: true,
+                    onSelect: () =>
+                      setPendingRemove({
+                        kind: 'project',
+                        project,
+                        conversationIds: projectConversations,
+                      }),
+                  },
+                ];
+                return (
+                  <SortableProject key={project.id} project={project} activitySorted={recentView}>
+                    {(drag) => (
+                      <ContextMenu>
+                        <ContextMenuTrigger
+                          render={
+                            (
+                              <div ref={drag.setNodeRef} style={drag.style}>
+                                {/* 项目行：折叠箭头 + 名称 + 悬停操作；整行可拖拽排序 */}
+                                <div
+                                  data-enso="project-row"
+                                  data-expanded={!folded || undefined}
+                                  className="group flex h-8 w-full items-center gap-1 rounded-lg px-2 transition-colors hover:bg-foreground/5"
+                                  {...drag.handleProps}
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleProject(project.id)}
+                                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                                    title={project.path}
+                                  >
+                                    <FoldChevron folded={folded} />
+                                    <span
+                                      className="min-w-0 flex-1 truncate text-[0.9286rem] font-medium text-foreground"
+                                      title={
+                                        project.kind === 'ssh'
+                                          ? `${project.sshHost}:${project.path}`
+                                          : project.path
+                                      }
+                                    >
+                                      {projectDisplayName(project)}
+                                      {project.kind === 'ssh' && (
+                                        <span className="ml-1.5 rounded bg-muted px-1 py-0.5 text-[10px] font-normal text-muted-foreground">
+                                          {project.sshConnectionName ?? project.sshHost}
+                                        </span>
+                                      )}
+                                      {recentView && (
+                                        <span className="ml-1.5 font-normal text-[0.7857rem] text-subtle-foreground">
+                                          {projectGroups.find(
+                                            (group) => group.id === project.groupId
+                                          )?.name ?? t('Ungrouped')}
+                                        </span>
+                                      )}
+                                    </span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => togglePinProject(project.id)}
+                                    className="hidden shrink-0 rounded-md p-1 text-muted-foreground group-hover:block hover:bg-muted hover:text-foreground"
+                                    title={projectPinned ? t('Unpin project') : t('Pin project')}
+                                  >
+                                    {projectPinned ? (
+                                      <PinOff className="h-3.5 w-3.5" />
+                                    ) : (
+                                      <Pin className="h-3.5 w-3.5" />
+                                    )}
+                                  </button>
+                                  {/* 操作悬停才显示，常驻会让每个项目都挂两枚图标;用 opacity 占位,名称截断不随悬停跳动 */}
+                                  <button
+                                    type="button"
+                                    onClick={() => void newConversation(project.id)}
+                                    className={PROJECT_ROW_ACTION_CLASS}
+                                    title={t('New conversation')}
+                                  >
+                                    <MessageSquarePlus className="h-3.5 w-3.5" />
+                                  </button>
+                                  <ProjectOverflowMenu actions={projectActions} />
+                                  {/*
+                                    置顶标记在最右侧保留占位，避免菜单遮罩使项目行失去悬停时挤动触发器，导致松开鼠标即关闭菜单。
+                                  */}
+                                  {(projectPinned || folded) && (
+                                    <span
+                                      className="flex shrink-0 items-center justify-center gap-1 py-1 text-[0.7857rem] text-subtle-foreground tabular-nums group-hover:opacity-0"
+                                      aria-hidden
+                                    >
+                                      {projectPinned && <Pin className="h-3.5 w-3.5" />}
+                                      {folded && projectConversations.length}
+                                    </span>
+                                  )}
+                                </div>
+                                <AnimatePresence initial={false}>
+                                  {!folded && (
+                                    <motion.div
+                                      initial="initial"
+                                      animate="animate"
+                                      exit="exit"
+                                      variants={heightVariants}
+                                      className="overflow-hidden"
+                                    >
+                                      <div className="flex flex-col">
+                                        {visibleConversations.slice(0, shownCount).map((id) => (
+                                          <motion.div
+                                            key={id}
+                                            layout={
+                                              dragPayload?.type === 'project' ? false : 'position'
+                                            }
+                                            transition={springStandard}
+                                          >
+                                            <DraggableChat id={id} conversation={conversations[id]}>
+                                              <ConversationRow
+                                                id={id}
+                                                conversation={conversations[id]}
+                                                active={activeId === id}
+                                                switchHint={switchHintFor(id, 'project')}
+                                                locale={locale}
+                                                nowTick={nowTick}
+                                                worktreeStatus={
+                                                  conversations[id].worktree
+                                                    ? worktreeStatuses[id]
+                                                    : undefined
+                                                }
+                                                isolated={Boolean(conversations[id].worktree)}
+                                                onSelect={selectConversation}
+                                                onTogglePin={togglePinConversation}
+                                                onToggleArchive={(conversationId) =>
+                                                  void handleToggleArchive(conversationId)
+                                                }
+                                                onCleanupWorktree={(conversationId) =>
+                                                  void handleCleanupWorktree(conversationId)
+                                                }
+                                                onMoveToWorktree={(conversationId) =>
+                                                  void handleMoveToWorktree(conversationId)
+                                                }
+                                                onRemove={(conversationId) =>
+                                                  void openRemoveConversation(conversationId)
+                                                }
+                                              />
+                                            </DraggableChat>
+                                          </motion.div>
+                                        ))}
+                                        {!searching &&
+                                          projectConversations.length > COLLAPSED_SESSION_LIMIT && (
+                                            <div className="flex items-center gap-1 pl-6">
+                                              {hiddenIds.length > 0 && (
+                                                <ContextMenu>
+                                                  <ContextMenuTrigger
+                                                    render={
+                                                      (
+                                                        <button
+                                                          type="button"
+                                                          onClick={() =>
+                                                            setRevealedExtras((prev) => ({
+                                                              ...prev,
+                                                              [project.id]: nextRevealedExtra(
+                                                                visibleConversations.length,
+                                                                prev[project.id] ?? 0
+                                                              ),
+                                                            }))
+                                                          }
+                                                          className={SHOW_MORE_CLASS}
+                                                        >
+                                                          {t('Show {{n}} more', {
+                                                            n: hiddenIds.length,
+                                                          })}
+                                                        </button>
+                                                      ) as React.ReactElement<
+                                                        Record<string, unknown>
+                                                      >
+                                                    }
+                                                  />
+                                                  <ContextMenuPopup className="min-w-36">
+                                                    <ContextMenuItem
+                                                      onClick={() =>
+                                                        void handleArchiveMany(hiddenIds)
+                                                      }
+                                                    >
+                                                      <Archive />
+                                                      {t('Archive {{n}} conversations', {
+                                                        n: hiddenIds.length,
+                                                      })}
+                                                    </ContextMenuItem>
+                                                  </ContextMenuPopup>
+                                                </ContextMenu>
+                                              )}
+                                              {revealedExtra > 0 && (
+                                                <button
+                                                  type="button"
+                                                  onClick={() =>
+                                                    setRevealedExtras((prev) => ({
+                                                      ...prev,
+                                                      [project.id]: prevRevealedExtra(
+                                                        prev[project.id] ?? 0
+                                                      ),
+                                                    }))
+                                                  }
+                                                  className={SHOW_MORE_CLASS}
+                                                >
+                                                  {t('Collapse')}
+                                                </button>
+                                              )}
+                                            </div>
+                                          )}
+                                        {visibleConversations.length === 0 && (
+                                          <p className="py-1.5 pl-8 text-xs text-subtle-foreground">
+                                            {t('No conversations yet')}
+                                          </p>
+                                        )}
+                                      </div>
+                                    </motion.div>
+                                  )}
+                                </AnimatePresence>
+                              </div>
+                            ) as React.ReactElement<Record<string, unknown>>
+                          }
+                        />
+                        <ContextMenuPopup className="min-w-40">
+                          {renderProjectActions(projectActions)}
+                        </ContextMenuPopup>
+                      </ContextMenu>
+                    )}
+                  </SortableProject>
+                );
+              };
+              if (recentView && !searching && activeProjects.length === 0) {
+                return (
+                  <p className="px-2 py-6 text-center text-xs text-muted-foreground">
+                    {t('No projects active in the last {{n}} days', {
+                      n: RECENT_PROJECT_WINDOW_DAYS,
+                    })}
+                  </p>
+                );
+              }
+              if (!searching && orderedProjects.length > 0 && activeProjects.length === 0) {
+                return (
+                  <p className="px-2 py-1.5 text-xs text-subtle-foreground">
+                    {t('No projects in this group yet')}
+                  </p>
+                );
+              }
+              if (resolvedGroupId === ALL_GROUP_ID && projectGroups.length > 0) {
+                return (
+                  <div>
+                    {pinnedProjects.length > 0 && (
+                      <div>
+                        <SidebarSectionLabel section="pinned-projects">
+                          {t('Pinned projects')}
+                        </SidebarSectionLabel>
+                        <div>{pinnedProjects.map(projectNode)}</div>
+                      </div>
+                    )}
+                    {groupSections.map((section) => {
+                      const foldedSection = searching
+                        ? false
+                        : collapsedGroupIds[section.groupId] === true;
+                      return (
+                        <div key={section.groupId}>
+                          <ProjectGroupHeader
+                            groupId={section.groupId}
+                            name={section.group?.name ?? t('Ungrouped')}
+                            emoji={section.group?.emoji}
+                            color={section.group?.color}
+                            count={section.projects.length}
+                            folded={foldedSection}
+                            sortable={section.groupId !== UNGROUPED_GROUP_ID}
+                            onToggle={() => toggleGroupSection(section.groupId)}
+                            onEdit={
+                              section.group
+                                ? () => setGroupEditor({ mode: 'edit', id: section.groupId })
+                                : undefined
+                            }
+                          />
+                          <AnimatePresence initial={false}>
+                            {!foldedSection && (
+                              <motion.div
+                                key={`content-${section.groupId}`}
+                                initial="initial"
+                                animate="animate"
+                                exit="exit"
+                                variants={heightVariants}
+                                className="overflow-hidden"
+                              >
+                                <div>{section.projects.map(projectNode)}</div>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              }
+              if (pinnedProjects.length > 0 && unpinnedProjects.length > 0) {
+                return (
+                  <div className="space-y-2">
+                    <div>
+                      <SidebarSectionLabel section="pinned-projects">
+                        {t('Pinned projects')}
+                      </SidebarSectionLabel>
+                      <div>{pinnedProjects.map(projectNode)}</div>
+                    </div>
+                    <div>{unpinnedProjects.map(projectNode)}</div>
+                  </div>
+                );
+              }
+              return activeProjects.map(projectNode);
+            })()}
+          </SortableContext>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-0.5 p-1.5">
+          {phoneEntry === 'devices' ? (
+            <>
+              <PhoneDeviceChip />
+              <div className="min-w-0 flex-1" />
+            </>
+          ) : phoneEntry === 'info' ? (
+            <>
+              <div className="min-w-0 flex-1" />
+              <PhoneLinkStatus />
+            </>
+          ) : (
+            <NodeSwitcher />
+          )}
+          <BackgroundTasksButton className={ICON_BUTTON_CLASS} />
+          <ArchiveEntryButton
+            count={archivedCount}
+            onClick={openArchive}
+            className={ICON_BUTTON_CLASS}
+          />
+          {compactButton && (
+            <button
+              type="button"
+              onClick={() => window.electronAPI.remote?.exitDesk?.()}
+              className={ICON_BUTTON_CLASS}
+              title={t('Compact view')}
+            >
+              <Smartphone className="h-4 w-4" />
+            </button>
+          )}
+          <button
+            type="button"
+            data-enso="settings-button"
+            onClick={() => window.electronAPI.window.openSettings()}
+            className={ICON_BUTTON_CLASS}
+            title={t('Settings')}
+            aria-label={t('Settings')}
+          >
+            <Settings className="h-4 w-4" />
+          </button>
+          {/* 桌面端搜索与折叠入口常驻窗口顶栏；移动端抽屉放在这里 */}
+          {mobile && (
+            <>
+              <button
+                type="button"
+                data-enso="search-button"
+                onClick={onOpenSearch}
+                className={ICON_BUTTON_CLASS}
+                title={
+                  searchShortcut
+                    ? `${t('Search anything')} (${searchShortcut})`
+                    : t('Search anything')
+                }
+              >
+                <Search className="h-4 w-4" />
+              </button>
+              <button
+                type="button"
+                data-enso="sidebar-toggle"
+                onClick={onToggleCollapse}
+                className={ICON_BUTTON_CLASS}
+                title={t('Collapse sidebar')}
+              >
+                <PanelLeftClose className="h-4 w-4" />
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      <Dialog open={archiveOpen} onOpenChange={setArchiveOpen}>
+        <DialogContent className="h-[min(40rem,85vh)] max-w-xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-baseline gap-2">
+              {t('Archived')}
+              <span className="font-sans text-sm text-muted-foreground tabular-nums">
+                {scopedArchivedCount}
+              </span>
+            </DialogTitle>
+            <p data-slot="archive-scope" className="text-xs text-muted-foreground">
+              {archiveScopeHint}
+            </p>
+            {(tabArchiveScope.kind !== 'all' || archiveSecretaries.length > 0) && (
+              <div className="flex flex-wrap gap-1.5">
+                {tabArchiveScope.kind !== 'all' && (
+                  <ArchiveScopeChip
+                    label={tabScopeLabel}
+                    selected={archiveScopeOverride === null}
+                    onClick={() => setArchiveScopeOverride(null)}
+                  />
+                )}
+                <ArchiveScopeChip
+                  label={t('All archived')}
+                  selected={archiveScope.kind === 'all'}
+                  onClick={() =>
+                    setArchiveScopeOverride(tabArchiveScope.kind === 'all' ? null : { kind: 'all' })
+                  }
+                />
+                {archiveSecretaries.map((secretaryId) => (
+                  <ArchiveScopeChip
+                    key={secretaryId}
+                    label={t('Dispatched by {{name}}', { name: secretaryName(secretaryId) })}
+                    selected={
+                      archiveScope.kind === 'secretary' && archiveScope.secretaryId === secretaryId
+                    }
+                    onClick={() => setArchiveScopeOverride({ kind: 'secretary', secretaryId })}
+                  />
+                ))}
+              </div>
+            )}
+            <div className="mt-1 flex items-center gap-2">
+              <InputGroup data-size="sm">
+                <InputGroupAddon>
+                  <Search />
+                </InputGroupAddon>
+                <InputGroupInput
+                  value={archiveQuery}
+                  placeholder={t('Search conversations...')}
+                  onChange={(event) => setArchiveQuery(event.target.value)}
+                />
+              </InputGroup>
+              <ArchiveCleanupMenu
+                open={archiveCleanupOpen === '*'}
+                onOpenChange={(open) => setArchiveCleanupOpen(open ? '*' : null)}
+                idsForDays={(days) =>
+                  staleArchivedConversationIds(order, conversations, days, Date.now())
+                }
+                onPick={(days, ids) =>
+                  setPendingRemove({ kind: 'archived', days, conversationIds: ids })
+                }
+                className="h-8 w-8 rounded-md opacity-100 hover:bg-muted"
+              />
+            </div>
+          </DialogHeader>
+          <DialogPanel className="flex flex-col gap-y-3 border-t pt-3!">
+            {slicedArchivedGroups.length === 0 && (
+              <p className="py-10 text-center text-sm text-muted-foreground">
+                {archiveQuery.trim() ? t('No matching conversations') : t('No conversations')}
+              </p>
+            )}
+            {slicedArchivedGroups.map((group) => {
+              const archivedProject = projects.find((project) => project.id === group.projectId);
+              const projectName = archivedProject
+                ? projectDisplayName(archivedProject)
+                : t('Other');
+              return (
+                <div key={group.projectId}>
+                  <div className="group flex items-center gap-2 rounded-md pr-0.5 pl-2">
+                    {group.projectArchived && (
+                      <FolderGit2 className="size-4 shrink-0 text-muted-foreground" />
+                    )}
+                    <span className="min-w-0 flex-1 truncate py-1 text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
+                      {projectName}
+                    </span>
+                    <span className="shrink-0 text-[10px] text-muted-foreground tabular-nums">
+                      {group.ids.length}
+                    </span>
+                    {group.projectArchived ? (
+                      <button
+                        type="button"
+                        onClick={() => toggleArchiveProject(group.projectId)}
+                        className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                        title={t('Unarchive project')}
+                      >
+                        <ArchiveRestore className="h-3.5 w-3.5" />
+                      </button>
+                    ) : (
+                      <ArchiveCleanupMenu
+                        open={archiveCleanupOpen === group.projectId}
+                        onOpenChange={(open) =>
+                          setArchiveCleanupOpen(open ? group.projectId : null)
+                        }
+                        idsForDays={(days) =>
+                          staleArchivedConversationIds(
+                            order,
+                            conversations,
+                            days,
+                            Date.now(),
+                            group.projectId
+                          )
+                        }
+                        onPick={(days, ids) =>
+                          setPendingRemove({
+                            kind: 'archived',
+                            days,
+                            conversationIds: ids,
+                            projectName,
+                          })
+                        }
+                      />
+                    )}
+                  </div>
+                  <div className="flex flex-col">
+                    {group.ids.map((id) => (
+                      <motion.div key={id} layout="position" transition={springStandard}>
+                        <ConversationRow
+                          id={id}
+                          conversation={conversations[id]}
+                          active={activeId === id}
+                          locale={locale}
+                          nowTick={nowTick}
+                          worktreeStatus={
+                            conversations[id].worktree ? worktreeStatuses[id] : undefined
+                          }
+                          isolated={Boolean(conversations[id].worktree)}
+                          menuZIndex={Z_INDEX.DROPDOWN_IN_MODAL}
+                          onSelect={(conversationId) => {
+                            selectConversation(conversationId);
+                            setArchiveOpen(false);
+                          }}
+                          onTogglePin={togglePinConversation}
+                          onToggleArchive={(conversationId) =>
+                            void handleToggleArchive(conversationId)
+                          }
+                          onCleanupWorktree={(conversationId) =>
+                            void handleCleanupWorktree(conversationId)
+                          }
+                          onMoveToWorktree={(conversationId) =>
+                            void handleMoveToWorktree(conversationId)
+                          }
+                          onRemove={(conversationId) => void openRemoveConversation(conversationId)}
+                        />
+                      </motion.div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </DialogPanel>
+        </DialogContent>
+      </Dialog>
+      <AddProjectDialog
+        open={addOpen}
+        onOpenChange={setAddOpen}
+        onAdd={handleAddProject}
+        groups={projectGroups}
+        defaultGroupId={defaultGroupId}
+      />
+      <GroupEditorDialog
+        open={groupEditor !== null}
+        group={
+          groupEditor?.mode === 'edit'
+            ? (projectGroups.find((group) => group.id === groupEditor.id) ?? null)
+            : null
+        }
+        projects={orderedProjects.filter((project) => !archivedProjectIds.includes(project.id))}
+        onOpenChange={(open) => {
+          if (!open) setGroupEditor(null);
+        }}
+        onSave={(input) => {
+          if (groupEditor?.mode === 'edit') {
+            updateProjectGroup(groupEditor.id, input);
+            return;
+          }
+          const group = createProjectGroup(input);
+          for (const projectId of input.projectIds ?? []) {
+            setProjectGroupId(projectId, group.id);
+          }
+        }}
+        onDelete={
+          groupEditor?.mode === 'edit'
+            ? () => {
+                const id = groupEditor.id;
+                removeProjectGroup(id);
+                if (selectedGroupId === id) selectGroup(ALL_GROUP_ID);
+              }
+            : undefined
+        }
+      />
+      <ProjectSettingsDialog
+        open={projectSettingsId !== null}
+        project={projects.find((project) => project.id === projectSettingsId) ?? null}
+        onOpenChange={(open) => {
+          if (!open) setProjectSettingsId(null);
+        }}
+      />
+      <ImportSessionDialog project={importProject} onClose={() => setImportProject(null)} />
+      <ImportProjectSessionsDialog
+        project={importSessionsProject}
+        onClose={() => setImportSessionsProject(null)}
+      />
+      <ConfirmDialog
+        open={pendingWorktreeAction !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingWorktreeAction(null);
+        }}
+        title={
+          pendingWorktreeAction?.kind === 'archive'
+            ? t('Archive session and clean up worktree?')
+            : t('Clean up worktree?')
+        }
+        description={t(
+          'Pending work: {{warning}}. This session returns to the main working tree. The worktree directory and uncommitted changes are removed only when no other sessions use it. The branch is kept.',
+          { warning: worktreeWarningText(pendingWorktreeAction?.status) }
+        )}
+        confirmLabel={pendingWorktreeAction?.kind === 'archive' ? t('Archive') : t('Clean up')}
+        onConfirm={() => {
+          if (!pendingWorktreeAction) return;
+          void runCleanup(pendingWorktreeAction.id, pendingWorktreeAction.kind === 'archive');
+        }}
+      />
+      <ConfirmDialog
+        open={pendingDirtyMove !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDirtyMove(null);
+        }}
+        title={t('Main working tree has uncommitted changes')}
+        description={t(
+          'The new worktree branches off HEAD, so those changes stay in the main working tree and will not follow this session.'
+        )}
+        confirmLabel={t('Move anyway')}
+        onConfirm={() => {
+          if (!pendingDirtyMove) return;
+          const id = pendingDirtyMove;
+          setPendingDirtyMove(null);
+          void handleMoveToWorktree(id, true);
+        }}
+      />
+      <ConfirmDialog
+        open={pendingRemove !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingRemove(null);
+        }}
+        title={
+          pendingRemove?.kind === 'project'
+            ? t('Remove project?')
+            : pendingRemove?.kind === 'archived'
+              ? t('Delete archived conversations?')
+              : t('Delete conversation?')
+        }
+        description={
+          pendingRemove?.kind === 'project'
+            ? t('"{{name}}" and its {{count}} conversations will be removed from the list.', {
+                name: projectDisplayName(pendingRemove.project),
+                count: pendingRemove.conversationIds.length,
+              })
+            : pendingRemove?.kind === 'archived'
+              ? pendingRemove.days === 0
+                ? pendingRemove.projectName
+                  ? t(
+                      'All {{count}} archived conversations in "{{name}}" will be removed from the list.',
+                      {
+                        count: pendingRemove.conversationIds.length,
+                        name: pendingRemove.projectName,
+                      }
+                    )
+                  : t('All {{count}} archived conversations will be removed from the list.', {
+                      count: pendingRemove.conversationIds.length,
+                    })
+                : pendingRemove.projectName
+                  ? t(
+                      '{{count}} conversations in "{{name}}" archived more than {{days}} days ago will be removed from the list.',
+                      {
+                        count: pendingRemove.conversationIds.length,
+                        days: pendingRemove.days,
+                        name: pendingRemove.projectName,
+                      }
+                    )
+                  : t(
+                      '{{count}} conversations archived more than {{days}} days ago will be removed from the list.',
+                      { count: pendingRemove.conversationIds.length, days: pendingRemove.days }
+                    )
+              : pendingRemove?.kind === 'conversation' && pendingRemove.worktreeWarning
+                ? t(
+                    'Pending work: {{warning}}. This conversation will be removed. Its worktree directory and uncommitted changes are removed only when no other sessions use it. The branch is kept.',
+                    {
+                      warning: pendingRemove.worktreeWarning,
+                    }
+                  )
+                : t('This conversation will be removed from the list.')
+        }
+        confirmLabel={t('Remove')}
+        onConfirm={() => {
+          if (!pendingRemove) return;
+          if (pendingRemove.kind === 'project') {
+            for (const id of pendingRemove.conversationIds) removeConversation(id);
+            void removeProject(pendingRemove.project.id);
+          } else if (pendingRemove.kind === 'archived') {
+            for (const id of pendingRemove.conversationIds) removeConversation(id);
+          } else {
+            removeConversation(pendingRemove.id);
+          }
+        }}
+      />
+
+      {/* 拖拽预览:侧栏 overflow-hidden 会裁切,portal 到 body */}
+      {createPortal(
+        <DragOverlay dropAnimation={null}>
+          {/* 只认侧栏自己的 payload:同一 DndContext 里其它区域(如右侧面板 tab)的拖拽不在这里预览 */}
+          {dragPayload?.type === 'project' ? (
+            <ProjectDragPreview
+              projectId={dragPayload.projectId}
+              name={projectDragPreviewName(projects, dragPayload.projectId, dragPayload.name)}
+              folded={collapsedProjects[dragPayload.projectId] === true}
+              revealedExtra={revealedExtras[dragPayload.projectId] ?? 0}
+              width={width}
+            />
+          ) : (
+            (dragPayload?.type === 'chat' || dragPayload?.type === 'workspace-file') && (
+              <div className="flex w-56 items-center gap-2 rounded-lg border bg-background/95 px-3 py-1.5 text-sm shadow-float">
+                {dragPayload.type === 'workspace-file' ? (
+                  <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
+                ) : (
+                  <Pin className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                )}
+                <span className="min-w-0 flex-1 truncate">
+                  {dragPayload.type === 'workspace-file'
+                    ? dragPayload.name
+                    : dragPayload.title.split('\n')[0].trim() || t('New conversation')}
+                </span>
+              </div>
+            )
+          )}
+        </DragOverlay>,
+        document.body
+      )}
+      <SecretaryResetDialog
+        open={secretaryResetId !== null}
+        secretaryId={secretaryResetId ?? undefined}
+        onOpenChange={(open) => {
+          if (!open) setSecretaryResetId(null);
+        }}
+      />
+    </motion.aside>
+  );
+}
+
+/** 项目块的 sortable 包装:render prop 把 ref/transform/监听器交给现有 JSX,不重排结构 */
+function ProjectGroupHeader({
+  groupId,
+  name,
+  emoji,
+  color,
+  count,
+  folded,
+  sortable,
+  onToggle,
+  onEdit,
+}: {
+  groupId: string;
+  name: string;
+  emoji?: string;
+  color?: string;
+  count: number;
+  folded: boolean;
+  sortable: boolean;
+  onToggle: () => void;
+  onEdit?: () => void;
+}) {
+  const dropId =
+    groupId === UNGROUPED_GROUP_ID ? UNGROUPED_GROUP_DROP_ID : projectGroupDragId(groupId);
+  const droppable = useDroppable({ id: dropId });
+  const sortableDrag = useSortable({
+    id: dropId,
+    data: { type: 'project-group', groupId } satisfies DragPayload,
+    disabled: !sortable,
+  });
+  const setRefs = (node: HTMLElement | null) => {
+    droppable.setNodeRef(node);
+    sortableDrag.setNodeRef(node);
+  };
+  return (
+    <div
+      ref={setRefs}
+      data-enso="section-header"
+      data-section="group"
+      style={{
+        transform: CSS.Transform.toString(sortableDrag.transform),
+        transition: sortableDrag.transition,
+        opacity: sortableDrag.isDragging ? 0.4 : undefined,
+      }}
+      className={cn(
+        'group relative flex w-full select-none items-center rounded-md pt-3.5 pr-2.5 pb-1 pl-2 text-[0.8214rem] font-medium text-subtle-foreground transition-colors hover:text-foreground',
+        droppable.isOver && 'bg-foreground/5 text-foreground',
+        sortable && 'cursor-grab'
+      )}
+      {...(sortable ? sortableDrag.listeners : {})}
+      {...(sortable ? sortableDrag.attributes : {})}
+    >
+      <button
+        type="button"
+        onClick={onToggle}
+        onPointerDown={(event) => event.stopPropagation()}
+        className="flex min-w-0 flex-1 items-center gap-1.5"
+      >
+        {/* 分组是小节标签而非树节点:不占左侧图标列;箭头跟在名字后,展开态悬停才出现,折叠态常驻提示 */}
+        <span className="min-w-0 truncate text-left">{name}</span>
+        {emoji && <span className="shrink-0 text-sm leading-none">{emoji}</span>}
+        {color && (
+          <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: color }} />
+        )}
+        <ChevronRight
+          data-enso="tree-chevron"
+          data-expanded={!folded || undefined}
+          className={cn(
+            'size-3 shrink-0 transition-[opacity,transform] duration-150',
+            !folded && 'rotate-90 opacity-0 group-hover:opacity-100'
+          )}
+        />
+        <span
+          className={cn(
+            'ml-auto shrink-0 font-normal text-[0.7857rem] tabular-nums',
+            onEdit && 'transition-opacity group-hover:opacity-0'
+          )}
+        >
+          {count}
+        </span>
+      </button>
+      {/* 编辑按钮桌面绝对定位盖在计数上,不占流:否则未分组(无 onEdit)的计数会比其他分组右移;触屏无悬停,改为排在计数右侧 */}
+      {onEdit && (
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onEdit();
+          }}
+          onPointerDown={(event) => event.stopPropagation()}
+          className={GROUP_EDIT_BUTTON_CLASS}
+        >
+          <Pencil className="size-3.25" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function projectDragPreviewName(projects: Project[], projectId: string, fallback: string): string {
+  const project = projects.find((entry) => entry.id === projectId);
+  return project ? projectDisplayName(project) : fallback;
+}
+
+function ProjectDragPreview({
+  projectId,
+  name,
+  folded,
+  revealedExtra,
+  width,
+}: {
+  projectId: string;
+  name: string;
+  folded: boolean;
+  revealedExtra: number;
+  width?: number;
+}) {
+  const { t } = useI18n();
+  const conversations = useSessionsStore((state) =>
+    selectSidebarConversations(state.conversations)
+  );
+  const order = useSessionsStore((state) => state.order);
+  const sessionIds = projectConversationIds(order, conversations, projectId);
+  const shownIds = folded
+    ? []
+    : sessionIds.slice(0, shownConversationCount(sessionIds.length, revealedExtra));
+  const hiddenCount = Math.max(0, sessionIds.length - shownIds.length);
+  return (
+    <div
+      className="pointer-events-none rounded-lg border bg-background/95 py-0.5 shadow-float"
+      style={{ width: width ?? 224 }}
+    >
+      <div className="flex h-8 items-center gap-2 px-2 text-[0.9286rem] font-medium">
+        <FoldChevron folded={folded} />
+        <span className="min-w-0 flex-1 truncate">{name}</span>
+      </div>
+      {!folded && (
+        <div className="flex flex-col">
+          {shownIds.map((id) => {
+            const conversation = conversations[id];
+            if (!conversation) return null;
+            return (
+              <div
+                key={id}
+                className="flex h-8 items-center gap-2 px-2 text-[0.9286rem] text-foreground/88"
+              >
+                <ConversationDot conversation={conversation} />
+                <span className="min-w-0 truncate">
+                  {conversation.title || t('New conversation')}
+                </span>
+              </div>
+            );
+          })}
+          {sessionIds.length > COLLAPSED_SESSION_LIMIT && (
+            <div className="flex items-center gap-1">
+              {hiddenCount > 0 && (
+                <div className="flex-1 rounded-lg py-1 text-center text-xs text-muted-foreground">
+                  {t('Show {{n}} more', { n: hiddenCount })}
+                </div>
+              )}
+              {revealedExtra > 0 && (
+                <div className="flex-1 rounded-lg py-1 text-center text-xs text-muted-foreground">
+                  {t('Collapse')}
+                </div>
+              )}
+            </div>
+          )}
+          {sessionIds.length === 0 && (
+            <p className="py-1.5 pl-8 text-xs text-muted-foreground">{t('No conversations yet')}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SortableProject({
+  project,
+  activitySorted = false,
+  children,
+}: {
+  project: Project;
+  activitySorted?: boolean;
+  children: (drag: {
+    setNodeRef: (node: HTMLElement | null) => void;
+    style: React.CSSProperties;
+    handleProps: Record<string, unknown>;
+  }) => React.ReactNode;
+}) {
+  const { setNodeRef, transform, transition, listeners, isDragging } = useSortable({
+    id: projectDragId(project.id),
+    disabled: { droppable: activitySorted },
+    data: {
+      type: 'project',
+      projectId: project.id,
+      path: project.path,
+      name: project.name,
+    } satisfies DragPayload,
+  });
+  return children({
+    setNodeRef,
+    style: {
+      transform: activitySorted ? undefined : CSS.Transform.toString(transform),
+      transition,
+      opacity: isDragging ? 0.4 : undefined,
+    },
+    handleProps: listeners ?? {},
+  });
+}
+
+function ArchiveCleanupMenu({
+  open,
+  onOpenChange,
+  idsForDays,
+  onPick,
+  className,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  idsForDays: (days: number) => string[];
+  onPick: (days: number, ids: string[]) => void;
+  className?: string;
+}) {
+  const { t } = useI18n();
+  return (
+    <Menu open={open} onOpenChange={onOpenChange}>
+      <MenuTrigger
+        className={cn(
+          'flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 hover:text-destructive',
+          open && 'opacity-100',
+          className
+        )}
+        title={t('Clean up archived')}
+        aria-label={t('Clean up archived')}
+      >
+        <Eraser className="h-3.5 w-3.5" />
+      </MenuTrigger>
+      <MenuPopup align="end" className="min-w-40" zIndex={Z_INDEX.DROPDOWN_IN_MODAL}>
+        {ARCHIVE_PURGE_DAYS.map((days) => {
+          const ids = idsForDays(days);
+          return (
+            <MenuItem
+              key={days}
+              variant="destructive"
+              disabled={ids.length === 0}
+              onClick={() => onPick(days, ids)}
+            >
+              {t('Older than {{days}} days', { days })}
+            </MenuItem>
+          );
+        })}
+        {(() => {
+          const ids = idsForDays(0);
+          return (
+            <MenuItem
+              variant="destructive"
+              disabled={ids.length === 0}
+              onClick={() => onPick(0, ids)}
+            >
+              {t('Delete all archived')}
+            </MenuItem>
+          );
+        })()}
+      </MenuPopup>
+    </Menu>
+  );
+}
+
+/** 置顶栏行:组内 sortable 拖拽重排,同时仍可拖入 Composer;独立 id 避免与项目组重复 */
+function SortablePinnedChat({
+  id,
+  conversation,
+  children,
+}: {
+  id: string;
+  conversation: { title: string; sessionFile?: string; pinned?: boolean };
+  children: React.ReactNode;
+}) {
+  const { setNodeRef, transform, transition, listeners, isDragging } = useSortable({
+    id: pinnedChatDragId(id),
+    data: {
+      type: 'chat',
+      conversationId: id,
+      title: conversation.title,
+      sessionFile: conversation.sessionFile,
+      pinned: conversation.pinned === true,
+    } satisfies DragPayload,
+  });
+  return (
+    <div
+      ref={setNodeRef}
+      {...listeners}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+        opacity: isDragging ? 0.4 : undefined,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+/** 会话行的拖拽源:拖入 Composer 成 mention / 拖到 Pinned 区置顶;原行拖动中降透明度 */
+function DraggableChat({
+  id,
+  conversation,
+  children,
+  dragId,
+}: {
+  id: string;
+  conversation: { title: string; sessionFile?: string; pinned?: boolean };
+  children: React.ReactNode;
+  dragId?: string;
+}) {
+  const { setNodeRef, listeners, isDragging } = useDraggable({
+    id: dragId ?? chatDragId(id),
+    data: {
+      type: 'chat',
+      conversationId: id,
+      title: conversation.title,
+      sessionFile: conversation.sessionFile,
+      pinned: conversation.pinned === true,
+    } satisfies DragPayload,
+  });
+  return (
+    <div ref={setNodeRef} {...listeners} style={{ opacity: isDragging ? 0.4 : undefined }}>
+      {children}
+    </div>
+  );
+}
+
+/** Pinned 栏目落点:拖会话悬停时高亮 */
+function PinnedDropZone({
+  children,
+  ...rest
+}: {
+  children: React.ReactNode;
+} & Record<string, unknown>) {
+  const { setNodeRef, isOver, active } = useDroppable({ id: PINNED_DROP_ID });
+  const draggingChat = (active?.data.current as DragPayload | undefined)?.type === 'chat';
+  return (
+    <div
+      ref={setNodeRef}
+      className={cn('rounded-lg', isOver && draggingChat && 'bg-brand/8 ring-1 ring-brand/40')}
+      {...rest}
+    >
+      {children}
+    </div>
+  );
+}
+
+interface ConversationRowProps {
+  id: string;
+  conversation: {
+    title: string;
+    status: string;
+    spawning: boolean;
+    hasRunningChild?: boolean;
+    pinned?: boolean;
+    archived?: boolean;
+    createdAt: number;
+    lastActiveAt?: number;
+    projectId: string;
+    messages: { timestamp?: number }[];
+    forkedFromConversationId?: string;
+    unread?: boolean;
+    pendingAsks?: readonly { requestId: string }[];
+    pendingApprovals?: readonly unknown[];
+    /** 标题总结在飞（标题后转圈） */
+    titleSummaryPending?: boolean;
+    /** 标题总结全部候选失败（标题后红叹号，点击重试） */
+    titleSummaryError?: string;
+    /** 手动重读在途（菜单项禁用 + 图标转圈） */
+    reloading?: boolean;
+    /** 由秘书派出；只用于显示标记，权限判断不读它 */
+    secretaryOrigin?: { secretaryConversationId: string; secretaryId?: string };
+  };
+  active: boolean;
+  locale: Parameters<typeof formatRelativeTime>[1];
+  nowTick: number;
+  /** 顶部 Pinned 栏目里用项目名做 hover 提示 */
+  hoverTitle?: string;
+  /** 已归档栏目里内联展示的项目名 */
+  subtitle?: string;
+  /** 秘书会话派出、仍在跑的件数 */
+  dispatchRunning?: number;
+  /** 隔离会话（有 worktree 绑定） */
+  isolated?: boolean;
+  /** 隔离会话的 worktree 状态（徽标：未提交/未合并） */
+  worktreeStatus?: WorktreeStatus;
+  switchHint?: string;
+  /** 右键菜单层级；弹窗内的行需要压过弹窗 */
+  menuZIndex?: number;
+  onSelect: (id: string) => void;
+  onTogglePin: (id: string) => void;
+  onToggleArchive: (id: string) => void;
+  onCleanupWorktree?: (id: string) => void;
+  onMoveToWorktree?: (id: string) => void;
+  onRemove: (id: string) => void;
+}
+
+/**
+ * 侧栏会话行：Pinned/项目/Archived 三处共用。
+ * 常规行 hover 只露置顶/归档，删除只在右键菜单里；
+ * 归档行是删除前的暂存区，hover 露还原 + 删除。
+ */
+function ConversationRow({
+  id,
+  conversation,
+  active,
+  locale,
+  nowTick,
+  hoverTitle,
+  subtitle,
+  dispatchRunning,
+  isolated,
+  worktreeStatus,
+  switchHint,
+  menuZIndex,
+  onSelect,
+  onTogglePin,
+  onToggleArchive,
+  onCleanupWorktree,
+  onMoveToWorktree,
+  onRemove,
+}: ConversationRowProps) {
+  const { t } = useI18n();
+  const projects = useSettingsStore((state) => state.projects);
+  const movable = canMoveConversationFrom(projects, conversation.projectId);
+  const moveTargets = moveConversationTargets(projects, conversation.projectId);
+  const localProject = useSettingsStore((state) =>
+    state.projects.some(
+      (project) =>
+        project.id === conversation.projectId &&
+        project.kind !== 'ssh' &&
+        project.kind !== 'secretary'
+    )
+  );
+  const scratchProject = useSettingsStore((state) =>
+    state.projects.some(
+      (project) => project.id === conversation.projectId && project.kind === 'scratch'
+    )
+  );
+  const [renaming, setRenaming] = useState(false);
+  const takenOver = useTakeover(id) !== undefined;
+  const worktree = useSessionsStore((state) => state.conversations[id]?.worktree);
+  const workspaceBusy = useSessionsStore((state) =>
+    Boolean(state.conversations[id]?.workspaceMigrating)
+  );
+  const worktreeMissing = useSessionsStore((state) => state.conversations[id]?.worktreeMissing);
+  const [worktreeBusy, setWorktreeBusy] = useState(false);
+  const [renameEntity, setRenameEntity] = useState<{
+    conversationId: string;
+    worktree: SessionWorktree;
+  } | null>(null);
+  const worktreeDisabled =
+    worktreeBusy ||
+    workspaceBusy ||
+    conversation.spawning ||
+    conversation.status === 'running' ||
+    conversation.reloading === true;
+  const newInWorktree = async () => {
+    if (worktreeDisabled) return;
+    setWorktreeBusy(true);
+    try {
+      const created = await useSessionsStore
+        .getState()
+        .newConversation(conversation.projectId, { worktreeFromConversationId: id });
+      if (!created) addToast({ type: 'error', title: t('Failed to create conversation') });
+    } catch (error) {
+      addToast({
+        type: 'error',
+        title: t('Failed to create conversation'),
+        description: String(error),
+      });
+    } finally {
+      setWorktreeBusy(false);
+    }
+  };
+  const pinned = conversation.pinned === true;
+  const archived = conversation.archived === true;
+  const muted = useSessionsStore((state) => state.conversations[id]?.muted === true);
+  const PinIcon = pinned ? PinOff : Pin;
+  const MuteIcon = muted ? Bell : BellOff;
+  const displayTitle = conversation.title || t('New conversation');
+  const sourceTitle = conversation.forkedFromConversationId
+    ? useSessionsStore.getState().conversations[conversation.forkedFromConversationId]?.title
+    : undefined;
+  const row = (
+    <div
+      data-slot="conversation-row"
+      data-pinned={pinned ? 'true' : 'false'}
+      data-enso="session-row"
+      data-active={active || undefined}
+      data-status={conversationThemeState(conversation)}
+      data-unread={conversation.unread || undefined}
+      data-muted={muted || undefined}
+      className={cn(
+        'group flex h-8 cursor-pointer items-center gap-2 rounded-lg px-2 text-[0.9286rem] transition-colors',
+        active
+          ? 'bg-foreground/[0.075] text-foreground dark:bg-foreground/10'
+          : 'text-foreground/88 hover:bg-foreground/5 hover:text-foreground'
+      )}
+      onClick={() => {
+        if (!renaming) onSelect(id);
+      }}
+      onDoubleClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setRenaming(true);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' && !renaming) onSelect(id);
+      }}
+      role="button"
+      tabIndex={0}
+      title={hoverTitle}
+    >
+      <ConversationDot conversation={conversation} />
+      <div className="flex min-w-0 flex-1 items-center gap-2">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          {sourceTitle && (
+            <span className="max-w-1/3 truncate text-[0.7857rem] text-subtle-foreground">
+              {t('Branched from {{title}}', { title: sourceTitle })}
+            </span>
+          )}
+          {renaming ? (
+            <ConversationTitleEdit
+              title={displayTitle}
+              onCommit={(title) => {
+                useSessionsStore.getState().renameConversation(id, title);
+                setRenaming(false);
+              }}
+              onCancel={() => setRenaming(false)}
+            />
+          ) : (
+            <span className="min-w-0 flex-1 truncate">
+              {displayTitle}
+              {subtitle && (
+                <span className="ml-1.5 text-[0.7857rem] text-subtle-foreground">{subtitle}</span>
+              )}
+            </span>
+          )}
+          {showsMutedBell(muted, conversation.secretaryOrigin !== undefined) && !renaming && (
+            <BellOff
+              className="h-3 w-3 shrink-0 text-subtle-foreground"
+              aria-label={t('Muted')}
+              data-enso="session-muted"
+            />
+          )}
+        </div>
+        {conversation.secretaryOrigin && (
+          <SecretaryOriginBadge
+            secretaryId={conversation.secretaryOrigin.secretaryId}
+            conversationId={id}
+            muted={muted}
+          />
+        )}
+        {!conversation.secretaryOrigin && takenOver && (
+          <SecretaryTakeoverBadge conversationId={id} />
+        )}
+        {isolated && worktree && <WorktreeBadge worktree={worktree} status={worktreeStatus} />}
+        <SessionTabCounts conversationId={id} />
+        <BackgroundTaskMarker conversationId={id} />
+        <SecretaryDispatchBadge count={dispatchRunning} />
+        {!renaming && (
+          <TitleSummaryBadge
+            pending={conversation.titleSummaryPending}
+            error={conversation.titleSummaryError}
+            onRetry={() => useSessionsStore.getState().retryTitleSummary(id)}
+          />
+        )}
+        {!renaming &&
+          (switchHint ? (
+            <span className="shrink-0 text-[0.7857rem] text-subtle-foreground tabular-nums">
+              {switchHint}
+            </span>
+          ) : (
+            <>
+              {pinned && !archived && (
+                <Pin
+                  className="h-3 w-3 shrink-0 text-subtle-foreground group-hover:hidden"
+                  aria-hidden
+                />
+              )}
+              <span className="shrink-0 text-[0.7857rem] text-subtle-foreground tabular-nums group-hover:hidden">
+                {formatRelativeTime(
+                  conversation.lastActiveAt ?? conversation.createdAt,
+                  locale,
+                  nowTick
+                )}
+              </span>
+              {!archived && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onTogglePin(id);
+                  }}
+                  className="hidden shrink-0 rounded p-0.5 text-muted-foreground group-hover:block hover:text-foreground"
+                  title={pinned ? t('Unpin') : t('Pin')}
+                >
+                  <PinIcon className="h-3.5 w-3.5" />
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onToggleArchive(id);
+                }}
+                className="hidden shrink-0 rounded p-0.5 text-muted-foreground group-hover:block hover:text-foreground"
+                title={archived ? t('Unarchive') : t('Archive')}
+              >
+                {archived ? (
+                  <ArchiveRestore className="h-3.5 w-3.5" />
+                ) : (
+                  <Archive className="h-3.5 w-3.5" />
+                )}
+              </button>
+              {archived && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRemove(id);
+                  }}
+                  className="hidden shrink-0 rounded p-0.5 text-muted-foreground group-hover:block hover:text-destructive"
+                  title={t('Delete')}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </>
+          ))}
+      </div>
+    </div>
+  );
+  return (
+    <>
+      <ContextMenu>
+        <ContextMenuTrigger render={row as React.ReactElement<Record<string, unknown>>} />
+        <ContextMenuPopup className="min-w-36" zIndex={menuZIndex}>
+          <ContextMenuItem onClick={() => setRenaming(true)}>
+            <Pencil />
+            {t('Rename')}
+          </ContextMenuItem>
+          <ContextMenuItem
+            disabled={conversation.reloading === true || conversation.spawning}
+            onClick={() => void reloadConversationFromMenu(id, t)}
+          >
+            <RefreshCw className={conversation.reloading ? 'animate-spin' : undefined} />
+            {t('Reload conversation')}
+          </ContextMenuItem>
+          <ContextMenuItem
+            disabled={worktreeDisabled}
+            onClick={() => void restartConversationFromMenu(id, t)}
+          >
+            <RotateCcw />
+            {t('Restart conversation (reload settings)')}
+          </ContextMenuItem>
+          {localProject && (
+            <ContextMenuItem
+              disabled={workspaceBusy || worktreeMissing || worktreeStatus?.exists === false}
+              onClick={() =>
+                void openDirectoryFromMenu(
+                  { projectId: conversation.projectId, conversationId: id },
+                  t
+                )
+              }
+            >
+              <FolderOpen />
+              {t(openDirectoryLabel(window.electronAPI.env.platform))}
+            </ContextMenuItem>
+          )}
+          {!archived && (
+            <ContextMenuItem onClick={() => onTogglePin(id)}>
+              <PinIcon />
+              {pinned ? t('Unpin') : t('Pin')}
+            </ContextMenuItem>
+          )}
+          <ContextMenuItem onClick={() => onToggleArchive(id)}>
+            {archived ? <ArchiveRestore /> : <Archive />}
+            {archived ? t('Unarchive') : t('Archive')}
+          </ContextMenuItem>
+          <ContextMenuItem
+            data-enso="session-mute"
+            onClick={() => useSessionsStore.getState().toggleMuteConversation(id)}
+          >
+            <MuteIcon />
+            {muted ? t('Unmute') : t('Mute')}
+          </ContextMenuItem>
+          {worktree && (
+            <>
+              <ContextMenuItem
+                disabled={worktreeDisabled || worktreeMissing || worktreeStatus?.exists === false}
+                onClick={() => void newInWorktree()}
+              >
+                {worktreeBusy ? <Loader2 className="animate-spin" /> : <MessageSquarePlus />}
+                {t('New conversation in this worktree')}
+              </ContextMenuItem>
+              <ContextMenuItem
+                disabled={worktreeDisabled || worktreeMissing || worktreeStatus?.exists === false}
+                onClick={() => setRenameEntity({ conversationId: id, worktree })}
+              >
+                <Pencil />
+                {t('Rename worktree')}
+              </ContextMenuItem>
+            </>
+          )}
+          {!archived &&
+            (isolated
+              ? onCleanupWorktree && (
+                  <ContextMenuItem
+                    disabled={worktreeDisabled}
+                    onClick={() => onCleanupWorktree(id)}
+                  >
+                    <Eraser />
+                    {t('Clean up worktree')}
+                  </ContextMenuItem>
+                )
+              : onMoveToWorktree &&
+                localProject &&
+                !scratchProject && (
+                  <ContextMenuItem disabled={worktreeDisabled} onClick={() => onMoveToWorktree(id)}>
+                    <GitBranchPlus />
+                    {t('Move to worktree')}
+                  </ContextMenuItem>
+                ))}
+          {!movable ? null : moveTargets.length > 0 ? (
+            <ContextMenuSub>
+              <ContextMenuSubTrigger>
+                <Folders />
+                {scratchProject ? t('Add to project…') : t('Move to project…')}
+              </ContextMenuSubTrigger>
+              <ContextMenuSubPopup className="min-w-36">
+                {moveTargets.map((project) => (
+                  <ContextMenuItem
+                    key={project.id}
+                    disabled={worktreeDisabled}
+                    onClick={() => void moveConversationFromMenu(id, project.id, t)}
+                  >
+                    {projectDisplayName(project)}
+                  </ContextMenuItem>
+                ))}
+              </ContextMenuSubPopup>
+            </ContextMenuSub>
+          ) : (
+            <ContextMenuItem disabled>
+              <Folders />
+              {scratchProject ? t('Add to project…') : t('Move to project…')}
+            </ContextMenuItem>
+          )}
+          <ContextMenuSeparator />
+          <ContextMenuItem variant="destructive" onClick={() => onRemove(id)}>
+            <Trash2 />
+            {t('Delete')}
+          </ContextMenuItem>
+        </ContextMenuPopup>
+      </ContextMenu>
+      <WorktreeRenameDialog entity={renameEntity} onClose={() => setRenameEntity(null)} />
+    </>
+  );
+}
+
+/**
+ * 标题后的总结状态槽：在飞转圈 → 失败红叹号（点击重试） → 无。pending 优先：点重试后叹号立刻变转圈。
+ * 现行机制每个成功回合都会滚动总结，转圈频繁出现是预期行为。
+ */
+function TitleSummaryBadge({
+  pending,
+  error,
+  onRetry,
+}: {
+  pending?: boolean;
+  error?: string;
+  onRetry: () => void;
+}) {
+  const { t } = useI18n();
+  if (pending) {
+    return (
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <span
+              role="status"
+              className="shrink-0 text-muted-foreground/60"
+              aria-label={t('Summarizing title')}
+            />
+          }
+        >
+          <Loader2 className="h-3 w-3 animate-spin" />
+        </TooltipTrigger>
+        <TooltipPopup side="right">{t('Summarizing title')}</TooltipPopup>
+      </Tooltip>
+    );
+  }
+  if (error) {
+    return (
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              type="button"
+              aria-label={t('Title summary failed')}
+              className="shrink-0 rounded p-0.5 text-destructive hover:text-destructive/80"
+              onClick={(e) => {
+                e.stopPropagation();
+                onRetry();
+              }}
+            />
+          }
+        >
+          <CircleAlert className="h-3 w-3" />
+        </TooltipTrigger>
+        <TooltipPopup side="right" className="max-w-72">
+          <p className="font-medium">{t('Title summary failed')}</p>
+          <p className="mt-0.5 break-all text-muted-foreground">{error}</p>
+          <p className="mt-1 text-muted-foreground/70">{t('Click to retry')}</p>
+        </TooltipPopup>
+      </Tooltip>
+    );
+  }
+  return null;
+}
+
+/** 会话悬停提示里的所属项目名,跟随别名 */
+function hoverProjectName(projects: Project[], projectId: string | undefined) {
+  const project = projects.find((entry) => entry.id === projectId);
+  return project ? projectDisplayName(project) : undefined;
+}
+
+/** 分组在菜单里的图标位:有 emoji 用 emoji,否则用统一的分组图标并套上分组色 */
+function GroupGlyph({ emoji, color }: { emoji?: string; color?: string }) {
+  if (emoji) {
+    return (
+      <span className="flex size-4 shrink-0 items-center justify-center text-sm leading-none">
+        {emoji}
+      </span>
+    );
+  }
+  return <Folders style={color ? { color } : undefined} />;
+}
+
+type ProjectAction =
+  | { kind: 'separator'; key: string }
+  | {
+      kind: 'item';
+      key: string;
+      label: string;
+      icon?: React.ReactNode;
+      destructive?: boolean;
+      onSelect: () => void;
+    }
+  | {
+      kind: 'submenu';
+      key: string;
+      label: string;
+      icon?: React.ReactNode;
+      items: ProjectAction[];
+    };
+
+/** 菜单项渲染:submenu 递归展开,让动态分组列表不把主菜单撑长 */
+function renderProjectActions(
+  actions: ProjectAction[],
+  surface: 'context' | 'menu' = 'context'
+): React.ReactNode {
+  return actions.map((action) => {
+    if (action.kind === 'separator') {
+      return surface === 'menu' ? (
+        <MenuSeparator key={action.key} />
+      ) : (
+        <ContextMenuSeparator key={action.key} />
+      );
+    }
+    if (action.kind === 'submenu') {
+      if (surface === 'menu') {
+        return (
+          <MenuSub key={action.key}>
+            <MenuSubTrigger>
+              {action.icon}
+              {action.label}
+            </MenuSubTrigger>
+            <MenuSubPopup className="min-w-40">
+              {renderProjectActions(action.items, 'menu')}
+            </MenuSubPopup>
+          </MenuSub>
+        );
+      }
+      return (
+        <ContextMenuSub key={action.key}>
+          <ContextMenuSubTrigger>
+            {action.icon}
+            {action.label}
+          </ContextMenuSubTrigger>
+          <ContextMenuSubPopup className="min-w-40">
+            {renderProjectActions(action.items)}
+          </ContextMenuSubPopup>
+        </ContextMenuSub>
+      );
+    }
+    if (surface === 'menu') {
+      return (
+        <MenuItem
+          key={action.key}
+          onClick={action.onSelect}
+          variant={action.destructive ? 'destructive' : 'default'}
+        >
+          {action.icon}
+          {action.label}
+        </MenuItem>
+      );
+    }
+    return (
+      <ContextMenuItem
+        key={action.key}
+        onClick={action.onSelect}
+        variant={action.destructive ? 'destructive' : 'default'}
+      >
+        {action.icon}
+        {action.label}
+      </ContextMenuItem>
+    );
+  });
+}
+
+function ProjectOverflowMenu({ actions }: { actions: ProjectAction[] }) {
+  const { t } = useI18n();
+  return (
+    <Menu>
+      <MenuTrigger
+        data-enso="row-menu"
+        aria-label={t('More actions')}
+        className={PROJECT_ROW_MENU_CLASS}
+        title={t('More actions')}
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <Ellipsis className="h-3.5 w-3.5" />
+      </MenuTrigger>
+      <MenuPopup align="end" className="min-w-40">
+        {renderProjectActions(actions, 'menu')}
+      </MenuPopup>
+    </Menu>
+  );
+}
+
+/** 区块标签:纯文字,不占图标列(对应不可折叠的 Active / Pinned 等分区);actions 悬停才显示 */
+function SidebarSectionLabel({
+  section,
+  children,
+  actions,
+}: {
+  /** 主题用的稳定分区 id，写到 data-section */
+  section: 'active' | 'pinned' | 'projects' | 'pinned-projects';
+  children: React.ReactNode;
+  actions?: React.ReactNode;
+}) {
+  return (
+    <div
+      data-enso="section-header"
+      data-section={section}
+      className="group flex items-center gap-1 pt-3.5 pr-1 pb-1 pl-2 text-[0.8214rem] font-medium text-subtle-foreground"
+    >
+      <span className="min-w-0 flex-1 truncate">{children}</span>
+      {actions}
+    </div>
+  );
+}
+
+/** 项目行首的折叠箭头:与会话行状态点同占 16px 列 */
+function FoldChevron({ folded }: { folded: boolean }) {
+  return (
+    <span
+      data-enso="tree-chevron"
+      data-expanded={!folded || undefined}
+      className="flex size-4 shrink-0 items-center justify-center text-subtle-foreground"
+    >
+      <ChevronRight
+        className={cn('size-3.5 transition-transform duration-150', !folded && 'rotate-90')}
+      />
+    </span>
+  );
+}
+
+function ConversationDot({
+  conversation,
+}: {
+  conversation: {
+    status: string;
+    spawning: boolean;
+    unread?: boolean;
+    pendingAsks?: readonly { requestId: string }[];
+    pendingApprovals?: readonly unknown[];
+    hasRunningChild?: boolean;
+  };
+}) {
+  // 待审批与 coworker tab 同为 attention；它们也按「等你处理」排在分组最前
+  const tone =
+    (conversation.pendingApprovals?.length ?? 0) > 0
+      ? 'attention'
+      : conversationDotTone({
+          status: conversation.status,
+          spawning: conversation.spawning,
+          unread: conversation.unread,
+          pendingAskCount: conversation.pendingAsks?.length ?? 0,
+          hasRunningChild: conversation.hasRunningChild,
+        });
+  // 锁进与项目行同宽的图标列:圆点/图标两种形态切换时标题不再左右跳动。
+  // 空闲不画点:满列空心圈没有信息量,只有运行/待回答/失败/未读才需要被看见
+  return (
+    <span className="flex size-4 shrink-0 items-center justify-center">
+      {tone !== 'idle' && (
+        <ConversationStatusIndicator
+          tone={tone}
+          size="sm"
+          data-enso="session-status"
+          data-status={conversationThemeState(conversation)}
+        />
+      )}
+    </span>
+  );
+}

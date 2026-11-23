@@ -1,0 +1,783 @@
+import {
+  type CollisionDetection,
+  DndContext,
+  PointerSensor,
+  pointerWithin,
+  rectIntersection,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core';
+import { AnimatePresence, motion } from 'framer-motion';
+import {
+  FoldHorizontal,
+  Menu,
+  PanelLeft,
+  PanelLeftClose,
+  PanelRight,
+  Search,
+  SquarePen,
+  UnfoldHorizontal,
+} from 'lucide-react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import { BackgroundLayer } from '@/components/app/BackgroundLayer';
+import { ChatAreaFrame } from '@/components/app/ChatAreaFrame';
+import { HeaderSessionTabs } from '@/components/app/HeaderSessionTabs';
+import { ProjectDropOverlay } from '@/components/app/ProjectDropOverlay';
+import { RestartWaitDialog, RestartWaitStrip } from '@/components/app/RestartWaitDialog';
+import { TitleBar } from '@/components/app/TitleBar';
+import { UpdateBanner } from '@/components/app/UpdateBanner';
+import {
+  type ShellChrome,
+  ShellChromeContext,
+  useWindowChromeKind,
+} from '@/components/app/WindowChrome';
+import { ZoomBanner } from '@/components/app/ZoomBanner';
+import { BackgroundTasksPage } from '@/components/backgroundTasks/BackgroundTasksPage';
+import { BotView } from '@/components/bots/BotView';
+import { ModeSwitch } from '@/components/bots/ModeSwitch';
+import { requestOpenChatFind } from '@/components/chat/ChatFindBar';
+import { ChatView } from '@/components/chat/ChatView';
+import { requestFocusComposer } from '@/components/chat/composerMentionBridge';
+import { ResizeHandle } from '@/components/chat/ResizeHandle';
+import { Sidebar } from '@/components/chat/Sidebar';
+import { PairNodeDialog } from '@/components/nodes/PairNodeDialog';
+import { OauthCredentialBootstrap } from '@/components/oauth/OauthCredentialBootstrap';
+import { Onboarding } from '@/components/onboarding/Onboarding';
+import { WorkspaceSearchDialog } from '@/components/search/WorkspaceSearchDialog';
+import { SecretaryWelcome } from '@/components/secretary/SecretaryWelcome';
+import { SessionPeekDialog } from '@/components/secretary/SessionPeekDialog';
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
+import { Button } from '@/components/ui/button';
+import { addToast, ToastProvider } from '@/components/ui/toast';
+import { useAutoArchiveScan } from '@/hooks/useAutoArchiveScan';
+import { useBackgroundImage } from '@/hooks/useBackgroundImage';
+import { useDockBadge } from '@/hooks/useDockBadge';
+import { useGenerationStallTimeout } from '@/hooks/useGenerationStallTimeout';
+import { useRecoverInterruptedTurns } from '@/hooks/useInterruptedSessionRecovery';
+import { useOpenFolderRequests } from '@/hooks/useOpenFolderRequests';
+import { isMobileWidth, useIsMobile, useViewportWidth } from '@/hooks/useViewport';
+import { useWindowsWindowChrome } from '@/hooks/useWindowsWindowChrome';
+import { useI18n } from '@/i18n';
+import {
+  effectiveKeybindings,
+  eventToBinding,
+  isEventInSidePanel,
+  menuAlreadyHandled,
+} from '@/lib/keybindings';
+import { easeOutLayout, springStandard } from '@/lib/motion';
+import { openSecretary } from '@/lib/openSecretary';
+import { subscribeSidebarToggle } from '@/lib/sidebarToggle';
+import {
+  addSidePanelBtw,
+  addSidePanelTerminal,
+  closeActiveSidePanelTab,
+} from '@/lib/sidePanelDock';
+import { cn } from '@/lib/utils';
+import { Z_INDEX } from '@/lib/z-index';
+import { pluginCommands, runPluginCommand } from '@/plugins/commands';
+import { resolvePluginKeybindings } from '@/plugins/keybindings';
+import { PluginNotices } from '@/plugins/PluginNotices';
+import { PluginUiHost } from '@/plugins/PluginUiHost';
+import { useBackgroundTasksView } from '@/stores/backgroundTasksView';
+import { useBotsStore } from '@/stores/bots';
+import {
+  isBotModeActive,
+  openBotNotification,
+  showLocalCodeView,
+  useAppModeStore,
+  useBotModeActive,
+} from '@/stores/bots/mode';
+import { bindPairCatalogSync } from '@/stores/pairCatalog';
+import { useRemoteNodesStore } from '@/stores/remoteNodes';
+import { useSecretaryStore } from '@/stores/secretary';
+import { useSessionsStore } from '@/stores/sessions';
+import { runSessionClean } from '@/stores/sessions/storageClean';
+import { useSettingsStore } from '@/stores/settings';
+import { flushElectronPersist } from '@/stores/settings/storage';
+import { bindSidePanelFullscreen, useSidePanelShown, useSidePanelStore } from '@/stores/sidePanel';
+
+// 右面板含 dockview / xterm / diffs，手机首屏用不到，打开时再加载
+const SidePanel = lazy(() =>
+  import('@/components/sidepanel/SidePanel').then((m) => ({ default: m.SidePanel }))
+);
+
+import { SIDE_PANEL_GAP_WIDTH, SIDE_PANEL_HANDLE_WIDTH } from '@/stores/sidePanel/width';
+
+/** 碰撞策略:光标所在的落点优先(否则会话行的大矩形会把置顶条/输入框让给重叠面积更大的项目块) */
+const dndCollision: CollisionDetection = (args) => {
+  const withPointer = pointerWithin(args);
+  return withPointer.length > 0 ? withPointer : rectIntersection(args);
+};
+
+const WIDTH_KEY = 'enso-sidebar-width';
+const COLLAPSED_KEY = 'enso-sidebar-collapsed';
+
+function startNewConversation() {
+  const sessions = useSessionsStore.getState();
+  const active = sessions.activeId ? sessions.conversations[sessions.activeId] : null;
+  const projectId = active?.projectId ?? useSettingsStore.getState().projects[0]?.id;
+  if (projectId) void sessions.newConversation(projectId);
+}
+
+const TOOLBAR_BUTTON =
+  'no-drag flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground';
+const MIN_WIDTH = 200;
+const MAX_WIDTH = 420;
+
+export default function App() {
+  const onboarded = useSettingsStore((s) => s.onboarded);
+  // 水合前 onboarded 恒为 false：浏览器版经隧道读设置要好几秒，不能先弹引导
+  const settingsHydrated = useSyncExternalStore(
+    (onChange) => useSettingsStore.persist?.onFinishHydration?.(onChange) ?? (() => {}),
+    () => useSettingsStore.persist?.hasHydrated?.() ?? true
+  );
+  useBackgroundImage();
+  useGenerationStallTimeout();
+  useAutoArchiveScan();
+  useRecoverInterruptedTurns();
+  useOpenFolderRequests();
+  useDockBadge();
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [closeRequestId, setCloseRequestId] = useState<string | null>(null);
+  useWindowsWindowChrome();
+  const [width, setWidth] = useState(() => {
+    const saved = Number(localStorage.getItem(WIDTH_KEY));
+    return Number.isFinite(saved) && saved >= MIN_WIDTH ? Math.min(saved, MAX_WIDTH) : 280;
+  });
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem(COLLAPSED_KEY) === '1');
+  // 窄屏下侧栏是抽屉，与桌面折叠状态互不影响
+  const isMobile = useIsMobile();
+  const viewportWidth = useViewportWidth();
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
+  useEffect(() => {
+    if (!isMobile) setDrawerOpen(false);
+  }, [isMobile]);
+  useEffect(
+    () =>
+      useSessionsStore.subscribe((state, prev) => {
+        if (state.activeId !== prev.activeId) setDrawerOpen(false);
+      }),
+    []
+  );
+  const { t } = useI18n();
+  const chatWide = useSettingsStore((s) => s.chatWide);
+  const activeConversationId = useSessionsStore((s) => s.activeId);
+  const sideOpen = useSidePanelShown(activeConversationId);
+  const sideWidth = useSidePanelStore(
+    (s) => s.uiByConversation[activeConversationId ?? '']?.width ?? s.lastWidth
+  );
+  const sideFullscreen = useSidePanelStore((s) => s.fullscreen);
+  const toggleSidePanel = useSidePanelStore((s) => s.toggleOpen);
+  const botPanelOpen = useBotsStore((s) => s.panelOpen);
+  const toggleBotPanel = useBotsStore((s) => s.togglePanel);
+  useEffect(() => {
+    if (sideFullscreen && !sideOpen) useSidePanelStore.getState().setFullscreen(false);
+  }, [sideOpen, sideFullscreen]);
+  // 全屏按会话记。挂载时补当前会话，读回本地状态和之后的切换再各补一次。
+  useEffect(() => bindSidePanelFullscreen(), []);
+  useEffect(() => {
+    document.documentElement.classList.add('enso-main-shell');
+    return () => document.documentElement.classList.remove('enso-main-shell');
+  }, []);
+  useEffect(() => window.electronAPI.app.onCloseRequest(setCloseRequestId), []);
+  useEffect(
+    () =>
+      window.electronAPI.app.onFlushPersist((requestId) => {
+        void flushElectronPersist().finally(() => {
+          window.electronAPI.app.respondFlushPersist(requestId);
+        });
+      }),
+    []
+  );
+  const respondClose = (action: 'cancel' | 'quit' | 'tray') => {
+    const requestId = closeRequestId;
+    if (!requestId) return;
+    setCloseRequestId(null);
+    window.electronAPI.app.respondCloseRequest(requestId, { action });
+  };
+  // 桌面折叠与窄屏抽屉是两套状态；⌘B 与 View 菜单都走这里
+  const toggleSidebarView = useCallback(() => {
+    if (isMobileWidth(window.innerWidth)) setDrawerOpen((v) => !v);
+    else setCollapsed((v) => !v);
+  }, []);
+  // macOS 透明窗口的点击形状按已绘制内容缓存，侧栏折叠动画让顶栏按钮换位后
+  // 命中区可能停在旧位置，按钮点上去没反应；动画结束后重算一次。
+  const refreshDragRegions = useCallback(() => {
+    if (window.electronAPI.env.platform !== 'darwin') return;
+    window.setTimeout(() => window.electronAPI.window.refreshDragRegions(), 400);
+  }, []);
+  const toggleSidebar = useCallback(() => {
+    toggleSidebarView();
+    refreshDragRegions();
+  }, [toggleSidebarView, refreshDragRegions]);
+  useEffect(() => subscribeSidebarToggle(toggleSidebar), [toggleSidebar]);
+  useEffect(() => window.electronAPI.window.onToggleSidebar(toggleSidebar), [toggleSidebar]);
+  // 右侧面板:手柄在面板左缘,向左拖加宽;拖拽中暂停宽度 spring 动画防抖动
+  const [sideResizing, setSideResizing] = useState(false);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    localStorage.setItem(WIDTH_KEY, String(width));
+  }, [width]);
+  useEffect(() => {
+    localStorage.setItem(COLLAPSED_KEY, collapsed ? '1' : '0');
+  }, [collapsed]);
+
+  useEffect(
+    () =>
+      window.electronAPI.resources.onSessionsCleanRequest(({ requestId, request }) => {
+        void runSessionClean(request)
+          .catch(() => 0)
+          .then((removed) => window.electronAPI.resources.sessionsCleanDone(requestId, removed));
+      }),
+    []
+  );
+
+  // 手机第二屏：会话目录/项目/provider 只在 renderer，绑定后 debounce 同步给 main
+  useEffect(() => {
+    bindPairCatalogSync();
+  }, []);
+
+  // 节点列表与可见层来自界面所在电脑：本机桌面，或以远程节点层跑在另一台桌面里（nodes: 交给那台的 main）
+  useEffect(() => {
+    const remote = window.electronAPI.remote;
+    return remote && !remote.nativePlatform ? undefined : useRemoteNodesStore.getState().bind();
+  }, []);
+  const pairDialogOpen = useRemoteNodesStore((s) => s.pairDialogOpen);
+  const botModeActive = useBotModeActive();
+  const botModeEnabled = useSettingsStore((s) => s.botModeEnabled);
+  const headerSessionTabsEnabled = useSettingsStore((s) => s.headerSessionTabs);
+  const appMode = useAppModeStore((s) => s.mode);
+  // 关闭实验开关：回到 Code（设置未水合前 botModeEnabled 恒为 false，不能据此回退）
+  useEffect(() => {
+    const hydrated = useSettingsStore.persist?.hasHydrated?.() ?? true;
+    if (appMode === 'bot' && hydrated && !botModeEnabled) {
+      useAppModeStore.getState().setMode('code');
+    }
+  }, [appMode, botModeEnabled]);
+
+  // Bot 模式开关打开即常驻订阅：Code 模式下也要实时计数待处理，并响应通知点击跳转
+  useEffect(() => {
+    if (!botModeEnabled) return;
+    const unbind = useBotsStore.getState().bind();
+    const offOpen = window.electronAPI.bots.onEvent((event) => {
+      if (event.kind === 'open') void openBotNotification(event);
+    });
+    return () => {
+      unbind();
+      offOpen();
+    };
+  }, [botModeEnabled]);
+
+  // 秘书开关打开即常驻订阅：聊天里的确认卡片与工作台读同一份 Main 状态
+  const secretaryEnabled = useSettingsStore((s) => s.secretaryEnabled);
+  const secretaryWelcomeOpen = useSecretaryStore((s) => s.welcomeOpen);
+  const backgroundTasksOpen = useBackgroundTasksView((s) => s.open);
+  useEffect(
+    () => (secretaryEnabled ? useSecretaryStore.getState().bind() : undefined),
+    [secretaryEnabled]
+  );
+
+  // Code 会话通知点击：在 Bot 模式时先切回 Code，会话由 sessions store 选中
+  useEffect(
+    () =>
+      window.electronAPI.agent.onFocusSession((sessionId) => {
+        if (useSessionsStore.getState().conversations[sessionId]) showLocalCodeView();
+      }),
+    []
+  );
+
+  const handleResize = useCallback((deltaX: number) => {
+    setWidth((w) => Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, w + deltaX)));
+  }, []);
+
+  // 全局快捷键(可在设置中改绑):折叠侧栏 / 打开设置 / 新对话 / coworker 标签切换
+  const keybindings = useSettingsStore((s) => s.keybindings);
+  useEffect(() => {
+    const bindings = effectiveKeybindings(keybindings);
+    // 主会话 + coworker 循环切换;无 coworker 时不动
+    const cycleTab = (direction: 1 | -1) => {
+      const sessions = useSessionsStore.getState();
+      const parent = sessions.activeId ? sessions.conversations[sessions.activeId] : null;
+      if (!parent) return;
+      const tabs: (string | undefined)[] = [undefined, ...(parent.coworkerIds ?? [])];
+      if (tabs.length <= 1) return;
+      // activeTabId 指向已删 coworker 时 indexOf = -1,+1 后回落主会话
+      const current = tabs.indexOf(parent.activeTabId);
+      sessions.selectTab(parent.id, tabs[(current + direction + tabs.length) % tabs.length]);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      const pressed = eventToBinding(e);
+      if (!pressed) return;
+      if (pressed === bindings['toggle-app-mode']) {
+        const settings = useSettingsStore.getState();
+        if (!settings.botModeEnabled) return;
+        e.preventDefault();
+        const modes = useAppModeStore.getState();
+        modes.setMode(modes.mode === 'bot' ? 'code' : 'bot');
+        return;
+      }
+      // Bot 模式：Code 会话相关的快捷键不响应（新对话/tab 切换/右侧面板/查找）
+      const bot = isBotModeActive();
+      if (bot && pressed === bindings['toggle-side-panel']) {
+        e.preventDefault();
+        useBotsStore.getState().togglePanel();
+        return;
+      }
+      if (bot && pressed === bindings['search-workspace']) {
+        e.preventDefault();
+        useBotsStore.getState().setSearchOpen(true);
+        return;
+      }
+      if (
+        bot &&
+        [
+          'new-conversation',
+          'next-tab',
+          'prev-tab',
+          'toggle-side-panel',
+          'toggle-side-panel-fullscreen',
+          'new-side-tab',
+          'new-btw-tab',
+          'close-side-tab',
+          'find-in-chat',
+          'search-workspace',
+          'open-secretary',
+        ].some((key) => pressed === bindings[key as keyof typeof bindings])
+      ) {
+        return;
+      }
+      if (pressed === bindings['toggle-sidebar']) {
+        e.preventDefault();
+        if (menuAlreadyHandled(e, pressed)) return;
+        toggleSidebar();
+      } else if (pressed === bindings['open-settings']) {
+        e.preventDefault();
+        void window.electronAPI.window.openSettings();
+      } else if (pressed === bindings['open-secretary']) {
+        if (useSettingsStore.getState().secretaryEnabled) {
+          e.preventDefault();
+          openSecretary();
+        }
+      } else if (pressed === bindings['new-conversation']) {
+        e.preventDefault();
+        startNewConversation();
+      } else if (pressed === bindings['new-side-tab']) {
+        e.preventDefault();
+        if (isEventInSidePanel(e.target)) addSidePanelTerminal();
+        else startNewConversation();
+      } else if (pressed === bindings['new-btw-tab']) {
+        e.preventDefault();
+        addSidePanelBtw();
+      } else if (pressed === bindings['next-tab']) {
+        e.preventDefault();
+        cycleTab(1);
+      } else if (pressed === bindings['prev-tab']) {
+        e.preventDefault();
+        cycleTab(-1);
+      } else if (pressed === bindings['toggle-side-panel']) {
+        e.preventDefault();
+        useSidePanelStore.getState().toggleOpen();
+      } else if (pressed === bindings['toggle-side-panel-fullscreen']) {
+        e.preventDefault();
+        useSidePanelStore.getState().toggleFullscreen();
+      } else if (pressed === bindings['close-side-tab']) {
+        e.preventDefault();
+        closeActiveSidePanelTab();
+      } else if (pressed === bindings['focus-composer']) {
+        e.preventDefault();
+        requestFocusComposer();
+      } else if (pressed === bindings['find-in-chat']) {
+        e.preventDefault();
+        requestOpenChatFind();
+      } else if (pressed === bindings['search-workspace']) {
+        e.preventDefault();
+        setSearchOpen(true);
+      } else if (!bot) {
+        const command = resolvePluginKeybindings(
+          pluginCommands(),
+          keybindings,
+          bindings
+        ).byBinding.get(pressed);
+        if (!command) return;
+        e.preventDefault();
+        const sessions = useSessionsStore.getState();
+        const parent = sessions.activeId ? sessions.conversations[sessions.activeId] : null;
+        void runPluginCommand(command, parent ? (parent.activeTabId ?? parent.id) : null).then(
+          (error) => {
+            if (error) addToast({ type: 'error', title: command.title, description: error });
+          }
+        );
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [keybindings, toggleSidebar]);
+
+  useEffect(() => {
+    if (!sideOpen || !sideFullscreen) return;
+    const onEsc = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (isBotModeActive()) return;
+      e.preventDefault();
+      useSidePanelStore.getState().setFullscreen(false);
+    };
+    window.addEventListener('keydown', onEsc);
+    return () => window.removeEventListener('keydown', onEsc);
+  }, [sideOpen, sideFullscreen]);
+
+  // 拖拽：侧栏项目排序 / 会话拖入 Composer / 拖到 Pinned 区。
+  // 6px 启动阈值：行点击与行内按钮不受影响。onDragEnd 在 Sidebar 的 useDndMonitor 里。
+  const dndSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } })
+  );
+
+  const chromeKind = useWindowChromeKind();
+  // Bot 视图仍走整行 TitleBar；Code 视图在桌面端把 chrome 并进卡片顶栏
+  const desktopShell = chromeKind !== 'mobile' && !botModeActive;
+  const handleSideResize = useCallback(
+    (deltaX: number) => {
+      const workspace = workspaceRef.current;
+      if (!workspace) return;
+      // 与 SidePanel 量宽口径一致：扣掉卡片外壳的画布内边距
+      const style = getComputedStyle(workspace);
+      const contentWidth =
+        workspace.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+      useSidePanelStore
+        .getState()
+        .nudgeWidth(
+          -deltaX,
+          contentWidth,
+          desktopShell ? SIDE_PANEL_GAP_WIDTH : SIDE_PANEL_HANDLE_WIDTH
+        );
+    },
+    [desktopShell]
+  );
+  const modeSwitch = botModeEnabled ? <ModeSwitch /> : null;
+  // 桌面外壳：右侧面板顶到窗口顶部，tab 条与顶栏同一行；Windows 原生按钮由面板 tab 条右端让位，
+  // Linux 自绘按钮在顶栏里会被面板盖住，保持独立卡片；网页版没有窗口按钮，同 mac
+  const titleRowPanel =
+    desktopShell && (chromeKind === 'mac' || chromeKind === 'windows' || chromeKind === 'web');
+  const sideInTitleRow = titleRowPanel && sideOpen && !isMobile && !botModeActive;
+  // Bot 模式开启时顶栏居中是 Bot 切换器，标签会与之重叠，整体让位
+  const headerSessionTabs =
+    headerSessionTabsEnabled &&
+    desktopShell &&
+    !botModeEnabled &&
+    !(sideInTitleRow && sideFullscreen) ? (
+      <HeaderSessionTabs onNew={startNewConversation} />
+    ) : null;
+  const sideToggle = (
+    <button
+      type="button"
+      className={cn(
+        'flex items-center justify-center rounded-md transition-colors hover:bg-accent/50',
+        isMobile ? 'h-9 w-9' : desktopShell ? TOOLBAR_BUTTON : 'h-7 w-7',
+        (botModeActive ? botPanelOpen : sideOpen) ? 'text-foreground' : 'text-muted-foreground'
+      )}
+      onClick={botModeActive ? toggleBotPanel : toggleSidePanel}
+      aria-label={t('Toggle side panel')}
+      title={t('Toggle side panel')}
+    >
+      <PanelRight className="h-4 w-4" />
+    </button>
+  );
+  const chatWideToggle = (
+    <button
+      type="button"
+      className={cn(
+        'flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-accent/50',
+        chatWide ? 'text-foreground' : 'text-muted-foreground',
+        isMobile && 'hidden'
+      )}
+      onClick={() => useSettingsStore.getState().setChatWide(!chatWide)}
+      aria-label={chatWide ? t('Use reading width') : t('Use full chat width')}
+      title={chatWide ? t('Use reading width') : t('Use full chat width')}
+    >
+      {chatWide ? <FoldHorizontal className="h-4 w-4" /> : <UnfoldHorizontal className="h-4 w-4" />}
+    </button>
+  );
+  const panelActions = (
+    <>
+      {chatWideToggle}
+      {sideToggle}
+    </>
+  );
+  // 桌面外壳：右侧面板开关在窗口顶栏（面板升进顶栏时由面板 tab 条右端接管），卡片顶栏只留铺满开关
+  const shellChrome: ShellChrome | null = desktopShell ? { trailing: chatWideToggle } : null;
+
+  return (
+    <div
+      data-enso="canvas"
+      className={cn('relative isolate flex flex-col', isMobile ? 'h-dvh' : 'h-screen')}
+    >
+      {/* 全局 toast 出口（addToast 依赖；不挂则静默失效） */}
+      <ToastProvider />
+      <PluginNotices />
+      <BackgroundLayer />
+      <ProjectDropOverlay />
+      <OauthCredentialBootstrap />
+      {chromeKind !== 'mobile' ? (
+        <TitleBar
+          leading={
+            <div className="flex items-center gap-0.5">
+              {/* Windows/Linux 顶栏贴左：开关居中落在折叠栏宽度内，与下方图标同一竖线 */}
+              <div
+                className={cn(
+                  chromeKind !== 'mac' && 'flex justify-center',
+                  chromeKind !== 'mac' && (desktopShell ? 'w-[48px]' : 'w-12')
+                )}
+              >
+                <button
+                  type="button"
+                  data-enso="sidebar-toggle"
+                  className={TOOLBAR_BUTTON}
+                  onClick={toggleSidebar}
+                  title={collapsed ? t('Expand sidebar') : t('Collapse sidebar')}
+                >
+                  {collapsed ? (
+                    <PanelLeft className="h-4 w-4" />
+                  ) : (
+                    <PanelLeftClose className="h-4 w-4" />
+                  )}
+                </button>
+              </div>
+              {desktopShell && (
+                <>
+                  <button
+                    type="button"
+                    data-enso="search-button"
+                    className={TOOLBAR_BUTTON}
+                    onClick={() => setSearchOpen(true)}
+                    title={t('Search anything')}
+                  >
+                    <Search className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    data-enso="new-session"
+                    className={TOOLBAR_BUTTON}
+                    onClick={startNewConversation}
+                    title={t('New conversation')}
+                  >
+                    <SquarePen className="h-4 w-4" />
+                  </button>
+                </>
+              )}
+            </div>
+          }
+          // 顶栏态全屏：面板 tab 条铺满整行，居中开关会被压在 tab 下
+          centered={(sideInTitleRow && sideFullscreen ? null : modeSwitch) ?? undefined}
+          middle={headerSessionTabs}
+          className={cn(
+            chromeKind !== 'mac' && 'pl-0',
+            desktopShell && 'border-b-0',
+            // 顶栏落在画布上：原生按钮底色随它透明，壁纸与侧栏一样透出来
+            desktopShell && 'bg-transparent',
+            // 右侧面板开关与面板 tab 条右端（面板 8px 外边距 + 8px 内边距）对齐
+            desktopShell && chromeKind === 'mac' && 'pr-4'
+          )}
+          actions={desktopShell ? (sideInTitleRow ? undefined : sideToggle) : panelActions}
+        />
+      ) : (
+        <TitleBar
+          title="EnsoCode"
+          centered={modeSwitch ?? undefined}
+          leading={
+            isMobile && !botModeActive ? (
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  data-enso="sidebar-toggle"
+                  className="-ml-1.5 flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground"
+                  onClick={() => setDrawerOpen(true)}
+                  aria-label={t('Conversations')}
+                  title={t('Conversations')}
+                >
+                  <Menu className="h-5 w-5" />
+                </button>
+                {!modeSwitch && (
+                  <span className="text-sm font-medium text-muted-foreground">EnsoCode</span>
+                )}
+              </div>
+            ) : undefined
+          }
+          actions={panelActions}
+        />
+      )}
+      {!desktopShell && <RestartWaitStrip />}
+      {!desktopShell && <UpdateBanner />}
+      {!desktopShell && <ZoomBanner />}
+      <div className="flex min-h-0 flex-1">
+        {botModeActive ? (
+          // Bot 模式：成员/群聊侧栏 + 聊天区；Code 侧栏/会话/右侧面板卸载
+          <BotView
+            sidebarWidth={width}
+            collapsed={collapsed}
+            onToggleCollapse={toggleSidebar}
+            onResize={handleResize}
+          />
+        ) : (
+          <DndContext sensors={dndSensors} collisionDetection={dndCollision}>
+            {isMobile ? (
+              <>
+                <AnimatePresence>
+                  {drawerOpen && (
+                    <motion.div
+                      key="drawer-backdrop"
+                      className="fixed inset-0 bg-black/40"
+                      style={{ zIndex: Z_INDEX.MOBILE_DRAWER }}
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      onClick={closeDrawer}
+                    />
+                  )}
+                </AnimatePresence>
+                <motion.div
+                  className="fixed inset-y-0 left-0 flex bg-background shadow-xl"
+                  style={{ zIndex: Z_INDEX.MOBILE_DRAWER }}
+                  initial={false}
+                  animate={{ x: drawerOpen ? 0 : '-105%' }}
+                  transition={springStandard}
+                  inert={!drawerOpen}
+                >
+                  <Sidebar
+                    width={Math.min(320, Math.round(viewportWidth * 0.85))}
+                    collapsed={false}
+                    onToggleCollapse={closeDrawer}
+                    onOpenSearch={() => setSearchOpen(true)}
+                    onNavigate={closeDrawer}
+                  />
+                </motion.div>
+              </>
+            ) : (
+              <>
+                <Sidebar
+                  width={collapsed ? undefined : width}
+                  collapsed={collapsed}
+                  onToggleCollapse={toggleSidebar}
+                  onOpenSearch={() => setSearchOpen(true)}
+                />
+                {!collapsed && <ResizeHandle edge={desktopShell} onResize={handleResize} />}
+              </>
+            )}
+            <div
+              ref={workspaceRef}
+              className={cn(
+                'relative flex min-h-0 min-w-0 flex-1',
+                // mac 右侧面板要向上伸进顶栏行：只裁横向
+                titleRowPanel ? 'overflow-x-clip' : 'overflow-hidden',
+                // 卡片 1px 描边画在盒外，左/上各让出 1px 才不被裁掉；overflow-clip-margin 对单轴 clip 和 hidden 都不生效
+                desktopShell && '-mt-px -ml-px pt-px pr-[8px] pb-[8px] pl-px'
+              )}
+            >
+              <div
+                data-enso="main"
+                className={cn(
+                  'relative flex min-h-0 min-w-0 flex-1 flex-col bg-background',
+                  desktopShell && 'overflow-hidden rounded-[10px] shadow-surface',
+                  // 与右侧面板合成一张卡：接缝处直角，分割靠 1px 手柄线
+                  sideInTitleRow && 'rounded-r-none'
+                )}
+                // 全屏面板开壁纸时是半透明的，铺开后把被盖住的对话藏掉，否则会透上来
+                style={
+                  sideOpen && sideFullscreen
+                    ? {
+                        visibility: 'hidden',
+                        transition: `visibility 0s ${easeOutLayout.duration}s`,
+                      }
+                    : undefined
+                }
+              >
+                <PluginUiHost />
+                {/* 秘书引导是独占页：透明背景下面板色 alpha 为 0，背后的空会话必须停止绘制 */}
+                <ChatAreaFrame
+                  hidden={(secretaryEnabled && secretaryWelcomeOpen) || backgroundTasksOpen}
+                >
+                  <ShellChromeContext.Provider value={shellChrome}>
+                    <ChatView />
+                  </ShellChromeContext.Provider>
+                </ChatAreaFrame>
+                {desktopShell && <RestartWaitStrip />}
+                {desktopShell && <UpdateBanner />}
+                {desktopShell && <ZoomBanner />}
+                {/* 初次设置只盖聊天区；远端浏览器（PWA 完整模式）同样走这条路径 */}
+                {secretaryEnabled && secretaryWelcomeOpen && <SecretaryWelcome />}
+                {backgroundTasksOpen && <BackgroundTasksPage />}
+              </div>
+              {sideOpen && !sideFullscreen && !isMobile && (
+                <ResizeHandle
+                  gap={desktopShell && !sideInTitleRow}
+                  onResize={handleSideResize}
+                  onResizingChange={setSideResizing}
+                />
+              )}
+              <Suspense fallback={null}>
+                <SidePanel
+                  width={sideWidth}
+                  resizing={sideResizing}
+                  card={desktopShell}
+                  titleRow={titleRowPanel}
+                />
+              </Suspense>
+            </div>
+          </DndContext>
+        )}
+      </div>
+      {settingsHydrated && !onboarded && !window.electronAPI.remote && <Onboarding />}
+      <WorkspaceSearchDialog open={searchOpen} onOpenChange={setSearchOpen} />
+      <SessionPeekDialog />
+      <PairNodeDialog
+        open={pairDialogOpen}
+        onOpenChange={useRemoteNodesStore.getState().setPairDialogOpen}
+      />
+      <AlertDialog
+        open={closeRequestId !== null}
+        onOpenChange={(open) => {
+          if (!open && closeRequestId) respondClose('cancel');
+        }}
+      >
+        <AlertDialogPopup className="sm:max-w-sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-base">{t('Confirm exit')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t(
+                'Exit closes the app completely, so your phone can no longer connect. Minimize to tray keeps the app running in the background so your phone can still connect.'
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter variant="bare">
+            <AlertDialogClose render={<Button variant="outline" size="sm" />}>
+              {t('Cancel')}
+            </AlertDialogClose>
+            <Button size="sm" onClick={() => respondClose('tray')}>
+              {t('Minimize to tray')}
+            </Button>
+            <Button variant="destructive" size="sm" onClick={() => respondClose('quit')}>
+              {t('Exit')}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+      <RestartWaitDialog />
+    </div>
+  );
+}

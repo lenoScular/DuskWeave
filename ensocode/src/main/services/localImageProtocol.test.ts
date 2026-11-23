@@ -1,0 +1,141 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { localImageUrlToPath, pluginAssetUrl } from '@shared/localImage';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  handleLocalImageRequest,
+  setBotAvatarResolver,
+  setPluginAssetResolver,
+  setSecretaryAvatarResolver,
+} from './localImageProtocol';
+
+describe('plugin-asset', () => {
+  let dir = '';
+
+  afterEach(() => {
+    setPluginAssetResolver(null);
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = '';
+  });
+
+  async function respond(url: string) {
+    return handleLocalImageRequest(url, null);
+  }
+
+  it('未注册或解析失败时 404', async () => {
+    const url = pluginAssetUrl('acme.theme', 'a.png', 'b1');
+    expect((await respond(url)).status).toBe(404);
+    setPluginAssetResolver(() => null);
+    expect((await respond(url)).status).toBe(404);
+    setPluginAssetResolver(() => {
+      throw new Error('missing');
+    });
+    expect((await respond(url)).status).toBe(404);
+  });
+
+  it('非白名单扩展名 403，坏的百分号编码 400', async () => {
+    setPluginAssetResolver(() => '/tmp/nope.mp4');
+    expect((await respond(pluginAssetUrl('acme.theme', 'a.mp4', 'b1'))).status).toBe(403);
+    expect((await respond('local-image://plugin-asset/acme.theme/%ZZ.png')).status).toBe(400);
+  });
+
+  it('字体带 MIME、CORS 和长缓存，并解码路径', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'enso-plugin-asset-'));
+    const file = join(dir, 'a.woff2');
+    writeFileSync(file, 'font-bytes');
+    let seen: { pluginId: string; rel: string } | null = null;
+    setPluginAssetResolver((pluginId, rel) => {
+      seen = { pluginId, rel };
+      return file;
+    });
+    const response = await respond(pluginAssetUrl('奶龙', '字体/a.woff2', 'build 2'));
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('font/woff2');
+    expect(response.headers.get('access-control-allow-origin')).toBe('*');
+    expect(response.headers.get('cache-control')).toBe('max-age=31536000');
+    expect(Buffer.from(await response.arrayBuffer()).toString()).toBe('font-bytes');
+    expect(seen).toEqual({ pluginId: '奶龙', rel: '字体/a.woff2' });
+  });
+
+  it('不把 plugin-asset 当成磁盘路径', () => {
+    expect(localImageUrlToPath(new URL(pluginAssetUrl('acme.theme', 'a.png', 'b1')))).toBeNull();
+  });
+});
+
+describe('secretary-avatar', () => {
+  afterEach(() => setSecretaryAvatarResolver(() => null));
+
+  async function respond(url: string) {
+    return handleLocalImageRequest(url, null);
+  }
+
+  it('路径不是固定文件名时拒绝，并且不去读盘', async () => {
+    let calls = 0;
+    setSecretaryAvatarResolver(() => {
+      calls += 1;
+      return '/tmp/not-the-avatar.png';
+    });
+    expect((await respond('local-image://secretary-avatar/../etc/passwd')).status).toBe(403);
+    expect((await respond('local-image://secretary-avatar/%2e%2e%2fpasswd')).status).toBe(403);
+    expect(
+      (await respond('local-image://secretary-avatar/avatar.png/../../etc/passwd')).status
+    ).toBe(403);
+    expect(calls).toBe(0);
+  });
+
+  it('固定文件名才交给解析器，并按内容返回图片', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sec-avatar-proto-'));
+    const file = join(dir, 'avatar.png');
+    writeFileSync(file, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]));
+    setSecretaryAvatarResolver(() => file);
+    try {
+      const response = await respond('local-image://secretary-avatar/avatar.png?v=2');
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toBe('image/png');
+      expect(response.headers.get('access-control-allow-origin')).toBe('*');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('GIF 头像按内容返回 image/gif，旧的 PNG 字节仍按 image/png', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sec-avatar-gif-'));
+    const file = join(dir, 'avatar.png');
+    setSecretaryAvatarResolver(() => file);
+    try {
+      for (const magic of ['GIF89a', 'GIF87a']) {
+        writeFileSync(file, Buffer.from(`${magic}\x01\x00\x01\x00`, 'latin1'));
+        const response = await respond('local-image://secretary-avatar/avatar.png?v=3&h=abcd');
+        expect(response.status).toBe(200);
+        expect(response.headers.get('content-type')).toBe('image/gif');
+        expect(Buffer.from(await response.arrayBuffer()).toString('latin1')).toContain(magic);
+      }
+      writeFileSync(file, Buffer.from('GIF88a\x01', 'latin1'));
+      expect((await respond('local-image://secretary-avatar/avatar.png?v=4')).status).toBe(403);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('bot-avatar', () => {
+  afterEach(() => setBotAvatarResolver(() => null));
+
+  it('Bot 头像不放行 GIF，PNG 照常', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bot-avatar-gif-'));
+    const file = join(dir, 'avatar.png');
+    setBotAvatarResolver(() => file);
+    const url = 'local-image://bot-avatar/0f8fad5b-d9cb-469f-a165-70867728950e?v=1';
+    try {
+      writeFileSync(file, Buffer.from('GIF89a\x01\x00\x01\x00', 'latin1'));
+      expect((await handleLocalImageRequest(url, null)).status).toBe(403);
+      writeFileSync(file, Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]));
+      const response = await handleLocalImageRequest(url, null);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-type')).toBe('image/png');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

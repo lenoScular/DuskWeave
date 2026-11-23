@@ -1,0 +1,815 @@
+import { randomUUID } from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import path from 'node:path';
+import { resolveSshTarget } from '@shared/ssh';
+import type {
+  AuthorityMutationResult,
+  ConversationAuthority,
+  ConversationAuthorityProjection,
+  ConversationAuthorityRequest,
+  ConversationBotBinding,
+  CreateConversationAuthorityRequest,
+  CreateProjectAuthorityRequest,
+  ModelRef,
+  ProjectAuthority,
+  ProjectAuthorityProjection,
+  RemoveProjectAuthorityRequest,
+  SelectProjectAuthorityRequest,
+  SourceAuthorityProjection,
+  UpdateConversationSelectionRequest,
+} from '@shared/types/agent';
+
+interface PersistedAuthority {
+  migrationVersion: 1;
+  projects: ProjectAuthority[];
+  conversations: ConversationAuthority[];
+}
+
+export interface SourceAuthorityRegistryOptions {
+  registryFile: string;
+  legacySettings?: () => Record<string, unknown> | null;
+  safeSessionRoot?: string;
+  randomUuid?: () => string;
+  onChanged?: (projection: SourceAuthorityProjection) => void;
+  resolveSshConnection?: (id: string) => { host: string; user?: string; name?: string } | null;
+}
+
+const record = (value: unknown): Record<string, unknown> | null =>
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+/**
+ * 规范化远端项目绝对路径：去重复/尾斜杠。本机无法 realpath 远端路径，
+ * 所以拒绝一切需要解析的形态（相对路径、~、. / ..分量），只收字面绝对路径。
+ */
+export function normalizeRemoteProjectPath(value: string): string | null {
+  if (!value.startsWith('/')) return null;
+  const segments = value.split('/').filter((s) => s.length > 0);
+  if (segments.some((s) => s === '.' || s === '..')) return null;
+  return segments.length === 0 ? '/' : `/${segments.join('/')}`;
+}
+
+const validId = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+
+function projectIdentity(
+  project: Pick<ProjectAuthority, 'kind' | 'canonicalPath' | 'sshConnectionId'>
+): string {
+  if (project.kind === 'ssh') return `ssh:${project.sshConnectionId}:${project.canonicalPath}`;
+  if (project.kind === 'scratch') return `scratch:${project.canonicalPath}`;
+  if (project.kind === 'secretary') return `secretary:${project.canonicalPath}`;
+  return project.kind === 'bot-home'
+    ? `bot-home:${project.canonicalPath}`
+    : `local:${project.canonicalPath}`;
+}
+
+function normalizeStoredProject(project: ProjectAuthority): { canonicalPath: string } {
+  if (project.kind === 'ssh') {
+    const canonicalPath = normalizeRemoteProjectPath(project.canonicalPath);
+    return { canonicalPath: canonicalPath ?? project.canonicalPath };
+  }
+  try {
+    const canonicalPath = realpathSync(project.canonicalPath);
+    if (!statSync(canonicalPath).isDirectory()) return { canonicalPath: project.canonicalPath };
+    return { canonicalPath };
+  } catch {
+    return { canonicalPath: project.canonicalPath };
+  }
+}
+
+export class SourceAuthorityRegistry {
+  private readonly projects = new Map<string, ProjectAuthority>();
+  private readonly conversations = new Map<string, ConversationAuthority>();
+  private readonly randomUuid: () => string;
+
+  constructor(private readonly options: SourceAuthorityRegistryOptions) {
+    this.randomUuid = options.randomUuid ?? randomUUID;
+    if (!this.load()) this.migrateLegacy(options.legacySettings?.());
+    if (this.normalizeLoadedProjects()) this.commit();
+  }
+
+  private hydrateProject(value: ProjectAuthority): ProjectAuthority {
+    if (value.kind !== 'ssh' || !value.sshConnectionId) return { ...value };
+    const connection = this.options.resolveSshConnection?.(value.sshConnectionId);
+    if (!connection) return { ...value };
+    return {
+      ...value,
+      sshHost: resolveSshTarget(connection),
+      ...(connection.name ? { sshConnectionName: connection.name } : {}),
+    };
+  }
+
+  projection(): SourceAuthorityProjection {
+    return {
+      projects: [...this.projects.values()].map((value) => this.hydrateProject(value)),
+      conversations: [...this.conversations.values()].map((value) => ({
+        ...value,
+        ...(value.selection ? { selection: { ...value.selection } } : {}),
+      })),
+    };
+  }
+
+  /** renderer / 手机可见部分：不含 bot-home 项目与 bot 会话 */
+  rendererProjection(): SourceAuthorityProjection {
+    const full = this.projection();
+    return {
+      projects: full.projects.filter((project) => project.kind !== 'bot-home'),
+      conversations: full.conversations.filter((conversation) => !conversation.bot),
+    };
+  }
+
+  botConversations(): ConversationAuthorityProjection[] {
+    return [...this.conversations.values()]
+      .filter((conversation) => conversation.bot)
+      .map((conversation) => this.copyConversation(conversation));
+  }
+
+  project(projectId: string): ProjectAuthority | undefined {
+    const value = this.projects.get(projectId);
+    return value ? this.hydrateProject(value) : undefined;
+  }
+
+  conversation(conversationId: string): ConversationAuthority | undefined {
+    const value = this.conversations.get(conversationId);
+    return value
+      ? { ...value, ...(value.selection ? { selection: { ...value.selection } } : {}) }
+      : undefined;
+  }
+
+  createProject(
+    request: CreateProjectAuthorityRequest
+  ): AuthorityMutationResult<ProjectAuthorityProjection> {
+    if (request.kind === 'bot-home') {
+      return { accepted: false, error: 'Project kind is reserved.' };
+    }
+    if (request.kind === 'scratch') {
+      return { accepted: false, error: 'Project kind is reserved.' };
+    }
+    if (request.kind === 'secretary') {
+      return { accepted: false, error: 'Project kind is reserved.' };
+    }
+    try {
+      return request.kind === 'ssh'
+        ? this.createSshProject(request)
+        : this.createLocalProject(request);
+    } catch (error) {
+      return { accepted: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  private createLocalProject(
+    request: CreateProjectAuthorityRequest
+  ): AuthorityMutationResult<ProjectAuthorityProjection> {
+    const canonicalPath = realpathSync(request.path);
+    if (!statSync(canonicalPath).isDirectory()) throw new Error('Project path is not a directory.');
+    const existing = this.findActiveByIdentity(`local:${canonicalPath}`);
+    if (existing) return { accepted: true, value: { ...existing } };
+    return this.insertProject({
+      projectId: this.randomUuid(),
+      canonicalPath,
+      state: 'active',
+      version: 1,
+    });
+  }
+
+  /** 仅 Main：把 Bot 工作区目录登记为隐藏项目（按路径幂等，目录不存在则创建） */
+  ensureBotHomeProject(dir: string): ProjectAuthorityProjection | undefined {
+    try {
+      mkdirSync(dir, { recursive: true });
+      const canonicalPath = realpathSync(dir);
+      const existing = this.findActiveByIdentity(`bot-home:${canonicalPath}`);
+      if (existing) return { ...existing };
+      const inserted = this.insertProject({
+        projectId: this.randomUuid(),
+        canonicalPath,
+        kind: 'bot-home',
+        state: 'active',
+        version: 1,
+      });
+      return inserted.accepted ? inserted.value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** 仅 Main：把临时会话根目录登记为 scratch 项目（按路径幂等，目录不存在则创建） */
+  ensureScratchProject(dir: string): ProjectAuthorityProjection | undefined {
+    try {
+      mkdirSync(dir, { recursive: true });
+      const canonicalPath = realpathSync(dir);
+      const existing = this.findActiveByIdentity(`scratch:${canonicalPath}`);
+      if (existing) return { ...existing };
+      const inserted = this.insertProject({
+        projectId: this.randomUuid(),
+        canonicalPath,
+        kind: 'scratch',
+        state: 'active',
+        version: 1,
+      });
+      return inserted.accepted ? inserted.value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** 仅 Main：把秘书工作区登记为隐藏项目（按路径幂等，目录不存在则创建） */
+  ensureSecretaryProject(dir: string): ProjectAuthorityProjection | undefined {
+    try {
+      mkdirSync(dir, { recursive: true });
+      const canonicalPath = realpathSync(dir);
+      const existing = this.findActiveByIdentity(`secretary:${canonicalPath}`);
+      if (existing) return { ...existing };
+      const inserted = this.insertProject({
+        projectId: this.randomUuid(),
+        canonicalPath,
+        kind: 'secretary',
+        state: 'active',
+        version: 1,
+      });
+      return inserted.accepted ? inserted.value : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** 删除秘书时撤掉它的隐藏项目：只认 secretary 类，不碰用户项目 */
+  removeSecretaryProject(projectId: string): boolean {
+    const project = this.projects.get(projectId);
+    if (project?.kind !== 'secretary' || project.state !== 'active') return false;
+    this.markProjectRemoved(project);
+    this.commit();
+    return true;
+  }
+
+  removeBotHomeProject(projectId: string): boolean {
+    const project = this.projects.get(projectId);
+    if (project?.kind !== 'bot-home' || project.state !== 'active') return false;
+    this.markProjectRemoved(project);
+    this.commit();
+    return true;
+  }
+
+  botHomeProject(dir: string): ProjectAuthorityProjection | undefined {
+    try {
+      const existing = this.findActiveByIdentity(`bot-home:${realpathSync(dir)}`);
+      return existing ? { ...existing } : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** 远端目录存在性由 IPC handler 先行 ssh 校验（registry 保持同步契约），这里只做路径规范化与去重 */
+  private createSshProject(
+    request: CreateProjectAuthorityRequest
+  ): AuthorityMutationResult<ProjectAuthorityProjection> {
+    const connectionId = request.sshConnectionId;
+    if (typeof connectionId !== 'string' || connectionId.length === 0) {
+      return { accepted: false, error: 'Remote project requires an SSH connection.' };
+    }
+    const connection = this.options.resolveSshConnection?.(connectionId);
+    if (!connection) return { accepted: false, error: 'SSH 连接不存在。' };
+    const sshHost = resolveSshTarget(connection);
+    const canonicalPath = normalizeRemoteProjectPath(request.path);
+    if (!canonicalPath) return { accepted: false, error: 'Remote project path must be absolute.' };
+    const existing = this.findActiveByIdentity(`ssh:${connectionId}:${canonicalPath}`);
+    if (existing) return { accepted: true, value: this.hydrateProject(existing) };
+    return this.insertProject({
+      projectId: this.randomUuid(),
+      canonicalPath,
+      kind: 'ssh',
+      sshHost,
+      sshConnectionId: connectionId,
+      state: 'active',
+      version: 1,
+    });
+  }
+
+  notifyProjection(): void {
+    this.options.onChanged?.(this.rendererProjection());
+  }
+
+  sshConnectionInUse(connectionId: string): boolean {
+    return [...this.projects.values()].some(
+      (project) =>
+        project.state === 'active' &&
+        project.kind === 'ssh' &&
+        project.sshConnectionId === connectionId
+    );
+  }
+
+  private insertProject(
+    value: ProjectAuthority
+  ): AuthorityMutationResult<ProjectAuthorityProjection> {
+    this.projects.set(value.projectId, value);
+    this.commit();
+    return { accepted: true, value: this.hydrateProject(value) };
+  }
+
+  selectProject(
+    request: SelectProjectAuthorityRequest
+  ): AuthorityMutationResult<ProjectAuthorityProjection> {
+    const project = this.projects.get(request.projectId);
+    return project &&
+      project.kind !== 'bot-home' &&
+      project.state === 'active' &&
+      project.version === request.version
+      ? { accepted: true, value: this.hydrateProject(project) }
+      : { accepted: false, error: 'Project authority is stale or unavailable.' };
+  }
+
+  removeProject(
+    request: RemoveProjectAuthorityRequest
+  ): AuthorityMutationResult<ProjectAuthorityProjection> {
+    const project = this.projects.get(request.projectId);
+    if (
+      project?.state !== 'active' ||
+      project.kind === 'bot-home' ||
+      project.kind === 'scratch' ||
+      project.kind === 'secretary' ||
+      project.version !== request.version
+    ) {
+      return { accepted: false, error: 'Project authority is stale or unavailable.' };
+    }
+    this.markProjectRemoved(project);
+    this.commit();
+    return { accepted: true, value: { ...project } };
+  }
+
+  private markProjectRemoved(project: ProjectAuthority): void {
+    project.state = 'removed';
+    project.version += 1;
+    for (const conversation of this.conversations.values()) {
+      if (conversation.projectId === project.projectId && conversation.lifecycle !== 'ended') {
+        conversation.lifecycle = 'ended';
+        conversation.version += 1;
+      }
+    }
+  }
+
+  createConversation(
+    request: CreateConversationAuthorityRequest
+  ): AuthorityMutationResult<ConversationAuthorityProjection> {
+    const project = this.projects.get(request.projectId);
+    if (
+      project?.state !== 'active' ||
+      project.kind === 'bot-home' ||
+      project.version !== request.projectVersion
+    ) {
+      return { accepted: false, error: 'Project authority is stale or unavailable.' };
+    }
+    if (request.conversationId) {
+      if (!validId(request.conversationId)) {
+        return { accepted: false, error: 'Conversation authority is stale or unavailable.' };
+      }
+      const existing = this.conversations.get(request.conversationId);
+      if (existing) {
+        return existing.projectId === project.projectId &&
+          existing.kind === 'root' &&
+          existing.lifecycle !== 'ended' &&
+          !existing.bot
+          ? { accepted: true, value: this.copyConversation(existing) }
+          : { accepted: false, error: 'Conversation authority is stale or unavailable.' };
+      }
+    }
+    const value: ConversationAuthority = {
+      conversationId: request.conversationId ?? this.randomUuid(),
+      projectId: project.projectId,
+      kind: 'root',
+      lifecycle: 'draft',
+      version: 1,
+      ...(request.forkedFrom ? { forkedFrom: { ...request.forkedFrom } } : {}),
+    };
+    this.conversations.set(value.conversationId, value);
+    this.commit();
+    return { accepted: true, value: this.copyConversation(value) };
+  }
+
+  /** 仅 Main：为 Bot 成员新建根会话（项目须 active 且不是 ssh） */
+  createBotConversation(
+    projectId: string,
+    bot: ConversationBotBinding
+  ): ConversationAuthorityProjection | undefined {
+    const project = this.projects.get(projectId);
+    if (project?.state !== 'active' || project.kind === 'ssh') return undefined;
+    const value: ConversationAuthority = {
+      conversationId: this.randomUuid(),
+      projectId,
+      kind: 'root',
+      lifecycle: 'draft',
+      version: 1,
+      bot: { ...bot },
+    };
+    this.conversations.set(value.conversationId, value);
+    this.commit();
+    return this.copyConversation(value);
+  }
+
+  endBotConversation(conversationId: string): ConversationAuthorityProjection | undefined {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation?.bot) return undefined;
+    if (conversation.lifecycle !== 'ended') {
+      conversation.lifecycle = 'ended';
+      conversation.version += 1;
+      this.commit();
+    }
+    return this.copyConversation(conversation);
+  }
+
+  /** 仅 Main：私聊切回旧对话时重新打开（所属项目须仍 active） */
+  reopenBotConversation(conversationId: string): ConversationAuthorityProjection | undefined {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation?.bot) return undefined;
+    if (this.projects.get(conversation.projectId)?.state !== 'active') return undefined;
+    if (conversation.lifecycle === 'ended') {
+      conversation.lifecycle = conversation.sessionFile ? 'ready' : 'draft';
+      conversation.version += 1;
+      this.commit();
+    }
+    return this.copyConversation(conversation);
+  }
+
+  removeBotConversation(conversationId: string): ConversationAuthorityProjection | undefined {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation?.bot) return undefined;
+    this.conversations.delete(conversationId);
+    this.commit();
+    return this.copyConversation(conversation);
+  }
+
+  selectConversation(
+    request: ConversationAuthorityRequest
+  ): AuthorityMutationResult<ConversationAuthorityProjection> {
+    const conversation = this.currentConversation(request);
+    return conversation
+      ? { accepted: true, value: this.copyConversation(conversation) }
+      : { accepted: false, error: 'Conversation authority is stale or unavailable.' };
+  }
+
+  endConversation(
+    request: ConversationAuthorityRequest
+  ): AuthorityMutationResult<ConversationAuthorityProjection> {
+    const conversation = this.currentConversation(request);
+    if (!conversation)
+      return { accepted: false, error: 'Conversation authority is stale or unavailable.' };
+    conversation.lifecycle = 'ended';
+    conversation.version += 1;
+    this.commit();
+    return { accepted: true, value: this.copyConversation(conversation) };
+  }
+
+  removeConversation(
+    request: ConversationAuthorityRequest
+  ): AuthorityMutationResult<ConversationAuthorityProjection> {
+    const conversation = this.conversations.get(request.conversationId);
+    if (!conversation || conversation.bot || conversation.version !== request.version) {
+      return { accepted: false, error: 'Conversation authority is stale or unavailable.' };
+    }
+    this.conversations.delete(conversation.conversationId);
+    this.commit();
+    return { accepted: true, value: this.copyConversation(conversation) };
+  }
+
+  moveConversation(
+    conversationId: string,
+    targetProjectId: string,
+    options?: { running?: boolean; worktreeBusy?: boolean }
+  ): AuthorityMutationResult<ConversationAuthorityProjection> {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation || conversation.bot) {
+      return { accepted: false, error: 'not-found' };
+    }
+    if (this.projects.get(conversation.projectId)?.kind === 'secretary') {
+      return { accepted: false, error: 'source-secretary' };
+    }
+    const targetError = this.moveTargetError(targetProjectId);
+    if (targetError) return { accepted: false, error: targetError };
+    if (conversation.projectId === targetProjectId) {
+      return { accepted: true, value: this.copyConversation(conversation) };
+    }
+    if (options?.running) {
+      return { accepted: false, error: 'running' };
+    }
+    if (options?.worktreeBusy) {
+      return { accepted: false, error: 'worktree-busy' };
+    }
+    conversation.projectId = targetProjectId;
+    conversation.version += 1;
+    this.commit();
+    return { accepted: true, value: this.copyConversation(conversation) };
+  }
+
+  /** 批量改挂：目标不可用整批拒绝；逐条拒绝的跳过并回报；被接受的一次落盘、一次广播 */
+  moveConversations(
+    requests: readonly { conversationId: string; running?: boolean; worktreeBusy?: boolean }[],
+    targetProjectId: string
+  ): AuthorityMutationResult<{
+    moved: string[];
+    skipped: { conversationId: string; error: string }[];
+  }> {
+    const targetError = this.moveTargetError(targetProjectId);
+    if (targetError) return { accepted: false, error: targetError };
+    const moved: string[] = [];
+    const skipped: { conversationId: string; error: string }[] = [];
+    for (const { conversationId, running, worktreeBusy } of requests) {
+      const conversation = this.conversations.get(conversationId);
+      const error =
+        !conversation || conversation.bot || conversation.lifecycle === 'ended'
+          ? 'not-found'
+          : this.projects.get(conversation.projectId)?.kind === 'secretary'
+            ? 'source-secretary'
+            : running
+              ? 'running'
+              : worktreeBusy
+                ? 'worktree-busy'
+                : undefined;
+      if (error || !conversation) {
+        skipped.push({ conversationId, error: error ?? 'not-found' });
+        continue;
+      }
+      if (conversation.projectId === targetProjectId) continue;
+      conversation.projectId = targetProjectId;
+      conversation.version += 1;
+      moved.push(conversationId);
+    }
+    if (moved.length > 0) this.commit();
+    return { accepted: true, value: { moved, skipped } };
+  }
+
+  private moveTargetError(targetProjectId: string): string | undefined {
+    const target = this.projects.get(targetProjectId);
+    if (target?.state !== 'active' || target.kind === 'bot-home' || target.kind === 'secretary') {
+      return 'target-unavailable';
+    }
+    if (target.kind === 'scratch') return 'target-scratch';
+    return undefined;
+  }
+
+  /** 仅 Main：整批登记复制出的根会话，一次落盘、一次广播；任一条不合法则整批拒绝 */
+  insertConversations(
+    targetProjectId: string,
+    records: readonly Pick<
+      ConversationAuthority,
+      'conversationId' | 'lifecycle' | 'sessionFile' | 'selection' | 'forkedFrom'
+    >[]
+  ): AuthorityMutationResult<string[]> {
+    const targetError = this.moveTargetError(targetProjectId);
+    if (targetError) return { accepted: false, error: targetError };
+    const ids = new Set(records.map((record) => record.conversationId));
+    if (
+      ids.size !== records.length ||
+      records.some(
+        (record) =>
+          !validId(record.conversationId) ||
+          this.conversations.has(record.conversationId) ||
+          record.lifecycle === 'ended'
+      )
+    ) {
+      return { accepted: false, error: 'invalid' };
+    }
+    for (const record of records) {
+      this.conversations.set(record.conversationId, {
+        conversationId: record.conversationId,
+        projectId: targetProjectId,
+        kind: 'root',
+        lifecycle: record.lifecycle,
+        version: 1,
+        ...(record.sessionFile ? { sessionFile: record.sessionFile } : {}),
+        ...(record.selection ? { selection: { ...record.selection } } : {}),
+        ...(record.forkedFrom ? { forkedFrom: { ...record.forkedFrom } } : {}),
+      });
+    }
+    if (records.length > 0) this.commit();
+    return { accepted: true, value: [...ids] };
+  }
+
+  /** 仅 Main：撤回 insertConversations 登记的会话（复制失败回滚） */
+  discardConversations(conversationIds: readonly string[]): void {
+    let changed = false;
+    for (const id of conversationIds) changed = this.conversations.delete(id) || changed;
+    if (changed) this.commit();
+  }
+
+  updateSelection(
+    request: UpdateConversationSelectionRequest
+  ): AuthorityMutationResult<ConversationAuthorityProjection> {
+    const conversation = this.currentConversation(request);
+    if (!conversation)
+      return { accepted: false, error: 'Conversation authority is stale or unavailable.' };
+    const revision = (conversation.selection?.revision ?? 0) + 1;
+    conversation.selection = { ...request.selection, revision };
+    conversation.version += 1;
+    this.commit();
+    return { accepted: true, value: this.copyConversation(conversation) };
+  }
+
+  markReady(
+    conversationId: string,
+    sessionFile: string,
+    model: ModelRef,
+    forkedFrom?: ConversationAuthority['forkedFrom']
+  ): void {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation || conversation.lifecycle === 'ended') return;
+    conversation.lifecycle = 'ready';
+    conversation.sessionFile = sessionFile;
+    if (forkedFrom) conversation.forkedFrom = { ...forkedFrom };
+    if (
+      !conversation.selection ||
+      conversation.selection.providerId !== model.providerId ||
+      conversation.selection.modelId !== model.modelId
+    ) {
+      conversation.selection = { ...model, revision: (conversation.selection?.revision ?? 0) + 1 };
+    }
+    conversation.version += 1;
+    this.commit();
+  }
+
+  private currentConversation(request: ConversationAuthorityRequest): ConversationAuthority | null {
+    const conversation = this.conversations.get(request.conversationId);
+    const project = conversation ? this.projects.get(conversation.projectId) : undefined;
+    return conversation &&
+      !conversation.bot &&
+      conversation.lifecycle !== 'ended' &&
+      conversation.version === request.version &&
+      project?.state === 'active'
+      ? conversation
+      : null;
+  }
+
+  private copyConversation(value: ConversationAuthority): ConversationAuthorityProjection {
+    return {
+      ...value,
+      ...(value.selection ? { selection: { ...value.selection } } : {}),
+      ...(value.forkedFrom ? { forkedFrom: { ...value.forkedFrom } } : {}),
+      ...(value.bot ? { bot: { ...value.bot } } : {}),
+    };
+  }
+
+  private commit(): void {
+    mkdirSync(path.dirname(this.options.registryFile), { recursive: true });
+    const temporary = `${this.options.registryFile}.tmp`;
+    const state: PersistedAuthority = {
+      migrationVersion: 1,
+      projects: [...this.projects.values()],
+      conversations: [...this.conversations.values()],
+    };
+    writeFileSync(temporary, JSON.stringify(state), { encoding: 'utf8', mode: 0o600 });
+    renameSync(temporary, this.options.registryFile);
+    this.options.onChanged?.(this.rendererProjection());
+  }
+
+  private findActiveByIdentity(identity: string): ProjectAuthority | undefined {
+    return [...this.projects.values()].find(
+      (project) => project.state === 'active' && projectIdentity(project) === identity
+    );
+  }
+
+  /** 把磁盘/遗留数据折成当前身份：规范化路径，同身份只留最早一条，会话并过去。 */
+  private normalizeLoadedProjects(): boolean {
+    let changed = false;
+    const keepers = new Map<string, ProjectAuthority>();
+    const remap = new Map<string, string>();
+    for (const project of this.projects.values()) {
+      const normalized = normalizeStoredProject(project);
+      if (normalized.canonicalPath !== project.canonicalPath) {
+        project.canonicalPath = normalized.canonicalPath;
+        changed = true;
+      }
+      if (project.state !== 'active') continue;
+      const identity = projectIdentity(project);
+      const keeper = keepers.get(identity);
+      if (!keeper) {
+        keepers.set(identity, project);
+        continue;
+      }
+      project.state = 'removed';
+      project.version += 1;
+      remap.set(project.projectId, keeper.projectId);
+      changed = true;
+    }
+    for (const conversation of this.conversations.values()) {
+      const nextProjectId = remap.get(conversation.projectId);
+      if (!nextProjectId) continue;
+      conversation.projectId = nextProjectId;
+      conversation.version += 1;
+      changed = true;
+    }
+    return changed;
+  }
+
+  private load(): boolean {
+    if (!existsSync(this.options.registryFile)) return false;
+    try {
+      const parsed = JSON.parse(
+        readFileSync(this.options.registryFile, 'utf8')
+      ) as PersistedAuthority;
+      if (
+        parsed.migrationVersion !== 1 ||
+        !Array.isArray(parsed.projects) ||
+        !Array.isArray(parsed.conversations)
+      )
+        return false;
+      for (const project of parsed.projects) {
+        if (validId(project.projectId) && typeof project.canonicalPath === 'string')
+          this.projects.set(project.projectId, project);
+      }
+      for (const conversation of parsed.conversations) {
+        if (
+          validId(conversation.conversationId) &&
+          this.projects.has(conversation.projectId) &&
+          conversation.kind === 'root'
+        ) {
+          this.conversations.set(conversation.conversationId, conversation);
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private migrateLegacy(settings: Record<string, unknown> | null | undefined): void {
+    const state = record(record(settings?.['enso-settings'])?.state);
+    const projects = Array.isArray(state?.projects) ? state.projects : [];
+    const remap = new Map<string, string>();
+    for (const raw of projects) {
+      const project = record(raw);
+      if (!validId(project?.id) || typeof project?.path !== 'string') continue;
+      try {
+        const canonicalPath = realpathSync(project.path);
+        if (!statSync(canonicalPath).isDirectory()) continue;
+        const existing = [...this.projects.values()].find(
+          (candidate) =>
+            candidate.state === 'active' &&
+            candidate.kind !== 'ssh' &&
+            candidate.canonicalPath === canonicalPath
+        );
+        if (existing) {
+          if (existing.projectId !== project.id) remap.set(project.id, existing.projectId);
+          continue;
+        }
+        this.projects.set(project.id, {
+          projectId: project.id,
+          canonicalPath,
+          state: 'active',
+          version: 1,
+        });
+      } catch {}
+    }
+    const conversationState = record(record(settings?.['enso-conversations'])?.state);
+    const conversations = record(conversationState?.conversations);
+    if (conversations) {
+      for (const [conversationId, raw] of Object.entries(conversations)) {
+        const conversation = record(raw);
+        const projectId =
+          typeof conversation?.projectId === 'string'
+            ? (remap.get(conversation.projectId) ?? conversation.projectId)
+            : undefined;
+        if (
+          !conversation ||
+          !validId(conversationId) ||
+          conversation.parentId ||
+          !validId(projectId) ||
+          !this.projects.has(projectId)
+        )
+          continue;
+        const sessionFile = this.validLegacySessionFile(conversation.sessionFile);
+        const providerId =
+          typeof conversation.lastProviderId === 'string' ? conversation.lastProviderId : undefined;
+        const modelId =
+          typeof conversation.lastModelId === 'string' ? conversation.lastModelId : undefined;
+        this.conversations.set(conversationId, {
+          conversationId,
+          projectId,
+          kind: 'root',
+          lifecycle: sessionFile ? 'ready' : 'draft',
+          version: 1,
+          ...(sessionFile ? { sessionFile } : {}),
+          ...(providerId && modelId ? { selection: { providerId, modelId, revision: 1 } } : {}),
+        });
+      }
+    }
+    this.commit();
+  }
+
+  private validLegacySessionFile(value: unknown): string | undefined {
+    if (typeof value !== 'string' || !this.options.safeSessionRoot) return undefined;
+    try {
+      const root = realpathSync(this.options.safeSessionRoot);
+      const file = realpathSync(value);
+      return file.startsWith(`${root}${path.sep}`) && statSync(file).isFile() ? file : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+}

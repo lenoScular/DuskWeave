@@ -1,0 +1,180 @@
+import { execFileSync } from 'node:child_process';
+import { readdirSync } from 'node:fs';
+import path from 'node:path';
+
+export interface FileSearchResult {
+  /** 相对 root 的路径 */
+  relativePath: string;
+  name: string;
+}
+
+/** 扫描时跳过的目录：依赖、构建产物、版本库 */
+const IGNORED_DIRS = new Set([
+  'node_modules',
+  '.git',
+  'dist',
+  'out',
+  'build',
+  'coverage',
+  '.next',
+  '.venv',
+  'venv',
+  '__pycache__',
+  'target',
+]);
+
+const JUNK_FILES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini']);
+const MAX_DEPTH = 32;
+const MAX_FILES = 20_000;
+
+function isJunkFile(name: string): boolean {
+  return JUNK_FILES.has(name);
+}
+
+function hasIgnoredDir(relativePath: string): boolean {
+  return relativePath.split(/[\\/]/).some((part) => IGNORED_DIRS.has(part));
+}
+
+function toPosix(relativePath: string): string {
+  return relativePath.replaceAll('\\', '/');
+}
+
+/** 从文件路径合成祖先目录，目录相对路径统一 posix 且带尾 / */
+function ancestorDirectories(files: readonly string[]): string[] {
+  const dirs = new Set<string>();
+  for (const file of files) {
+    const parts = toPosix(file).split('/');
+    for (let i = 1; i < parts.length; i++) {
+      dirs.add(`${parts.slice(0, i).join('/')}/`);
+    }
+  }
+  return [...dirs];
+}
+
+function entryName(relativePath: string): string {
+  const trimmed = toPosix(relativePath).replace(/\/+$/, '');
+  return trimmed.split('/').at(-1) || trimmed;
+}
+
+function listGitFiles(root: string): string[] | null {
+  try {
+    const inside = execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: 2000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    }).trim();
+    if (inside !== 'true') return null;
+    const raw = execFileSync(
+      'git',
+      ['ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', '.'],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        timeout: 4000,
+        maxBuffer: 32 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      }
+    );
+    return raw
+      .split('\0')
+      .filter(Boolean)
+      .map((rel) => path.normalize(rel))
+      .filter((rel) => !hasIgnoredDir(rel) && !isJunkFile(path.basename(rel)));
+  } catch {
+    return null;
+  }
+}
+
+function walkFiles(root: string): string[] {
+  const results: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    if (depth > MAX_DEPTH || results.length >= MAX_FILES) return;
+    let entries: import('node:fs').Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (results.length >= MAX_FILES) return;
+      if (entry.name.startsWith('.') && entry.isDirectory()) continue;
+      if (entry.isDirectory()) {
+        if (IGNORED_DIRS.has(entry.name)) continue;
+        walk(path.join(dir, entry.name), depth + 1);
+      } else if (entry.isFile()) {
+        if (isJunkFile(entry.name)) continue;
+        results.push(path.relative(root, path.join(dir, entry.name)));
+      }
+    }
+  };
+  walk(root, 0);
+  return results;
+}
+
+/** 递归列出 root 下的文件（相对路径）。git 仓库走 ignore 规则，否则目录忽略 + 深度/数量上限 */
+export function listFiles(root: string): string[] {
+  return listGitFiles(root) ?? walkFiles(root);
+}
+
+/**
+ * 子序列模糊评分：query 的字符须按序出现在 target 中，否则 0。
+ * 连续命中与分隔符后命中加分，越靠前越高。
+ */
+export function fuzzyScore(query: string, target: string): number {
+  if (!query) return 1;
+  const q = query.toLowerCase();
+  const t = target.toLowerCase();
+  let score = 0;
+  let ti = 0;
+  let lastHit = -2;
+  for (let qi = 0; qi < q.length; qi++) {
+    const idx = t.indexOf(q[qi], ti);
+    if (idx === -1) return 0;
+    score += idx === lastHit + 1 ? 4 : 1;
+    if (idx === 0 || t[idx - 1] === '/' || t[idx - 1] === '.' || t[idx - 1] === '-') score += 1;
+    lastHit = idx;
+    ti = idx + 1;
+  }
+  return score / (1 + t.length / 100);
+}
+
+/** 在 root 下按文件名/路径模糊搜索；目录由文件路径合成，相对路径带尾 / */
+export function searchFiles(root: string, query: string, maxResults = 10): FileSearchResult[] {
+  const files = listFiles(root);
+  const entries: FileSearchResult[] = [
+    ...ancestorDirectories(files).map((relativePath) => ({
+      relativePath,
+      name: entryName(relativePath),
+    })),
+    ...files.map((relativePath) => ({
+      relativePath,
+      name: path.basename(relativePath),
+    })),
+  ];
+  const trimmed = query.trim();
+  if (!trimmed) {
+    return entries
+      .sort(
+        (a, b) =>
+          a.relativePath.length - b.relativePath.length ||
+          a.relativePath.localeCompare(b.relativePath)
+      )
+      .slice(0, maxResults)
+      .map(({ relativePath, name }) => ({ relativePath, name }));
+  }
+  const needle = trimmed.toLowerCase();
+  return entries
+    .map((entry) => {
+      const { relativePath, name } = entry;
+      let score = Math.max(fuzzyScore(trimmed, name) * 2, fuzzyScore(trimmed, relativePath));
+      if (name.toLowerCase() === needle) score += 1000;
+      return { relativePath, name, score };
+    })
+    .filter((r) => r.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxResults)
+    .map(({ relativePath, name }) => ({ relativePath, name }));
+}

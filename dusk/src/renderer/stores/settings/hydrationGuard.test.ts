@@ -1,0 +1,160 @@
+import type { SourceAuthorityProjection } from '@shared/types';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+import type * as SettingsModule from './index';
+import { SETTINGS_VERSION } from './migrate';
+
+const writeKey = vi.fn(async () => undefined);
+let resolveRead: (value: Record<string, unknown> | null) => void = () => {};
+const readSettings = vi.fn(
+  () =>
+    new Promise<Record<string, unknown> | null>((resolve) => {
+      resolveRead = resolve;
+    })
+);
+const sourceAuthorityRead = vi.fn(async () => ({ projects: [], conversations: [] }));
+let projectionListener: ((projection: SourceAuthorityProjection) => void) | null = null;
+
+vi.stubGlobal('navigator', { language: 'en-US' });
+vi.stubGlobal('document', {
+  documentElement: {
+    dataset: {},
+    lang: 'en',
+    classList: { toggle: vi.fn() },
+    style: { setProperty: vi.fn(), removeProperty: vi.fn() },
+  },
+});
+vi.stubGlobal('window', {
+  matchMedia: () => ({ matches: false, addEventListener: vi.fn() }),
+  electronAPI: {
+    settings: { read: readSettings, writeKey, onChanged: vi.fn() },
+    sourceAuthority: {
+      read: sourceAuthorityRead,
+      onChanged: vi.fn((listener: (projection: SourceAuthorityProjection) => void) => {
+        projectionListener = listener;
+        return vi.fn();
+      }),
+    },
+    instructions: { delete: vi.fn(async () => ({ ok: true })) },
+  },
+});
+
+let settingsModule: typeof SettingsModule;
+
+const projection = (paths: string[]) =>
+  ({
+    projects: paths.map((path, i) => ({
+      projectId: `p${i}`,
+      canonicalPath: path,
+      state: 'active',
+      version: 1,
+    })),
+    conversations: [],
+  }) as unknown as SourceAuthorityProjection;
+
+const providers = [{ id: 'prov', name: 'P', baseUrl: 'https://x', apiKey: 'k' }];
+const persisted = { 'enso-settings': { version: SETTINGS_VERSION, state: { providers } } };
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+const writtenProviders = () =>
+  writeKey.mock.calls.map(
+    (call) =>
+      (call as unknown as [string, { state: SettingsModule.SettingsState }])[1].state.providers
+  );
+
+describe('settings persist hydration guard', () => {
+  beforeAll(async () => {
+    settingsModule = await import('./index');
+  });
+
+  it('drops every write that lands before persist has merged the first read', async () => {
+    // 设置窗刚起：settings.read 还没回，Main 的 source-authority 广播先到
+    projectionListener?.(projection(['/tmp/alpha']));
+    await flush();
+    expect(settingsModule.useSettingsStore.getState().projects).toHaveLength(1);
+    expect(writeKey).not.toHaveBeenCalled();
+
+    // 回包已到但 getItem 还没结算、persist 还没 merge：同一 tick 内再来一条广播
+    resolveRead(persisted);
+    projectionListener?.(projection(['/tmp/alpha', '/tmp/beta']));
+    // adapter 的 await read() 已结算、persist 的 parse → merge 还在后面几个 microtask：
+    // 这段时间内存仍是 initialState，setState 一样不得落盘
+    await Promise.resolve();
+    await Promise.resolve();
+    projectionListener?.(projection(['/tmp/alpha', '/tmp/beta', '/tmp/gamma']));
+    await flush();
+    expect(settingsModule.useSettingsStore.getState().providers).toEqual(providers);
+    // version 与当前一致，无 migrate 回写；水合后 onRehydrateStorage 的补写（老用户标 onboarded、
+    // 重投影）允许发生，但每一次落盘都必须带着磁盘上的真实 providers —— 空默认值一次都不能出现
+    expect(writeKey).toHaveBeenCalled();
+    expect(writtenProviders().every((p) => p.length === 1)).toBe(true);
+
+    const before = writeKey.mock.calls.length;
+    settingsModule.useSettingsStore.getState().setTheme('dark');
+    await flush();
+    expect(writeKey).toHaveBeenCalledTimes(before + 1);
+    expect(writtenProviders().at(-1)).toEqual(providers);
+  });
+});
+
+describe('settings sync from another window', () => {
+  it('re-reads when a local write raced the in-flight rehydrate, so the local change survives', async () => {
+    const store = settingsModule.useSettingsStore;
+    const onChanged = (
+      window as unknown as { electronAPI: { settings: { onChanged: ReturnType<typeof vi.fn> } } }
+    ).electronAPI.settings.onChanged;
+    const listener = onChanged.mock.calls[0]?.[0] as (() => void) | undefined;
+    expect(listener).toBeTypeOf('function');
+
+    const onDisk = (theme: string) => ({
+      'enso-settings': { version: SETTINGS_VERSION, state: { ...store.getState(), theme } },
+    });
+    // 另一窗口写入 → 本窗口开始重读；回包在途时用户本地改了主题
+    readSettings.mockClear();
+    listener?.();
+    expect(readSettings).toHaveBeenCalledTimes(1);
+    store.getState().setTheme('dark');
+    await Promise.resolve();
+    // 主进程按 IPC 顺序先答复重读（旧快照 system），再处理我们的 writeKey
+    resolveRead(onDisk('system'));
+    await flush();
+
+    // 必须再读一次拿到含本地写入的最新缓存，而不是停在旧快照上
+    expect(readSettings).toHaveBeenCalledTimes(2);
+    resolveRead(onDisk('dark'));
+    await flush();
+    expect(store.getState().theme).toBe('dark');
+  });
+});
+
+describe('settings subagent model availability', () => {
+  it('单条关闭落盘后可水合恢复，再开启不丢覆盖且不修改邻居', async () => {
+    const store = settingsModule.useSettingsStore;
+    const entry = {
+      id: 'sub-model',
+      providerId: 'prov',
+      modelId: 'model',
+      description: '保留说明',
+      reasoning: 'off' as const,
+      thinkingLevel: 'high' as const,
+    };
+    const neighbor = { ...entry, id: 'neighbor', enabled: true };
+    store.setState({ subagentModels: [entry, neighbor], subagentModelsEnabled: true });
+    store.getState().updateSubagentModel(entry.id, { enabled: false });
+    await flush();
+    const disabled = [{ ...entry, enabled: false }, neighbor];
+    expect(writeKey).toHaveBeenLastCalledWith(
+      'enso-settings',
+      expect.objectContaining({ state: expect.objectContaining({ subagentModels: disabled }) })
+    );
+    const saved = JSON.parse(JSON.stringify(store.getState()));
+    store.setState({ subagentModels: [] });
+    const hydration = store.persist.rehydrate();
+    resolveRead({ 'enso-settings': { version: SETTINGS_VERSION, state: saved } });
+    await hydration;
+    expect(store.getState().subagentModels).toEqual(disabled);
+    store.getState().updateSubagentModel(entry.id, { enabled: true });
+    expect(store.getState().subagentModels).toEqual([{ ...entry, enabled: true }, neighbor]);
+    expect(store.getState().subagentModelsEnabled).toBe(true);
+    expect(store.getState().providers).toEqual(providers);
+  });
+});

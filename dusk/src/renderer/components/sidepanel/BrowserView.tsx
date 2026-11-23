@@ -1,0 +1,495 @@
+import type { BrowserTabState } from '@shared/types/browser';
+import { ArrowLeft, ArrowRight, Bug, Globe, Hand, RotateCw } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import {
+  insertComposerImage,
+  insertUiElementMention,
+  requestFocusComposer,
+} from '@/components/chat/composerMentionBridge';
+import { addToast } from '@/components/ui/toast';
+import { useI18n } from '@/i18n';
+import { syncOverlayGuard } from '@/lib/overlayGuard';
+import { resolveSidePanelDockConversationId } from '@/lib/sidePanelDockId';
+import { cn } from '@/lib/utils';
+import { useSessionsStore } from '@/stores/sessions';
+import { useSidePanelShown, useSidePanelStore } from '@/stores/sidePanel';
+import {
+  AnnotateToolbarControl,
+  BrowserAnnotateStageOverlay,
+  DesignFrameRing,
+  DesignHintBar,
+  useBrowserAnnotateSession,
+} from './BrowserAnnotateOverlay';
+import { isCoveredBy, overlayBoxes } from './overlayCover';
+import { usePanelHotkeyTarget } from './panelVisibility';
+
+const EMPTY: BrowserTabState = {
+  tabId: null,
+  url: '',
+  title: '',
+  favicon: null,
+  loading: false,
+  canGoBack: false,
+  canGoForward: false,
+  locked: false,
+  devtoolsOpen: false,
+  designMode: false,
+  holder: null,
+};
+
+type Rect = { x: number; y: number; width: number; height: number; radius?: number };
+
+const sameRect = (a: Rect | null, b: Rect | null) =>
+  a === b ||
+  (a !== null &&
+    b !== null &&
+    a.x === b.x &&
+    a.y === b.y &&
+    a.width === b.width &&
+    a.height === b.height &&
+    a.radius === b.radius);
+
+const MIN_PANE = 80;
+const DEFAULT_DEVTOOLS_RATIO = 0.42;
+
+function readBox(el: HTMLElement | null): Rect | null {
+  if (!el?.isConnected) return null;
+  const box = el.getBoundingClientRect();
+  if (box.width < 1 || box.height < 1) return null;
+  const rect: Rect = {
+    x: Math.round(box.left),
+    y: Math.round(box.top),
+    width: Math.round(box.width),
+    height: Math.round(box.height),
+  };
+  const radius = cardCornerRadius(el, box.bottom);
+  return radius > 0 ? { ...rect, radius } : rect;
+}
+
+/** 原生视图不受 CSS 圆角裁切：贴着圆角卡片底边时让 Main 给视图同样的圆角 */
+function cardCornerRadius(el: HTMLElement, bottom: number): number {
+  const card = el.closest<HTMLElement>('[data-slot="side-panel"]');
+  if (!card || Math.abs(card.getBoundingClientRect().bottom - bottom) > 1) return 0;
+  const style = getComputedStyle(card);
+  return (
+    Number.parseFloat(style.borderBottomLeftRadius) ||
+    Number.parseFloat(style.borderBottomRightRadius) ||
+    0
+  );
+}
+
+/**
+ * 真实网页由 Main 的 WebContentsView 画在主窗口上；这里只是一块占位 div，
+ * 负责把自己的屏幕矩形与可见性报给 Main，并渲染地址栏。
+ * 侧栏宽度动画 / 拖拽期间矩形连续变化，用 rAF 轮询比事件拼接更稳。
+ */
+/** BrowserView 宿主：Code 用 dockview 面板，Bot 右侧面板用固定 tab */
+export interface BrowserSurface {
+  readonly id: string;
+  readonly isActive: boolean;
+  readonly isVisible: boolean;
+  setTitle(title: string): void;
+  getParameters(): object | undefined;
+  updateParameters(params: object): void;
+}
+
+interface BrowserViewProps {
+  conversationId: string;
+  panelApi: BrowserSurface;
+  /** 宿主自行判定可见时传入（Bot 面板）；缺省按 Code 侧栏与当前会话判定 */
+  active?: boolean;
+}
+
+/** 浏览器版（远程桌面）看不到 Main 里的原生网页视图，只给说明 */
+function RemoteBrowserNotice() {
+  const { t } = useI18n();
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-muted-foreground text-sm">
+      <Globe className="h-6 w-6" />
+      <p>{t('The built-in browser is not available in full view. Check it on the computer.')}</p>
+    </div>
+  );
+}
+
+export function BrowserView(props: BrowserViewProps) {
+  return window.electronAPI.remote ? <RemoteBrowserNotice /> : <DesktopBrowserView {...props} />;
+}
+
+function DesktopBrowserView({ conversationId, panelApi, active }: BrowserViewProps) {
+  const { t } = useI18n();
+  const dockConversationId = useSessionsStore((s) =>
+    resolveSidePanelDockConversationId(s.conversations, conversationId)
+  );
+  const sidebarOpen = useSidePanelShown(dockConversationId);
+  const isActiveConversation = useSessionsStore((s) => s.activeId === dockConversationId);
+  const hostVisible = active ?? (sidebarOpen && isActiveConversation);
+  // 标注快捷键：Bot 面板由宿主传 active。Code 侧栏按可见优先，多个可见浏览器才用分组是否激活区分
+  const browserHotkeys = usePanelHotkeyTarget('browser', active === undefined);
+  const hotkeysActive = active ?? browserHotkeys;
+  const [state, setState] = useState<BrowserTabState>(EMPTY);
+  const [address, setAddress] = useState('');
+  const [editing, setEditing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [devtoolsRatio, setDevtoolsRatio] = useState(DEFAULT_DEVTOOLS_RATIO);
+  const [stageSize, setStageSize] = useState({ width: 800, height: 600 });
+  const hostRef = useRef<HTMLDivElement>(null);
+  const dtRef = useRef<HTMLDivElement>(null);
+  const splitRef = useRef<HTMLDivElement>(null);
+  const lastSent = useRef<Rect | null | undefined>(undefined);
+  const lastCovered = useRef(false);
+  const lastDt = useRef<Rect | null | undefined>(undefined);
+  const lastDtCovered = useRef(false);
+  const lockedRef = useRef(false);
+  lockedRef.current = state.locked;
+  const devtoolsOpenRef = useRef(false);
+  devtoolsOpenRef.current = state.devtoolsOpen;
+  // host 透明、真正露出网页时才挖壁纸；空白占位/加载中保留壁纸垫底
+  const showsPage =
+    (state.url.startsWith('http') || state.url.startsWith('file:')) && !state.loading;
+  const showsPageRef = useRef(false);
+  showsPageRef.current = showsPage;
+  const lastHole = useRef<Rect | null>(null);
+  const tabId = panelApi.id;
+
+  const annotate = useBrowserAnnotateSession({
+    tabId,
+    conversationId,
+    url: state.url,
+    designMode: state.designMode,
+    onDesignModeState: setState,
+    active: hotkeysActive,
+  });
+
+  useEffect(() => {
+    const node = hostRef.current;
+    if (!node) return;
+    const update = () => {
+      const rect = node.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        setStageSize({ width: Math.round(rect.width), height: Math.round(rect.height) });
+      }
+    };
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(node);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    return window.electronAPI.browser.onState((event) => {
+      if (event.tabId === tabId) setState(event.state);
+    });
+  }, [tabId]);
+
+  useEffect(() => {
+    return window.electronAPI.browser.onDesignMode((event) => {
+      if (event.tabId !== tabId) return;
+      if (
+        event.type === 'cancelled' ||
+        event.type === 'select' ||
+        event.type === 'drawing' ||
+        event.type === 'pin-click' ||
+        event.type === 'pins'
+      ) {
+        return;
+      }
+      let inserted = false;
+      if (event.type === 'annotated') {
+        inserted = event.image ? insertComposerImage(event.image) : false;
+      } else {
+        const id =
+          typeof crypto !== 'undefined' && 'randomUUID' in crypto
+            ? crypto.randomUUID()
+            : `ui-${Date.now()}`;
+        inserted = insertUiElementMention(
+          {
+            kind: 'ui-element',
+            id,
+            label: event.payload.label || event.payload.tag || 'element',
+            path: event.payload.path || event.payload.tag || 'element',
+            text: event.payload.text || event.payload.label || event.payload.tag || 'element',
+            imageId: `img-${id}`,
+          },
+          event.image
+        );
+      }
+      if (!inserted) addToast({ type: 'warning', title: t('No Composer for this selection') });
+      else requestFocusComposer();
+    });
+  }, [tabId, t]);
+
+  useEffect(() => {
+    if (!editing) setAddress(state.url);
+  }, [state.url, editing]);
+
+  useEffect(() => {
+    const title = state.title.trim() || t('Browser');
+    panelApi.setTitle(title);
+    panelApi.updateParameters({ ...panelApi.getParameters(), favicon: state.favicon });
+  }, [panelApi, state.title, state.favicon, t]);
+
+  useEffect(() => {
+    let raf = 0;
+    let disposed = false;
+    const root = document.getElementById('root');
+    // 挂载即全量重推：矩形 / covered 靠首帧必发，浮层状态靠这一次显式同步
+    syncOverlayGuard();
+    const tick = () => {
+      if (disposed) return;
+      const visible =
+        hostVisible &&
+        panelApi.isActive &&
+        panelApi.isVisible &&
+        document.visibilityState === 'visible';
+      const rect = visible ? readBox(hostRef.current) : null;
+      const covered =
+        rect !== null && (lockedRef.current || isCoveredBy(rect, overlayBoxes(document, root)));
+      if (
+        lastSent.current === undefined ||
+        !sameRect(lastSent.current, rect) ||
+        covered !== lastCovered.current
+      ) {
+        lastSent.current = rect;
+        lastCovered.current = covered;
+        void window.electronAPI.browser
+          .setViewport(tabId, conversationId, rect, covered)
+          .then(setState);
+      }
+      const hole = showsPageRef.current ? rect : null;
+      if (!sameRect(lastHole.current, hole)) {
+        lastHole.current = hole;
+        useSidePanelStore.getState().setBrowserHole(`${tabId}:guest`, hole);
+      }
+      const dtRect = visible && devtoolsOpenRef.current ? readBox(dtRef.current) : null;
+      const dtCovered = dtRect !== null && isCoveredBy(dtRect, overlayBoxes(document, root));
+      if (
+        lastDt.current === undefined ||
+        !sameRect(lastDt.current, dtRect) ||
+        dtCovered !== lastDtCovered.current
+      ) {
+        useSidePanelStore.getState().setBrowserHole(`${tabId}:devtools`, dtRect);
+        lastDt.current = dtRect;
+        lastDtCovered.current = dtCovered;
+        void window.electronAPI.browser
+          .setDevToolsViewport(tabId, conversationId, dtRect, dtCovered)
+          .then(setState);
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => {
+      disposed = true;
+      cancelAnimationFrame(raf);
+      const { setBrowserHole } = useSidePanelStore.getState();
+      setBrowserHole(`${tabId}:guest`, null);
+      setBrowserHole(`${tabId}:devtools`, null);
+      lastHole.current = null;
+      if (lastSent.current !== null) {
+        lastSent.current = null;
+        void window.electronAPI.browser.setViewport(tabId, conversationId, null);
+      }
+      if (lastDt.current !== null) {
+        lastDt.current = null;
+        void window.electronAPI.browser.setDevToolsViewport(tabId, conversationId, null);
+      }
+    };
+  }, [conversationId, tabId, panelApi, hostVisible]);
+
+  const submit = async () => {
+    setEditing(false);
+    const target = address.trim();
+    if (!target) return;
+    const result = await window.electronAPI.browser.navigate(tabId, conversationId, target);
+    setError(result.ok ? null : (result.error ?? t('Navigation failed')));
+  };
+
+  const onSplitPointer = (event: React.PointerEvent<HTMLDivElement>) => {
+    const host = hostRef.current;
+    const dt = dtRef.current;
+    if (!host || !dt) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const startY = event.clientY;
+    const startHost = host.getBoundingClientRect().height;
+    const startDt = dt.getBoundingClientRect().height;
+    const total = startHost + startDt;
+    const onMove = (move: globalThis.PointerEvent) => {
+      const nextDt = Math.min(
+        total - MIN_PANE,
+        Math.max(MIN_PANE, startDt - (move.clientY - startY))
+      );
+      setDevtoolsRatio(nextDt / total);
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  };
+
+  const iconButton =
+    'flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent';
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="flex h-[36px] shrink-0 items-center gap-1 border-b bg-background px-2">
+        <button
+          type="button"
+          className={iconButton}
+          disabled={state.locked || !state.canGoBack}
+          onClick={() => void window.electronAPI.browser.goBack(tabId)}
+          aria-label={t('Back')}
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          className={iconButton}
+          disabled={state.locked || !state.canGoForward}
+          onClick={() => void window.electronAPI.browser.goForward(tabId)}
+          aria-label={t('Forward')}
+        >
+          <ArrowRight className="h-3.5 w-3.5" />
+        </button>
+        <button
+          type="button"
+          className={iconButton}
+          disabled={state.locked || !state.tabId}
+          onClick={() => void window.electronAPI.browser.reload(tabId)}
+          aria-label={t('Reload')}
+        >
+          <RotateCw className={cn('h-3.5 w-3.5', state.loading && 'animate-spin')} />
+        </button>
+        <form
+          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md border bg-background px-2 py-0.5 text-xs focus-within:border-ring"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void submit();
+          }}
+        >
+          <Globe className="h-3 w-3 shrink-0 text-muted-foreground" />
+          <input
+            value={address}
+            onChange={(e) => setAddress(e.target.value)}
+            onFocus={(e) => {
+              setEditing(true);
+              e.target.select();
+            }}
+            onBlur={() => setEditing(false)}
+            placeholder={t('Enter a URL')}
+            spellCheck={false}
+            disabled={state.locked}
+            className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground disabled:opacity-60"
+          />
+        </form>
+        <AnnotateToolbarControl
+          tabId={tabId}
+          conversationId={conversationId}
+          active={state.designMode}
+          disabled={!state.tabId || state.locked || state.devtoolsOpen}
+          queueOpen={annotate.queueOpen}
+          onQueueOpenChange={annotate.setQueueOpen}
+          onToggleDesignMode={(next) => void annotate.setDesignMode(next)}
+          onOpenPinFromQueue={(item) => void annotate.openPinFromQueue(item)}
+          onSendQueue={annotate.sendQueue}
+        />
+        <button
+          type="button"
+          className={cn(iconButton, state.devtoolsOpen && 'bg-muted text-foreground')}
+          disabled={!state.tabId}
+          onClick={() =>
+            void window.electronAPI.browser.setDevTools(tabId, !state.devtoolsOpen).then(setState)
+          }
+          aria-label={t('Toggle Developer Tools')}
+          aria-pressed={state.devtoolsOpen}
+        >
+          <Bug className="h-3.5 w-3.5" />
+        </button>
+        {state.locked && (
+          <span className="flex shrink-0 items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-600 dark:text-amber-400">
+            <Hand className="h-3 w-3" />
+            {t('Enso is in control')}
+          </span>
+        )}
+      </div>
+      {state.designMode && (
+        <DesignHintBar
+          drawing={annotate.drawing}
+          pick={annotate.draftPick}
+          markupTool={annotate.markupTool}
+          editorOpen={annotate.openPin !== null}
+          onMarkupToolChange={annotate.handleMarkupToolChange}
+          onExit={() => void annotate.setDesignMode(false)}
+        />
+      )}
+      {error && (
+        <div className="border-b bg-destructive/10 px-3 py-1 text-xs text-destructive">{error}</div>
+      )}
+      <div className="flex min-h-0 flex-1 flex-col" data-slot="browser-native-stack">
+        <div
+          ref={hostRef}
+          className={cn(
+            'relative min-h-0',
+            state.devtoolsOpen ? 'shrink-0' : 'flex-1',
+            showsPage ? 'bg-transparent' : 'bg-background'
+          )}
+          style={state.devtoolsOpen ? { flex: `${1 - devtoolsRatio} 1 0` } : undefined}
+        >
+          <DesignFrameRing active={state.designMode} />
+          {state.designMode && (
+            <BrowserAnnotateStageOverlay
+              tabId={tabId}
+              conversationId={conversationId}
+              stageSize={stageSize}
+              draftPick={annotate.draftPick}
+              openPin={annotate.openPin}
+              markupTool={annotate.markupTool}
+              warningShown={annotate.warningShown}
+              onWarningShownChange={annotate.setWarningShown}
+              onDraftPickChange={annotate.setDraftPick}
+              onMoveSelection={(dir) => void annotate.moveSelection(dir)}
+              onCancelDraft={annotate.cancelDraft}
+              onCloseOpenPin={annotate.closeOpenPin}
+              onSendQueue={annotate.sendQueue}
+              onStrokeStateChange={annotate.setMarkupStrokeActive}
+              active={hotkeysActive}
+            />
+          )}
+          {!state.url.startsWith('http') && !state.url.startsWith('file:') && (
+            <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-sm text-muted-foreground">
+              <Globe className="h-6 w-6 opacity-40" />
+              <p>{t('Enter a URL above, or let the agent open a page with browser_navigate.')}</p>
+            </div>
+          )}
+          {state.locked && (
+            <div className="group absolute inset-0 z-10 flex cursor-default items-center justify-center">
+              <div className="absolute inset-0 bg-black/0 transition-colors group-hover:bg-black/40" />
+              <button
+                type="button"
+                className="relative flex items-center gap-1.5 rounded-full border bg-background px-4 py-2 text-sm shadow-lg opacity-0 transition-opacity group-hover:opacity-100 hover:bg-muted"
+                onClick={() => void window.electronAPI.browser.setLocked(conversationId, false)}
+              >
+                <Hand className="h-3.5 w-3.5" />
+                {t('Take control')}
+              </button>
+            </div>
+          )}
+        </div>
+        {state.devtoolsOpen && (
+          <>
+            <div
+              ref={splitRef}
+              className="h-1.5 shrink-0 cursor-row-resize bg-border hover:bg-ring"
+              onPointerDown={onSplitPointer}
+            />
+            <div
+              ref={dtRef}
+              className="min-h-0 bg-transparent"
+              style={{ flex: `${devtoolsRatio} 1 0` }}
+            />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

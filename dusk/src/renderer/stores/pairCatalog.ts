@@ -1,0 +1,346 @@
+import { toPairProjectEntry } from '@enso/pair';
+import { conversationCwd } from '@shared/conversationCwd';
+import { normalizeLocale, translate } from '@shared/i18n';
+import { catalogSyncFingerprint, pairJsonFingerprint } from '@shared/pair/metaSync';
+import { projectDisplayName } from '@shared/projectName';
+import type { PairCatalogPayload } from '@shared/types';
+import { resolveContextUsage } from '@/components/chat/usageSegments';
+import { getXtermTheme } from '@/lib/ghosttyTheme';
+import { isLeaderRenderer, onLeaderRendererChanged } from '@/lib/rendererRole';
+import { useModelDirectoryStore } from '@/stores/modelDirectory';
+import { readMaterializedProviders } from '@/stores/modelDirectory/useProviders';
+import { useOauthCredentialStore } from '@/stores/oauthCredentials';
+import { pairProviderSyncPlan } from '@/stores/pairCatalogProviders';
+import { catalogHiddenProjectIds, catalogListedProject } from '@/stores/pairCatalogVisibility';
+import { useSessionsStore } from '@/stores/sessions';
+import { lastActiveAt } from '@/stores/sessions/pinned';
+import { setPairViewedSession } from '@/stores/sessions/unread';
+import { useSettingsStore } from '@/stores/settings';
+import { applyProjectOrder } from '@/stores/settings/projectOrder';
+import {
+  ARCHIVED_PROJECTS_KEY,
+  PINNED_ORDER_KEY,
+  PROJECT_ORDER_KEY,
+  readSidebarOrder,
+  subscribeSidebarOrder,
+} from '@/stores/settings/sidebarOrderStorage';
+
+/**
+ * 会话目录同步：会话标题、项目、provider 只存在于 renderer，
+ * main 与 worker 都没有，故由此处 debounce 推给 main 供手机端展示。
+ * providers 与桌面选择器同口径，并剥掉 apiKey/baseUrl/oauthAccountKey，密钥永不出 main。
+ */
+
+const DEBOUNCE_MS = 300;
+let timer: ReturnType<typeof setTimeout> | null = null;
+let bound = false;
+let lastPushFingerprint: string | null = null;
+
+function buildPayload(): PairCatalogPayload {
+  const settings = useSettingsStore.getState();
+  const sessions = useSessionsStore.getState();
+  // 与桌面侧栏一致的项目手动顺序（拖拽偏好存 localStorage，不进 settings store）
+  const orderedProjects = applyProjectOrder(settings.projects, readSidebarOrder(PROJECT_ORDER_KEY));
+  const listedProjects = orderedProjects.filter(
+    (project): project is typeof project & { kind?: 'local' | 'ssh' } =>
+      catalogListedProject(project.kind)
+  );
+  const archivedProjects = new Set(readSidebarOrder(ARCHIVED_PROJECTS_KEY));
+  const scratchLabel = translate(normalizeLocale(settings.language), 'Temporary chats');
+  const projectName = new Map(
+    settings.projects.map((project) => [
+      project.id,
+      project.kind === 'scratch' ? scratchLabel : projectDisplayName(project),
+    ])
+  );
+  const projectPath = new Map(settings.projects.map((p) => [p.id, p.path]));
+  const projectKind = new Map(settings.projects.map((p) => [p.id, p.kind]));
+
+  type Conversation = NonNullable<(typeof sessions.conversations)[string]>;
+  // 子会话跟随父会话的 worktree（与桌面 ChatView 的 toolCwd 同源）
+  const toolCwd = (c: Conversation): string | undefined => {
+    const owner = (c.parentId ? sessions.conversations[c.parentId] : undefined) ?? c;
+    if (projectKind.get(owner.projectId) === 'scratch') {
+      return (
+        conversationCwd({
+          kind: 'scratch',
+          canonicalPath: projectPath.get(owner.projectId) ?? '',
+          conversationId: owner.id,
+        }) ?? undefined
+      );
+    }
+    return owner.worktree?.path ?? projectPath.get(c.projectId);
+  };
+  const slashCommands = settings.skills
+    .filter((skill) => skill.enabled !== false)
+    .map((skill) => ({ name: `/skill:${skill.name}`, description: skill.description }));
+  // 冷会话桌面不留消息正文：用量与占用都取 session-meta（worker 按完整记录算），不按 c.messages 算
+  const toEntry = (c: Conversation) => {
+    const context = resolveContextUsage(c.occupancy, c.contextWindow);
+    return {
+      id: c.id,
+      title: c.parentId ? c.coworkerName || c.title : c.title,
+      projectName: projectName.get(c.projectId) ?? '',
+      projectId: c.projectId,
+      ...(toolCwd(c) ? { cwd: toolCwd(c) } : {}),
+      status: c.spawning ? 'running' : c.status,
+      // 与桌面侧栏同一活跃时间：冷会话消息被剥离时回落到持久化的 lastActiveAt
+      updatedAt: lastActiveAt(c),
+      ...(c.parentId ? { parentId: c.parentId } : {}),
+      ...(c.pinned === true ? { pinned: true } : {}),
+      ...(c.archived === true ? { archived: true } : {}),
+      ...(c.muted === true ? { muted: true } : {}),
+      // 当前模型与推理档位：手机切换器回显；缺省字段不占帧体积
+      ...(c.lastProviderId ? { providerId: c.lastProviderId } : {}),
+      ...(c.lastModelId ? { modelId: c.lastModelId } : {}),
+      ...(c.reasoningEnabled !== undefined ? { reasoningEnabled: c.reasoningEnabled } : {}),
+      ...(c.thinkingLevel ? { thinkingLevel: c.thinkingLevel } : {}),
+      ...(c.unread === true ? { unread: true } : {}),
+      ...(c.pendingAsks && c.pendingAsks.length > 0
+        ? { pendingAskCount: c.pendingAsks.length }
+        : {}),
+      ...(c.pendingApprovals && c.pendingApprovals.length > 0
+        ? { pendingApprovalCount: c.pendingApprovals.length }
+        : {}),
+      // 排队消息：手机队列区展示与操作；图片不下发正文，只给个标记
+      ...(c.queuedMessages?.length
+        ? {
+            queued: c.queuedMessages.map((m) => ({
+              id: m.id,
+              text: m.text,
+              ...(m.images?.length ? { hasImages: true } : {}),
+            })),
+          }
+        : {}),
+      ...(c.goal
+        ? {
+            goal: {
+              text: c.goal.text,
+              status: c.goal.status,
+              ...(c.goal.note ? { note: c.goal.note } : {}),
+              autoTurns: c.goal.autoTurns,
+            },
+          }
+        : {}),
+      ...(slashCommands.length ? { slashCommands } : {}),
+      ...(context ? { context } : {}),
+      ...(c.usageTotals ? { usageTotals: c.usageTotals } : {}),
+    };
+  };
+
+  const topLevel = sessions.order
+    .map((id) => sessions.conversations[id])
+    .filter((c): c is Conversation => Boolean(c));
+  // coworker 子会话不进 order（桌面用 tab 展示），但手机抽屉需要它们嵌套在父会话下；
+  // 只补父会话仍在列表里的（dismissed 的已从 conversations 删除，自然不会出现）
+  const inOrder = new Set(sessions.order);
+  const children = Object.values(sessions.conversations).filter((c): c is Conversation =>
+    Boolean(c?.parentId && inOrder.has(c.parentId))
+  );
+
+  const catalog = [...topLevel, ...children].map(toEntry);
+  const hiddenProjectIds = catalogHiddenProjectIds(
+    settings.projects,
+    settings.scratchSessionsEnabled
+  );
+  const visibleCatalog = catalog.filter((entry) => !hiddenProjectIds.has(entry.projectId));
+
+  // 与桌面选择器同一套可用口径（启用 + 凭证真实可用 + 启用模型），并剥掉密钥。
+  // OAuth 未就绪的空列表不结算，main 会扣下这一帧，避免手机显示没有模型服务。
+  const providerPlan = pairProviderSyncPlan(
+    readMaterializedProviders(),
+    useOauthCredentialStore.getState().snapshot,
+    settings.virtualModels
+  );
+
+  return {
+    catalog: visibleCatalog,
+    // 置顶组的手动拖拽顺序：手机置顶栏按它排前，未收录的按活跃倒序
+    pinnedOrder: readSidebarOrder(PINNED_ORDER_KEY),
+    projects: listedProjects.map((project) => ({
+      ...toPairProjectEntry(project),
+      ...(archivedProjects.has(project.id) ? { archived: true as const } : {}),
+    })),
+    projectGroups: settings.projectGroups,
+    providers: providerPlan.entries,
+    providersSettled: providerPlan.settled,
+    // 仅 main 侧用于 spawn 反查 cwd，不下发手机
+    projectPaths: settings.projects.map((p) => ({ id: p.id, path: p.path })),
+    // 原样下发（含 sync-terminal：手机也按终端配色推导整套 UI，与桌面一致）；
+    // system 交由手机跟随自己的系统深浅色，而非照搬桌面此刻的解析结果
+    theme: settings.theme,
+    // 只下发选中主题解析后的调色板（约几百字节），手机不必打包整份主题库
+    terminal: getXtermTheme(settings.terminalTheme),
+    terminalFontFamily: settings.terminalFontFamily,
+    compactReadOnlyTools: settings.compactReadOnlyTools,
+    expandLiveEdits: settings.expandLiveEdits,
+    expandLiveReasoning: settings.expandLiveReasoning,
+    autoCollapseTurns: settings.autoCollapseTurns,
+    collapseCompletedActivity: settings.collapseCompletedActivity,
+    collapseLiveActivity: settings.collapseLiveActivity,
+    pinUnfinishedTodos: settings.pinUnfinishedTodos,
+  };
+}
+
+function catalogPushFingerprint(payload: PairCatalogPayload): string {
+  return pairJsonFingerprint({
+    catalog: catalogSyncFingerprint(payload.catalog, payload.pinnedOrder ?? []),
+    projects: payload.projects,
+    projectGroups: payload.projectGroups,
+    providers: payload.providers,
+    providersSettled: payload.providersSettled,
+    projectPaths: payload.projectPaths,
+    theme: payload.theme,
+    terminal: payload.terminal,
+    terminalFontFamily: payload.terminalFontFamily,
+    compactReadOnlyTools: payload.compactReadOnlyTools,
+    expandLiveEdits: payload.expandLiveEdits,
+    expandLiveReasoning: payload.expandLiveReasoning,
+    autoCollapseTurns: payload.autoCollapseTurns,
+    collapseCompletedActivity: payload.collapseCompletedActivity,
+    collapseLiveActivity: payload.collapseLiveActivity,
+    pinUnfinishedTodos: payload.pinUnfinishedTodos,
+  });
+}
+
+/**
+ * 两个数据源 store 都已 merge 磁盘状态才能推：水合前的 conversations/projects 是 initialState 的空值，
+ * 推给 main 会被当真目录下发，对端（手机/远程节点）据“曾在目录现在没了”把仍在订阅的会话判为幽灵而跳离。
+ */
+function storesHydrated(): boolean {
+  return useSessionsStore.persist.hasHydrated() && useSettingsStore.persist.hasHydrated();
+}
+
+function schedulePush(): void {
+  if (timer) clearTimeout(timer);
+  timer = setTimeout(() => {
+    timer = null;
+    if (!isLeaderRenderer() || !storesHydrated()) return;
+    const payload = buildPayload();
+    const fingerprint = catalogPushFingerprint(payload);
+    if (fingerprint === lastPushFingerprint) return;
+    lastPushFingerprint = fingerprint;
+    window.electronAPI.pair.pushCatalog(payload);
+  }, DEBOUNCE_MS);
+}
+
+/** 应用启动时绑定一次：会话/项目/provider 变化即同步给 main */
+export function bindPairCatalogSync(): void {
+  if (bound) return;
+  bound = true;
+  schedulePush();
+  // 水合完成时补推一次：上面那次可能因未水合被跳过；多窗口 rehydrate 后也由此重推（指纹相同则不发）
+  useSessionsStore.persist.onFinishHydration(schedulePush);
+  useSettingsStore.persist.onFinishHydration(schedulePush);
+  useSessionsStore.subscribe((state, prev) => {
+    if (state.conversations !== prev.conversations || state.order !== prev.order) schedulePush();
+  });
+  useOauthCredentialStore.subscribe((state, prev) => {
+    if (state.snapshot !== prev.snapshot) schedulePush();
+  });
+  useModelDirectoryStore.subscribe((state, prev) => {
+    if (state.snapshot !== prev.snapshot) schedulePush();
+  });
+  useSettingsStore.subscribe((state, prev) => {
+    if (
+      state.projects !== prev.projects ||
+      state.projectGroups !== prev.projectGroups ||
+      state.providers !== prev.providers ||
+      state.theme !== prev.theme ||
+      state.terminalTheme !== prev.terminalTheme ||
+      state.terminalFontFamily !== prev.terminalFontFamily ||
+      state.compactReadOnlyTools !== prev.compactReadOnlyTools ||
+      state.expandLiveEdits !== prev.expandLiveEdits ||
+      state.expandLiveReasoning !== prev.expandLiveReasoning ||
+      state.autoCollapseTurns !== prev.autoCollapseTurns ||
+      state.collapseCompletedActivity !== prev.collapseCompletedActivity ||
+      state.collapseLiveActivity !== prev.collapseLiveActivity ||
+      state.pinUnfinishedTodos !== prev.pinUnfinishedTodos ||
+      state.skills !== prev.skills
+    ) {
+      schedulePush();
+    }
+  });
+  // 侧栏拖拽重排（项目/置顶）落盘后同步给手机
+  subscribeSidebarOrder(schedulePush);
+  onLeaderRendererChanged((leader) => {
+    if (!leader) return;
+    lastPushFingerprint = null;
+    schedulePush();
+  });
+  // 手机订阅历史会话时恢复它，worker 才有投影可发（resume 对已启动会话自动忽略）
+  window.electronAPI.pair.onResumeSession((sessionId) => {
+    setPairViewedSession(sessionId);
+    if (!isLeaderRenderer()) return;
+    useSessionsStore.getState().markConversationRead(sessionId);
+    void useSessionsStore.getState().resumeConversation(sessionId);
+  });
+  // 手机新建的会话登记进桌面列表；不登记的话它的 agent 事件会因「未知会话」被丢弃
+  window.electronAPI.pair.onSessionCreated((session) => {
+    setPairViewedSession(session.sessionId);
+    if (!isLeaderRenderer()) return;
+    useSessionsStore.getState().adoptPairSession(session);
+  });
+  // 手机改会话模型/推理档位：走桌面选择器同一 store 方法
+  // （setModel 只记忆待用模型；reasoning/thinking 对已启动会话即时下发）
+  window.electronAPI.pair.onSessionConfig((config) => {
+    if (!isLeaderRenderer()) return;
+    const store = useSessionsStore.getState();
+    if (config.type === 'set-model') {
+      store.setModel(config.sessionId, config.providerId, config.modelId);
+    } else if (config.type === 'set-reasoning') {
+      store.setReasoning(config.sessionId, config.enabled);
+    } else {
+      store.setThinking(config.sessionId, config.level);
+    }
+  });
+  // 手机操作排队消息：与桌面队列区同一批 store 方法
+  window.electronAPI.pair.onQueueAction((action) => {
+    if (!isLeaderRenderer()) return;
+    const store = useSessionsStore.getState();
+    switch (action.type) {
+      case 'enqueue':
+        store.enqueueMessage(action.sessionId, action.text, action.images);
+        break;
+      case 'queue-remove':
+        store.removeQueuedMessage(action.sessionId, action.messageId);
+        break;
+      case 'queue-update':
+        store.updateQueuedMessage(action.sessionId, action.messageId, action.text);
+        break;
+      case 'queue-send-now':
+        store.sendQueuedNow(action.sessionId, action.messageId);
+        break;
+      case 'queue-interrupt-send':
+        void store.interruptAndSendQueued(action.sessionId, action.messageId);
+        break;
+      case 'goal-pause':
+        store.pauseGoal(action.sessionId);
+        break;
+      case 'goal-resume':
+        store.resumeGoal(action.sessionId);
+        break;
+      case 'goal-clear':
+        store.clearGoal(action.sessionId);
+        break;
+      case 'goal-set':
+        store.setGoal(action.sessionId, action.text);
+        break;
+      case 'compact':
+        store.compact(action.sessionId, action.instructions, { quiet: true });
+        break;
+      case 'rewind':
+        store.rewind(action.sessionId, action.userIndexFromEnd, action.restoreFiles);
+        break;
+      case 'retry':
+        store.retry(action.sessionId);
+        break;
+      case 'task-stop':
+        void window.electronAPI.agent.stopTask(action.sessionId, action.taskId);
+        break;
+      case 'subagent-stop':
+        void window.electronAPI.agent.stopSubagent(action.sessionId, action.agentId);
+        break;
+    }
+  });
+}

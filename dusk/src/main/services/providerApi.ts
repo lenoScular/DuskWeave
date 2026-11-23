@@ -1,0 +1,380 @@
+import { addAbortListener } from 'node:events';
+import { classify } from '@earendil-works/pi-ai/api/typesafe-system-one';
+import { typesafeProvider } from '@earendil-works/pi-ai/providers/typesafe';
+import { net } from '@platform';
+import { positiveFiniteNumber } from '@shared/modelCatalog';
+import {
+  DEFAULT_BASE_URLS,
+  isClassifierOnlyProvider,
+  withVersionSegment,
+} from '@shared/providerCatalog';
+import type {
+  FetchedModel,
+  ListModelsResult,
+  ModelApiKind,
+  ProviderApiConfig,
+  TestProviderResult,
+} from '@shared/types';
+import { createSecretSet } from './secretRedactor';
+
+const ANTHROPIC_VERSION = '2023-06-01';
+const TIMEOUT_MS = 15000;
+/** 连通性探测上限。1 会让 thinking 模型在思维链阶段直接超限（上游 502）。 */
+const TEST_MAX_OUTPUT_TOKENS = 4096;
+
+const OFFICIAL_ANTHROPIC_HOST = 'api.anthropic.com';
+
+export function isOfficialAnthropicHost(urlOrBase: string): boolean {
+  try {
+    const parsed = new URL(urlOrBase);
+    return parsed.hostname.toLowerCase() === OFFICIAL_ANTHROPIC_HOST;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveBase(config: ProviderApiConfig): string {
+  const base = config.baseUrl.trim().replace(/\/+$/, '');
+  return base || DEFAULT_BASE_URLS[config.api];
+}
+
+async function waitForProxy(ready: Promise<boolean>, signal?: AbortSignal | null): Promise<void> {
+  if (!signal) {
+    await ready;
+    return;
+  }
+  const aborted = Promise.withResolvers<never>();
+  const listener = addAbortListener(signal, () => aborted.reject(signal.reason));
+  try {
+    await Promise.race([ready, aborted.promise]);
+    signal.throwIfAborted();
+  } finally {
+    listener[Symbol.dispose]();
+  }
+}
+
+async function request(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    // Node/undici TLS 指纹会被 Cloudflare 拦成 403 挑战页（done.5111online.uk 已踩过）；
+    // 聊天能通是因为 worker 装了系统代理。主进程拉模型必须走 Chromium net.fetch。
+    // 动态 import：避免 providerApi → proxyConfig → agentHost 把 worker 入口拖进无关测试。
+    const { getProxyConfig } = await import('./proxyConfig');
+    await waitForProxy(getProxyConfig().whenReady(), init.signal);
+    return await net.fetch(url, {
+      ...init,
+      signal: init.signal ? AbortSignal.any([controller.signal, init.signal]) : controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function httpError(response: Response): string {
+  return `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`;
+}
+
+export function toMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.name === 'AbortError' ? 'Request timed out' : error.message;
+  }
+  return String(error);
+}
+
+/** 鉴权头先放，用户请求头后盖。没有用户头时保持原对象。 */
+function withProviderHeaders(
+  headers: Record<string, string>,
+  extra: Record<string, string> | undefined
+): Record<string, string> {
+  return extra ? { ...headers, ...extra } : headers;
+}
+
+export async function listModels(
+  config: ProviderApiConfig,
+  signal?: AbortSignal
+): Promise<ListModelsResult> {
+  const base = resolveBase(config);
+  const signalWithTimeout = signal && AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]);
+  const key = config.apiKey.trim();
+  try {
+    if (isClassifierOnlyProvider(config)) {
+      return {
+        ok: true,
+        models: (typesafeProvider().getAllModels?.() ?? []).map((model) => ({ id: model.id })),
+      };
+    }
+    let url: string;
+    let headers: Record<string, string> = {};
+    let usesDefaultModelsList = false;
+    switch (config.api) {
+      case 'anthropic-messages':
+        // 官方默认每页 20 条且带 has_more；同步需要完整清单，取单页上限
+        url = `${withVersionSegment(base, 'v1')}/models?limit=1000`;
+        headers = { 'x-api-key': key, 'anthropic-version': ANTHROPIC_VERSION };
+        break;
+      case 'google-generative-ai':
+        url = `${withVersionSegment(base, 'v1beta')}/models?key=${encodeURIComponent(key)}`;
+        break;
+      case 'ollama':
+        url = `${base}/api/tags`;
+        break;
+      default:
+        url = `${base}/models`;
+        headers = { Authorization: `Bearer ${key}` };
+        usesDefaultModelsList = true;
+    }
+    headers = withProviderHeaders(headers, config.headers);
+
+    let response = await request(url, { headers, redirect: 'manual', signal: signalWithTimeout });
+    if (
+      response.status === 401 &&
+      config.api === 'anthropic-messages' &&
+      !isOfficialAnthropicHost(url)
+    ) {
+      // 第三方 Anthropic 首次 401 时允许以 Bearer 替换 x-api-key 重试一次同一 URL（保留 anthropic-version）
+      const retryHeaders: Record<string, string> = {
+        Authorization: `Bearer ${key}`,
+        'anthropic-version': ANTHROPIC_VERSION,
+      };
+      response = await request(url, {
+        headers: withProviderHeaders(retryHeaders, config.headers),
+        redirect: 'manual',
+        signal: signalWithTimeout,
+      });
+    }
+
+    if (!response.ok) {
+      const error =
+        response.status === 404 && usesDefaultModelsList
+          ? 'GET /models returned 404: the provider may not support /models, or the Base URL may be wrong (e.g. missing /v1). If the Base URL is correct, add models manually in the model center.'
+          : httpError(response);
+      return { ok: false, models: [], error };
+    }
+
+    const data = await response.json();
+    if (!isValidModelListPayload(config.api, data)) {
+      return { ok: false, models: [], error: 'Invalid model list response format' };
+    }
+    const models = extractModelEntries(config.api, data as Record<string, unknown>);
+    return { ok: true, models };
+  } catch (error) {
+    const secrets = createSecretSet([config.apiKey]);
+    return { ok: false, models: [], error: secrets.redactError(toMessage(error)) };
+  }
+}
+
+/**
+ * 各家 "OpenAI 兼容" 站与 Google 官方对上下文窗口 / 最大输出的字段名各不相同，
+ * 按 "更具体的字段名优先" 依次探测（清单参考 DeepChat new-api 分支 + OpenRouter/Groq/Gemini）。
+ * 官方 OpenAI / Anthropic 不返回这些字段，探不到就缺省，下游走 catalog/default 兜底。
+ */
+const CONTEXT_WINDOW_FIELDS = [
+  'context_length',
+  'contextLength',
+  'input_token_limit',
+  'max_input_tokens',
+  'context_window',
+  'context_size',
+  'inputTokenLimit',
+] as const;
+
+const MAX_TOKENS_FIELDS = [
+  'max_completion_tokens',
+  'max_output_tokens',
+  'output_token_limit',
+  'max_tokens',
+  'outputTokenLimit',
+] as const;
+
+function firstPositiveField(
+  item: Record<string, unknown>,
+  fields: readonly string[]
+): number | undefined {
+  for (const field of fields) {
+    const value = positiveFiniteNumber(item[field]);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+/** 非正 / 非有限 / 非数字一律视为缺失，不留假数字 */
+function attachTokenLimits(id: string, item: Record<string, unknown>): FetchedModel {
+  const contextWindow = firstPositiveField(item, CONTEXT_WINDOW_FIELDS);
+  let maxTokens = firstPositiveField(item, MAX_TOKENS_FIELDS);
+  if (maxTokens === undefined && item.top_provider && typeof item.top_provider === 'object') {
+    // OpenRouter 形状：最大输出藏在 top_provider 里
+    maxTokens = firstPositiveField(item.top_provider as Record<string, unknown>, [
+      'max_completion_tokens',
+    ]);
+  }
+  return {
+    id,
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+  };
+}
+
+/**
+ * 全量同步必须使用完整有效的模型清单；未拉完的分页或解析时被过滤的损坏条目
+ * 不能被误判为模型下架。合法空数组仍代表上游已经没有模型，可以用于清空本地清单。
+ */
+export function isValidModelListPayload(api: ModelApiKind, data: unknown): boolean {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return false;
+  }
+  const obj = data as Record<string, unknown>;
+  if (
+    obj.has_more === true ||
+    (typeof obj.nextPageToken === 'string' && obj.nextPageToken.length > 0)
+  ) {
+    return false;
+  }
+  const entries = api === 'google-generative-ai' || api === 'ollama' ? obj.models : obj.data;
+  if (!Array.isArray(entries)) return false;
+  const models = extractModelEntries(api, obj);
+  return models.length === entries.length && models.every((model) => model.id.trim().length > 0);
+}
+
+export function extractModelEntries(
+  api: ModelApiKind,
+  data: Record<string, unknown>
+): FetchedModel[] {
+  // 条目可能是 null 或非对象，先过滤再取字段，避免响应结构异常时抛错
+  const objects = (value: unknown): Record<string, unknown>[] =>
+    Array.isArray(value)
+      ? value.filter(
+          (item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object'
+        )
+      : [];
+
+  if (api === 'ollama') {
+    // /api/tags 不携带上下文信息（需要逐个调 /api/show，不在本列表接口里做）
+    return objects(data.models)
+      .map((item) => item.model ?? item.name)
+      .filter((id): id is string => typeof id === 'string')
+      .map((id) => ({ id }));
+  }
+  if (api === 'google-generative-ai') {
+    return objects(data.models)
+      .filter(
+        (item): item is Record<string, unknown> & { name: string } => typeof item.name === 'string'
+      )
+      .map((item) => attachTokenLimits(item.name.replace(/^models\//, ''), item));
+  }
+  return objects(data.data)
+    .filter((item): item is Record<string, unknown> & { id: string } => typeof item.id === 'string')
+    .map((item) => attachTokenLimits(item.id, item));
+}
+
+export async function testProvider(
+  config: ProviderApiConfig,
+  modelId?: string
+): Promise<TestProviderResult> {
+  const started = Date.now();
+  const model = modelId?.trim();
+
+  if (isClassifierOnlyProvider(config)) {
+    const catalog = typesafeProvider().getAllModels?.() ?? [];
+    const classifier = catalog.find(
+      (entry) => entry.type === 'classifier' && entry.id === (model || 'jev-latest')
+    );
+    if (classifier?.type !== 'classifier' || classifier.api !== 'typesafe-system-one') {
+      return { ok: false, latencyMs: Date.now() - started, message: 'Classifier not found' };
+    }
+    const result = await classify(
+      { ...classifier, baseUrl: resolveBase(config) },
+      {
+        state: { message: 'Connectivity check' },
+        questions: {
+          connected: {
+            type: 'choice',
+            instructions: 'Is this a connectivity check?',
+            criteria: { yes: 'A connectivity check', no: 'Anything else' },
+          },
+        },
+      },
+      {
+        apiKey: config.apiKey.trim(),
+        maxRetries: 0,
+        timeoutMs: TIMEOUT_MS,
+        fetch: (url, init) => request(String(url), { ...init, redirect: 'manual' }),
+      }
+    );
+    return {
+      ok: result.stopReason === 'stop',
+      latencyMs: Date.now() - started,
+      message:
+        result.stopReason === 'stop'
+          ? 'Connected'
+          : createSecretSet([config.apiKey]).redactError(result.errorMessage ?? 'Failed'),
+    };
+  }
+
+  // 无模型可用时，退化为拉取模型列表做连通性检查
+  if (!model) {
+    const result = await listModels(config);
+    return {
+      ok: result.ok,
+      latencyMs: Date.now() - started,
+      message: result.ok ? 'Connected' : (result.error ?? 'Failed'),
+    };
+  }
+
+  const base = resolveBase(config);
+  const key = config.apiKey.trim();
+  try {
+    let url: string;
+    let headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    let body: unknown;
+
+    switch (config.api) {
+      case 'anthropic-messages':
+        url = `${withVersionSegment(base, 'v1')}/messages`;
+        headers = { ...headers, 'x-api-key': key, 'anthropic-version': ANTHROPIC_VERSION };
+        body = {
+          model,
+          max_tokens: TEST_MAX_OUTPUT_TOKENS,
+          messages: [{ role: 'user', content: 'hi' }],
+        };
+        break;
+      case 'google-generative-ai':
+        url = `${withVersionSegment(base, 'v1beta')}/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+        body = {
+          contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+          generationConfig: { maxOutputTokens: TEST_MAX_OUTPUT_TOKENS },
+        };
+        break;
+      case 'ollama':
+        url = `${base}/api/chat`;
+        body = { model, messages: [{ role: 'user', content: 'hi' }], stream: false };
+        break;
+      case 'openai-responses':
+        url = `${base}/responses`;
+        headers = { ...headers, Authorization: `Bearer ${key}` };
+        body = { model, input: 'hi', max_output_tokens: TEST_MAX_OUTPUT_TOKENS };
+        break;
+      default:
+        url = `${base}/chat/completions`;
+        headers = { ...headers, Authorization: `Bearer ${key}` };
+        body = {
+          model,
+          max_tokens: TEST_MAX_OUTPUT_TOKENS,
+          messages: [{ role: 'user', content: 'hi' }],
+        };
+    }
+
+    headers = withProviderHeaders(headers, config.headers);
+    const response = await request(url, { method: 'POST', headers, body: JSON.stringify(body) });
+    const latencyMs = Date.now() - started;
+    if (!response.ok) return { ok: false, latencyMs, message: httpError(response) };
+    return { ok: true, latencyMs, message: model };
+  } catch (error) {
+    const secrets = createSecretSet([config.apiKey]);
+    return {
+      ok: false,
+      latencyMs: Date.now() - started,
+      message: secrets.redactError(toMessage(error)),
+    };
+  }
+}

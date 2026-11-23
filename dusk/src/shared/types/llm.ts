@@ -1,0 +1,95 @@
+/** 模型 API 协议类型，值域对齐 pi sdk 的 Api，便于后续直接接入 */
+export const MODEL_API_KINDS = [
+  'openai-completions',
+  'openai-responses',
+  'anthropic-messages',
+  'google-generative-ai',
+  'ollama',
+  'typesafe-system-one',
+] as const;
+
+export type ModelApiKind = (typeof MODEL_API_KINDS)[number];
+
+/** 行级推理覆盖：未设 / 空 = 跟随 catalog 或乐观默认。不要存 `'follow'`。 */
+export const MODEL_REASONING_OVERRIDES = ['on', 'off'] as const;
+export type ModelReasoningOverride = (typeof MODEL_REASONING_OVERRIDES)[number];
+
+/**
+ * 行级最高思考档覆盖，值域与 `THINKING_LEVELS` 对齐。
+ * 写在 llm 以免 `types/agent` ↔ `types/llm` 循环依赖。
+ */
+export const MODEL_THINKING_LEVEL_OVERRIDES = [
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const;
+export type ModelThinkingLevelOverride = (typeof MODEL_THINKING_LEVEL_OVERRIDES)[number];
+
+/** 自定义模型行的可选能力覆盖。缺省字段 = 跟随上一层，不在数据层填假数字。 */
+export interface ModelCapabilityOverrides {
+  reasoning?: ModelReasoningOverride;
+  thinkingLevel?: ModelThinkingLevelOverride;
+  contextWindow?: number;
+  maxTokens?: number;
+}
+
+export interface ModelEntry extends ModelCapabilityOverrides {
+  id: string;
+  imageGeneration?: boolean;
+  label?: string;
+  /** 是否启用（缺省视为启用） */
+  enabled?: boolean;
+}
+
+export interface ModelProvider {
+  id: string;
+  name: string;
+  api: ModelApiKind;
+  apiKey: string;
+  baseUrl: string;
+  enabled: boolean;
+  models: ModelEntry[];
+  /**
+   * 此 API Key 条目在本机是否自动拉取模型，只有显式设为 true 才开启。
+   *
+   * Whether to refresh models on this device for this API key entry. Only an explicit true enables it.
+   */
+  autoFetchModels?: boolean;
+  /**
+   * 此 API Key 条目在本机自动拉取模型的间隔（整小时 1–168，缺省 1）。
+   *
+   * Device-local model refresh interval for this API key entry (1–168 whole hours, default 1).
+   */
+  modelRefreshIntervalHours?: number;
+  /** 自动拉取见过的模型 id（本机）；只追加不在其中的模型，用户删掉的不再加回 */
+  knownModelIds?: string[];
+  /** 最近一次自动拉取的结果（本机，Main 写入）；不含错误详情 */
+  modelRefreshStatus?: { ok: boolean; at: number };
+  /** 从哪个本地应用导入（手动创建时为空） */
+  importedFrom?: string;
+  /**
+   * 向导选中的厂商目录 id。`__custom` 必须保留：用户按「自定义」录入、
+   * baseUrl 却撞上官方 hostname（如 api.x.ai）时，不能再按 URL 并进 xAI 组，
+   * 否则自定义模型清单会被静默吞掉、设置页也看不到这条自定义供应商。
+   */
+  catalogId?: string;
+  /**
+   * 订阅账号 key（见 `oauthProviders.ts` 的多账号模型）；存在即订阅条目，apiKey/baseUrl 为空。
+   * 同一厂商的多个账号各占一条 ModelProvider，key 分别是 `anthropic`、`anthropic#2`…
+   */
+  oauthAccountKey?: string;
+  /**
+   * ChatGPT OAuth 顺序账号池；缺省保持固定账号。顺序只来自显式成员，不重排锚点。
+   */
+  oauthAccountPool?: { accountKeys: string[] };
+  /** 发给该供应商的额外 HTTP 请求头。空表不持久化。 */
+  headers?: Record<string, string>;
+}
+
+/** provider 是否具备可用凭证（API key 或订阅账号） */
+export const hasProviderCredentials = (
+  provider: Pick<ModelProvider, 'apiKey' | 'oauthAccountKey'>
+): boolean => Boolean(provider.apiKey || provider.oauthAccountKey);

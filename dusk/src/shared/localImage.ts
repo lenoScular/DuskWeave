@@ -1,0 +1,157 @@
+/**
+ * 背景图媒体文件的共享约定：
+ * - `local-image://` 特权协议 URL 与本地路径的双向转换（主进程 protocol.handle 与渲染层共用）
+ * - 支持的媒体扩展名白名单（主进程白名单校验与渲染层目录过滤共用）
+ *
+ * URL 形状（standard scheme 必须有 hostname）：
+ * - Windows 盘符路径  `C:\a\b.png`            → `local-image://c/a/b.png`（盘符作 host）
+ * - UNC / WSL 路径    `\\wsl.localhost\U\x`   → `local-image://wsl.localhost/U/x`
+ * - POSIX 绝对路径    `/a/b.png`              → `local-image://posix/a/b.png`（固定 host）
+ * - 远程图片代理      `local-image://remote-fetch/?url=<encoded>`（主进程 net.fetch 代理，绕过 CSP/CORS）
+ * - 插件图片和字体    `local-image://plugin-asset/<pluginId>/<rel>?v=<build>`
+ */
+
+export const LOCAL_IMAGE_SCHEME = 'local-image';
+
+/** 远程桌面（浏览器）里由 web-preload 设置：local-image URL 改走壳页面 SW 的隧道代理 */
+export const REMOTE_LOCAL_IMAGE_PREFIX_KEY = '__ensoRemoteLocalImagePrefix';
+
+function routed(url: string): string {
+  const prefix = (globalThis as Record<string, unknown>)[REMOTE_LOCAL_IMAGE_PREFIX_KEY];
+  return typeof prefix === 'string' ? `${prefix}${encodeURIComponent(url)}` : url;
+}
+
+/** POSIX 绝对路径的固定 host（盘符 host 恒为单字母，二者不会撞） */
+const POSIX_HOST = 'posix';
+
+/** 远程图片代理的保留 host */
+export const REMOTE_FETCH_HOST = 'remote-fetch';
+
+/** 成员头像的保留 host：只按 botId 寻址，路径由 Main 推导；v 为头像版本（缓存失效） */
+export const BOT_AVATAR_HOST = 'bot-avatar';
+export const botAvatarUrl = (botId: string, version: number): string =>
+  routed(`${LOCAL_IMAGE_SCHEME}://${BOT_AVATAR_HOST}/${encodeURIComponent(botId)}?v=${version}`);
+
+/**
+ * 秘书头像的保留 host：只有一个秘书，路径由 Main 推导。
+ * v 是版本号，h 是图片字节的短指纹：两者都在 URL 上，换图后地址一定变，不吃旧缓存。
+ */
+export const SECRETARY_AVATAR_HOST = 'secretary-avatar';
+export const secretaryAvatarUrl = (version: number, hash?: string, secretaryId?: string): string =>
+  routed(
+    `${LOCAL_IMAGE_SCHEME}://${SECRETARY_AVATAR_HOST}/avatar.png?v=${version}${
+      hash ? `&h=${encodeURIComponent(hash)}` : ''
+    }${secretaryId ? `&s=${encodeURIComponent(secretaryId)}` : ''}`
+  );
+
+/**
+ * 已完成报告截图副本的保留 host：只按会话 id 与内容哈希文件名寻址，磁盘路径由 Main 推导，
+ * 不把 host 的绝对路径交给 renderer。文件名即内容哈希，v 是报告完成时间。
+ */
+export const SECRETARY_REPORT_HOST = 'secretary-report';
+export const secretaryReportImageUrl = (
+  conversationId: string,
+  name: string,
+  version: number
+): string =>
+  routed(
+    `${LOCAL_IMAGE_SCHEME}://${SECRETARY_REPORT_HOST}/${encodeURIComponent(conversationId)}/${encodeURIComponent(name)}?v=${version}`
+  );
+
+/** 插件目录内图片和字体的保留 host。v 是安装代号，换包后缓存失效 */
+export const PLUGIN_ASSET_HOST = 'plugin-asset';
+
+export function pluginAssetUrl(pluginId: string, rel: string, build: string): string {
+  const segments = rel
+    .split('/')
+    .filter((part) => part.length > 0)
+    .map((part) => encodeURIComponent(part));
+  const path = segments.length > 0 ? `/${segments.join('/')}` : '';
+  const id = encodeURIComponent(pluginId);
+  const version = encodeURIComponent(build);
+  return routed(`${LOCAL_IMAGE_SCHEME}://${PLUGIN_ASSET_HOST}/${id}${path}?v=${version}`);
+}
+
+export const IMAGE_EXTENSIONS = [
+  'png',
+  'jpg',
+  'jpeg',
+  'gif',
+  'webp',
+  'bmp',
+  'svg',
+  'jfif',
+  'avif',
+] as const;
+
+export const VIDEO_EXTENSIONS = ['mp4', 'webm', 'ogg', 'ogv', 'mov'] as const;
+
+export const MEDIA_EXTENSIONS: readonly string[] = [...IMAGE_EXTENSIONS, ...VIDEO_EXTENSIONS];
+
+/** 取小写扩展名（不带点）；无扩展名返回空串 */
+export function mediaExtension(pathOrUrl: string): string {
+  const clean = pathOrUrl.split(/[?#]/)[0] ?? '';
+  const idx = clean.lastIndexOf('.');
+  if (idx < 0) return '';
+  return clean.slice(idx + 1).toLowerCase();
+}
+
+export function isMediaPath(pathOrUrl: string): boolean {
+  return MEDIA_EXTENSIONS.includes(mediaExtension(pathOrUrl));
+}
+
+export function isVideoPath(pathOrUrl: string): boolean {
+  return (VIDEO_EXTENSIONS as readonly string[]).includes(mediaExtension(pathOrUrl));
+}
+
+/** 本地绝对路径 → local-image:// URL（逐段 encodeURIComponent，保住空格/中文/#）*/
+export function toLocalImageUrl(filePath: string): string {
+  const normalized = filePath.replace(/\\/g, '/');
+
+  // UNC：//server/share/...（含 WSL 的 \\wsl.localhost\...）
+  if (normalized.startsWith('//')) {
+    const [host, ...rest] = normalized.slice(2).split('/').filter(Boolean);
+    return routed(`${LOCAL_IMAGE_SCHEME}://${host}/${rest.map(encodeURIComponent).join('/')}`);
+  }
+
+  // Windows 盘符：C:/...
+  const drive = /^([a-zA-Z]):\/(.*)$/.exec(normalized);
+  if (drive) {
+    const segments = drive[2].split('/').filter(Boolean).map(encodeURIComponent);
+    return routed(`${LOCAL_IMAGE_SCHEME}://${drive[1].toLowerCase()}/${segments.join('/')}`);
+  }
+
+  // POSIX 绝对路径
+  const segments = normalized.split('/').filter(Boolean).map(encodeURIComponent);
+  return routed(`${LOCAL_IMAGE_SCHEME}://${POSIX_HOST}/${segments.join('/')}`);
+}
+
+/** local-image:// URL → 本地绝对路径；形状不合法返回 null */
+export function localImageUrlToPath(url: URL): string | null {
+  const host = url.hostname;
+  if (
+    !host ||
+    host === REMOTE_FETCH_HOST ||
+    host === BOT_AVATAR_HOST ||
+    host === SECRETARY_AVATAR_HOST ||
+    host === SECRETARY_REPORT_HOST ||
+    host === PLUGIN_ASSET_HOST
+  )
+    return null;
+  const segments = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+  if (host === POSIX_HOST) {
+    return `/${segments.join('/')}`;
+  }
+  if (/^[a-z]$/i.test(host)) {
+    return `${host.toUpperCase()}:\\${segments.join('\\')}`;
+  }
+  return `\\\\${host}\\${segments.join('\\')}`;
+}
+
+/** 远程图片走主进程代理的 URL；nonce 用于手动/定时刷新时绕开缓存 */
+export function toRemoteImageProxyUrl(remoteUrl: string, nonce = 0): string {
+  const bust = nonce > 0 ? `&_t=${nonce}` : '';
+  return routed(
+    `${LOCAL_IMAGE_SCHEME}://${REMOTE_FETCH_HOST}/?url=${encodeURIComponent(remoteUrl)}${bust}`
+  );
+}

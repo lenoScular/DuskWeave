@@ -1,0 +1,1256 @@
+import { randomUUID } from 'node:crypto';
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { join } from 'node:path';
+import { app, ipcMain, type RendererContents } from '@platform';
+import { diffConversations, isEmptyConversationsStore } from '@shared/conversationsPatch';
+import {
+  type ContextMenuOpen,
+  type FileOpenRule,
+  normalizeContextMenuOpen,
+  normalizeFileOpenRules,
+  parseContextMenuOpen,
+  parseFileOpenRules,
+} from '@shared/fileOpening';
+import { type Locale, normalizeLocale } from '@shared/i18n';
+import { collectPresetPromptIds } from '@shared/presetPrompts';
+import { normalizeSshTimeoutSeconds } from '@shared/sshTimeout';
+import { IPC_CHANNELS, isEditMode, resolveEditMode } from '@shared/types';
+import { appDesktop } from '../services/desktopHooks';
+import { readStoredOauthCredentialKeys } from '../services/oauthProviders';
+import {
+  parseTrayPreventDisplaySleep,
+  parseTraySleepPolicy,
+  type TraySleepPolicy,
+} from '../services/pairPowerKeepAlive';
+import {
+  createProviderModelRefresh,
+  keepRefreshedProviderModels,
+} from '../services/providerModelRefresh';
+import {
+  applyMainConversationsPatch,
+  CONVERSATIONS_KEY,
+  mergeConversationsWrite,
+  noteConversationsRead,
+  readConversationsFor,
+} from '../services/remoteRenderer/conversationSync';
+import { sendToRemoteRenderers } from '../services/remoteRenderer/senders';
+import { broadcastToRenderers, isMainRenderer } from '../services/renderers';
+import { deleteSystemPrompt } from '../services/systemPromptStore';
+import { localUi } from '../services/uiHost';
+import type { ConversationsMovePorts, ImportProjectSessionsPorts } from './conversationsMove';
+
+function getSettingsPath(): string {
+  return join(app.getPath('userData'), 'settings.json');
+}
+
+// 内存缓存和防抖配置
+let cachedSettings: Record<string, unknown> | null = null;
+let pendingWrite: NodeJS.Timeout | null = null;
+let maxWaitTimer: NodeJS.Timeout | null = null;
+let isDirty = false;
+let providerModelRefresh: ReturnType<typeof createProviderModelRefresh> | undefined;
+const pendingSystemPromptDeletes = new Set<string>();
+
+const DEBOUNCE_MS = 500;
+const MAX_WAIT_MS = 5000;
+
+export const SETTINGS_STATE_FIELDS = [
+  'theme',
+  'themeId',
+  'accentColor',
+  'userCssEnabled',
+  'language',
+  'terminalTheme',
+  'terminalFontSize',
+  'terminalFontFamily',
+  'terminalFontWeight',
+  'terminalFontWeightBold',
+  'terminalShell',
+  'worktreeRoot',
+  'favoriteTerminalThemes',
+  'statusLineSegments',
+  'loadLocalSkills',
+  'loadHarnessAssets',
+  'windowsLocalShell',
+  'exploreFoldEnabled',
+  'rtkEnabled',
+  'longCacheRetention',
+  'computerPreview',
+  'computerAllowAllApps',
+  'editMode',
+  'openLinksInBuiltinBrowser',
+  'hashlineEditEnabled',
+  'compactStrategy',
+  'smartCompactEnabled',
+  'smartCompactModel',
+  'smartCompactMode',
+  'autoUpdate',
+  'autoRestartForUpdate',
+  'updateChannel',
+  'pluginAutoUpdate',
+  'proxyMode',
+  'customProxyUrl',
+  'customCaCertPath',
+  'openChangesOnFileEdit',
+  'fileOpenRules',
+  'contextMenuOpen',
+  'compactReadOnlyTools',
+  'expandLiveEdits',
+  'expandLiveReasoning',
+  'autoCollapseTurns',
+  'collapseCompletedActivity',
+  'collapseLiveActivity',
+  'liveActivityFoldDelaySec',
+  'pinUnfinishedTodos',
+  'pinnedModels',
+  'headerSessionTabs',
+  'headerRecentMinutes',
+  'chatWide',
+  'navRailSide',
+  'chatTypography',
+  'notifyMainAgentOnly',
+  'maxActiveCoworkers',
+  'autoRetryLimit',
+  'privacyMasking',
+  'shell',
+  'sshTimeoutSeconds',
+  'generationStallTimeoutMin',
+  'autoArchiveIdleDays',
+  'autoArchiveMergedWorktrees',
+  'autoDeleteArchivedDays',
+  'activeRetentionMinutes',
+  'backgroundImageEnabled',
+  'backgroundSourceType',
+  'backgroundImagePath',
+  'backgroundFolderPath',
+  'backgroundUrlPath',
+  'backgroundRandomEnabled',
+  'backgroundRandomInterval',
+  'backgroundOpacity',
+  'backgroundBlur',
+  'backgroundBrightness',
+  'backgroundSaturation',
+  'backgroundMask',
+  'borderOpacity',
+  'backgroundComposerOpacity',
+  'backgroundCodeOpacity',
+  'backgroundSizeMode',
+  'backgroundRefreshNonce',
+  'providers',
+  'defaultModel',
+  'defaultModelFollowLast',
+  'titleSummaryEnabled',
+  'titleSummaryModel',
+  'imageGenerationModel',
+  'memoryDistillModel',
+  'memoryChatModel',
+  'memoryLanguage',
+  'approvalReviewer',
+  'approvalAutoManage',
+  'approvalAllowThreshold',
+  'lastApprovalMode',
+  'defaultReasoningEnabled',
+  'defaultThinkingLevel',
+  'subagentModelsEnabled',
+  'subagentModels',
+  'virtualModels',
+  'skills',
+  'mcpServers',
+  'instructions',
+  'presets',
+  'defaultPresetId',
+  'agentTypes',
+  'disabledBuiltinAgentTypes',
+  'disabledBuiltinTools',
+  'webSearchChain',
+  'disabledWorkflowPresets',
+  'subagentAllowedModes',
+  'memoryEmbeddingModel',
+  'memoryEmbeddingAutoDownload',
+  'memoryModelIdleMinutes',
+  'memoryEmbeddingRemoteProviderId',
+  'memoryDistillEnabled',
+  'memoryDistillWindowMinutes',
+  'botModeEnabled',
+  'scratchSessionsEnabled',
+  'dropShelfEnabled',
+  'secretaryEnabled',
+  'botMaxRunningTurns',
+  'botDiscussModeEnabled',
+  'botRouteClassifier',
+  'botAssistantModel',
+  'protectedActionsInCode',
+  'dcgEnabled',
+  'memoryKgEnabled',
+  'memoryReconcileEnabled',
+  'memoryDecayEnabled',
+  'memoryDecayArchiveCandidates',
+  'memoryDecayAutoArchive',
+  'memoryDecayStaleDays',
+  'memoryDecayMaxImportance',
+  'memoryDecayIntervalDays',
+  'onboarded',
+  'keybindings',
+  'projects',
+  'projectGroups',
+  'usageModelPricing',
+] as const;
+
+export type SettingsStateField = (typeof SETTINGS_STATE_FIELDS)[number];
+
+/** 仅限本机的字段：config-sync 绝不计入指纹，也绝不回写。 */
+const CONFIG_SYNC_EXCLUDED_STATE_FIELDS = new Set<SettingsStateField>([
+  'hashlineEditEnabled',
+  'pinnedModels',
+  'approvalAutoManage',
+  'approvalAllowThreshold',
+  'privacyMasking',
+  'shell',
+  'virtualModels',
+  'windowsLocalShell',
+  'computerPreview',
+  'computerAllowAllApps',
+  'terminalShell',
+  'openLinksInBuiltinBrowser',
+  'worktreeRoot',
+  'fileOpenRules',
+  'contextMenuOpen',
+  'autoUpdate',
+  'autoRestartForUpdate',
+  'updateChannel',
+  'longCacheRetention',
+  'pluginAutoUpdate',
+  'proxyMode',
+  'customProxyUrl',
+  'customCaCertPath',
+  'sshTimeoutSeconds',
+  'backgroundImageEnabled',
+  'backgroundSourceType',
+  'backgroundImagePath',
+  'backgroundFolderPath',
+  'backgroundUrlPath',
+  'backgroundRandomEnabled',
+  'backgroundRefreshNonce',
+  'themeId',
+  'userCssEnabled',
+  'lastApprovalMode',
+  'memoryEmbeddingAutoDownload',
+  'memoryModelIdleMinutes',
+  'memoryEmbeddingRemoteProviderId',
+  // 记忆库每台机器一份（userData/memory/memory.db），遗忘 / 矛盾复核策略作用于本机库，不跨机同步
+  'memoryReconcileEnabled',
+  'memoryDecayEnabled',
+  'memoryDecayArchiveCandidates',
+  'memoryDecayAutoArchive',
+  'memoryDecayStaleDays',
+  'memoryDecayMaxImportance',
+  'memoryDecayIntervalDays',
+  // 聚合待办排在本机库的队列里，窗口只影响本机的提炼时机
+  'memoryDistillWindowMinutes',
+  'botModeEnabled',
+  'scratchSessionsEnabled',
+  'dropShelfEnabled',
+  'secretaryEnabled',
+  'botMaxRunningTurns',
+  'botDiscussModeEnabled',
+  'botRouteClassifier',
+  'botAssistantModel',
+  'protectedActionsInCode',
+  'dcgEnabled',
+  'onboarded',
+  'headerSessionTabs',
+  'headerRecentMinutes',
+  'projects',
+  'projectGroups',
+  'disabledWorkflowPresets',
+  // 与 CONFIG_SYNC_FIELD_POLICY 的 excluded 一致：引用本机 provider 条目，跨机悬空
+  'webSearchChain',
+]);
+
+export const CONFIG_SYNC_COMMIT_FIELDS = SETTINGS_STATE_FIELDS.filter(
+  (field) => !CONFIG_SYNC_EXCLUDED_STATE_FIELDS.has(field)
+);
+
+// 记忆 embedding 配置只存 id/开关，模型文件在 userData/memory/models；切换立即作用于之后的写入与查询
+function notifyMemoryEmbeddingSettings(settings: Record<string, unknown>): void {
+  void import('../services/memoryHost')
+    .then(
+      ({
+        syncMemoryEmbeddingFromSettings,
+        syncMemoryDistillFromSettings,
+        syncMemoryForgettingFromSettings,
+        syncMemoryKgFromSettings,
+        syncMemoryReconcileFromSettings,
+      }) => {
+        const state = settingsStateOf(settings);
+        syncMemoryEmbeddingFromSettings(state);
+        syncMemoryDistillFromSettings(state);
+        syncMemoryKgFromSettings(state);
+        syncMemoryReconcileFromSettings(state);
+        syncMemoryForgettingFromSettings(state);
+      }
+    )
+    .catch(() => {});
+}
+
+function notifyTrayToggleShortcut(settings: Record<string, unknown>): void {
+  const keybindings = settingsStateOf(settings).keybindings;
+  appDesktop().syncTrayToggleShortcut(keybindings);
+}
+
+function notifyDropShelf(settings: Record<string, unknown>): void {
+  appDesktop().syncDropShelf(settingsStateOf(settings).dropShelfEnabled === true);
+}
+
+function notifyAppLanguage(
+  previous: Record<string, unknown> | null,
+  next: Record<string, unknown>
+): void {
+  if (settingsStateOf(previous).language !== settingsStateOf(next).language) {
+    appDesktop().syncAppLanguage();
+  }
+}
+
+function settingsStateOf(settings: Record<string, unknown> | null): Record<string, unknown> {
+  const store = settings?.['enso-settings'];
+  if (!store || typeof store !== 'object') return {};
+  const state = (store as Record<string, unknown>).state;
+  return state && typeof state === 'object' ? (state as Record<string, unknown>) : {};
+}
+
+export interface SettingsPatchResult {
+  ok: boolean;
+  previous?: unknown;
+  value?: unknown;
+  error?: string;
+}
+
+function systemPromptIds(settings: Record<string, unknown> | null): Set<string> {
+  const presets = settingsStateOf(settings).presets;
+  const ids = new Set<string>();
+  for (const preset of Array.isArray(presets) ? presets : []) {
+    for (const id of collectPresetPromptIds(preset)) ids.add(id);
+  }
+  return ids;
+}
+
+export function readSettings(): Record<string, unknown> | null {
+  if (cachedSettings !== null) {
+    return cachedSettings;
+  }
+
+  try {
+    const settingsPath = getSettingsPath();
+    if (existsSync(settingsPath)) {
+      cachedSettings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      return cachedSettings;
+    }
+  } catch {}
+  cachedSettings = null;
+  return null;
+}
+
+// 原子写入：先写临时文件再重命名，避免崩溃导致文件损坏
+function atomicWriteSettings(data: Record<string, unknown>): boolean {
+  try {
+    const settingsPath = getSettingsPath();
+    const tempPath = `${settingsPath}.tmp`;
+    // 含供应商 apiKey、MCP env 明文：只给本人读写，rename 后 settings.json 沿用这个权限
+    writeFileSync(tempPath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    renameSync(tempPath, settingsPath);
+    tightenOwnerOnly(settingsPath);
+    // 正文只能在引用成功落盘后回收；失败/防抖窗口内必须保留旧磁盘配置的正文。
+    if (pendingSystemPromptDeletes.size > 0) {
+      const referenced = systemPromptIds(data);
+      for (const id of pendingSystemPromptDeletes) {
+        if (referenced.has(id) || deleteSystemPrompt(id).ok) pendingSystemPromptDeletes.delete(id);
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** mode 只在新建时生效；残留的 0644 .tmp 被 rename 上来后这里再收紧。失败不挡住落盘。 */
+function tightenOwnerOnly(file: string): void {
+  if (process.platform === 'win32') return;
+  try {
+    chmodSync(file, 0o600);
+  } catch {
+    // 权限收紧失败不让设置写盘失败
+  }
+}
+
+export function flushSettings(): boolean {
+  if (pendingWrite) {
+    clearTimeout(pendingWrite);
+    pendingWrite = null;
+  }
+  if (maxWaitTimer) {
+    clearTimeout(maxWaitTimer);
+    maxWaitTimer = null;
+  }
+
+  if (isDirty && cachedSettings !== null) {
+    const written = atomicWriteSettings(cachedSettings);
+    // 写入失败时保留 dirty 状态，之后的事务或退出时可再次尝试 flush。
+    if (written) isDirty = false;
+    return written;
+  }
+  return true;
+}
+
+export type SettingsBroadcast = 'exclude-sender' | 'all-renderers';
+
+/** 一次写入把这些字段从非空写成空，视为破坏性：写前把上一份文件快照下来，给用户留恢复余地。 */
+const PROTECTED_FIELDS = ['providers', 'skills', 'mcpServers', 'instructions'] as const;
+const MAX_BACKUPS = 5;
+
+function settingsState(data: Record<string, unknown> | null): Record<string, unknown> {
+  const store = data?.['enso-settings'];
+  const state =
+    store && typeof store === 'object' ? (store as Record<string, unknown>).state : null;
+  return state && typeof state === 'object' ? (state as Record<string, unknown>) : {};
+}
+
+function destructiveFields(prev: Record<string, unknown> | null, next: Record<string, unknown>) {
+  const before = settingsState(prev);
+  const after = settingsState(next);
+  const fields: string[] = PROTECTED_FIELDS.filter((field) => {
+    const was = before[field];
+    const now = after[field];
+    return Array.isArray(was) && was.length > 0 && (!Array.isArray(now) || now.length === 0);
+  });
+  if (
+    !isEmptyConversationsStore(prev?.[CONVERSATIONS_KEY]) &&
+    isEmptyConversationsStore(next[CONVERSATIONS_KEY])
+  ) {
+    fields.push(CONVERSATIONS_KEY);
+  }
+  return fields;
+}
+
+/** 快照当前磁盘文件为 settings.backup-<ts>.json，只留最近 MAX_BACKUPS 份。失败不影响写入。 */
+function snapshotBeforeDestructiveWrite(fields: string[]): void {
+  try {
+    const settingsPath = getSettingsPath();
+    if (!existsSync(settingsPath)) return;
+    const dir = join(settingsPath, '..');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    copyFileSync(settingsPath, join(dir, `settings.backup-${stamp}.json`));
+    const stale = readdirSync(dir)
+      .filter((f) => f.startsWith('settings.backup-') && f.endsWith('.json'))
+      .sort()
+      .slice(0, -MAX_BACKUPS);
+    for (const f of stale) rmSync(join(dir, f), { force: true });
+    console.warn(`[settings] destructive write empties ${fields.join(', ')}; snapshot saved`);
+  } catch {}
+}
+
+/** 更新缓存、广播窗口、debounce 落盘（SETTINGS_WRITE / WRITE_KEY / Gateway 共用） */
+function scheduleWrite(
+  data: Record<string, unknown>,
+  sender?: RendererContents,
+  broadcast: SettingsBroadcast = 'exclude-sender',
+  /** 远端主界面已经通过会话补丁拿到这次变化：不再让它经中继整份重读 settings */
+  patchedRemoteMain = false
+): boolean {
+  try {
+    const store = objectRecord(data['enso-settings']);
+    const state = objectRecord(store?.state);
+    if (state) {
+      let normalized = state;
+      if ('fileOpenRules' in state) {
+        const rules = parseFileOpenRules(state.fileOpenRules);
+        if (!rules) return false;
+        normalized = { ...normalized, fileOpenRules: rules };
+      }
+      if ('contextMenuOpen' in state) {
+        const config = parseContextMenuOpen(state.contextMenuOpen);
+        if (!config) return false;
+        normalized = { ...normalized, contextMenuOpen: config };
+      }
+      data = { ...data, 'enso-settings': { ...store, state: normalized } };
+    }
+    const previous = readSettings();
+    const destructive = destructiveFields(previous, data);
+    if (destructive.length > 0) {
+      flushSettings();
+      snapshotBeforeDestructiveWrite(destructive);
+    }
+    if (settingsStateOf(previous).presets !== settingsStateOf(data).presets) {
+      const nextPromptIds = systemPromptIds(data);
+      for (const id of systemPromptIds(previous)) {
+        if (!nextPromptIds.has(id)) pendingSystemPromptDeletes.add(id);
+      }
+    }
+    cachedSettings = data;
+    isDirty = true;
+    providerModelRefresh?.sync();
+    notifyMemoryEmbeddingSettings(data);
+    notifyTrayToggleShortcut(data);
+    notifyDropShelf(data);
+    notifyAppLanguage(previous, data);
+    if (
+      settingsStateOf(previous).botModeEnabled !== settingsStateOf(data).botModeEnabled ||
+      settingsStateOf(previous).botMaxRunningTurns !== settingsStateOf(data).botMaxRunningTurns
+    ) {
+      void import('./bots')
+        .then(({ syncBotModeServices }) => syncBotModeServices())
+        .catch(() => {});
+    }
+    // 讨论模式开关不能走 syncBotModeServices：后者在 Bot 模式关闭时会销毁整套服务
+    if (
+      (settingsStateOf(previous).botDiscussModeEnabled === true) !==
+      (settingsStateOf(data).botDiscussModeEnabled === true)
+    ) {
+      void import('./bots').then(({ syncBotDiscussMode }) => syncBotDiscussMode()).catch(() => {});
+    }
+
+    // 普通 store 写排除 sender；Gateway 写显式选择 all-renderers。
+    for (const contents of localUi()?.allContents() ?? []) {
+      if (broadcast === 'all-renderers' || !sender || contents !== sender) {
+        contents.send(IPC_CHANNELS.SETTINGS_CHANGED);
+      }
+    }
+    sendToRemoteRenderers(
+      IPC_CHANNELS.SETTINGS_CHANGED,
+      [],
+      broadcast === 'all-renderers' ? undefined : sender?.id,
+      patchedRemoteMain ? 'main' : undefined
+    );
+
+    if (pendingWrite) {
+      clearTimeout(pendingWrite);
+    }
+
+    if (!maxWaitTimer) {
+      maxWaitTimer = setTimeout(() => {
+        if (cachedSettings !== null) {
+          const written = atomicWriteSettings(cachedSettings);
+          if (written) isDirty = false;
+        }
+        maxWaitTimer = null;
+        pendingWrite = null;
+      }, MAX_WAIT_MS);
+    }
+
+    pendingWrite = setTimeout(() => {
+      if (maxWaitTimer) {
+        clearTimeout(maxWaitTimer);
+        maxWaitTimer = null;
+      }
+      if (cachedSettings !== null) {
+        const written = atomicWriteSettings(cachedSettings);
+        if (written) isDirty = false;
+      }
+      pendingWrite = null;
+    }, DEBOUNCE_MS);
+
+    void import('../services/agentHost')
+      .then(
+        async ({
+          pushApprovalReviewer,
+          pushCompactRoute,
+          pushMaxActiveCoworkers,
+          pushAutoRetryLimit,
+          pushLongCacheRetention,
+          pushPrivacyMasking,
+          pushShellLimits,
+          pushDisabledWorkflowPresets,
+          pushBuiltinTools,
+          pushModelDirectory,
+          pushWebSearchConfig,
+          pushImageGenerationConfig,
+        }) => {
+          pushApprovalReviewer(await readStoredOauthCredentialKeys());
+          pushCompactRoute(await readStoredOauthCredentialKeys());
+          pushMaxActiveCoworkers();
+          pushAutoRetryLimit();
+          pushLongCacheRetention();
+          pushPrivacyMasking();
+          pushShellLimits();
+          pushDisabledWorkflowPresets();
+          pushBuiltinTools();
+          pushModelDirectory();
+          pushWebSearchConfig();
+          pushImageGenerationConfig();
+        }
+      )
+      .catch(() => {});
+    // 目录只重合成自定义分区；动态 import 避免 settings ↔ modelDirectory 静态环。
+    void import('../services/modelDirectory')
+      .then(({ notifyModelDirectorySettingsChanged }) => notifyModelDirectorySettingsChanged())
+      .catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 只对导入预览用到的可迁移设置字段计算指纹。 */
+export function settingsFingerprint(settings: Record<string, unknown> | null): string {
+  const state = settingsStateOf(settings);
+  const portable: Record<string, unknown> = {};
+  for (const field of CONFIG_SYNC_COMMIT_FIELDS) {
+    if (field in state) portable[field] = state[field];
+  }
+  return JSON.stringify(portable);
+}
+
+export interface SettingsTransactionResult {
+  ok: boolean;
+  backupPath?: string;
+  error?: string;
+}
+
+/**
+ * 把完整的同步白名单补丁作为一次持久化设置事务应用。
+ * 这段临界区刻意不含 await：备份和原子 rename 都成功之前，
+ * 调用方不能观察到缓存更新或广播。
+ */
+export function commitSettingsTransaction(
+  expectedFingerprint: string,
+  statePatch: Record<string, unknown>
+): SettingsTransactionResult {
+  const current = readSettings() ?? {};
+  if (settingsFingerprint(current) !== expectedFingerprint) {
+    return { ok: false, error: 'Settings changed since preview; preview again.' };
+  }
+  if (!flushSettings()) {
+    return { ok: false, error: 'Unable to flush pending settings writes.' };
+  }
+
+  const latest = readSettings() ?? {};
+  const settingsPath = getSettingsPath();
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupPath = join(
+    app.getPath('userData'),
+    `settings.config-sync-backup-${stamp}-${randomUUID()}.json`
+  );
+  try {
+    // 导入前必须先做完整快照，包括所有不相关的 store。
+    if (existsSync(settingsPath)) copyFileSync(settingsPath, backupPath);
+    else writeFileSync(backupPath, JSON.stringify(latest, null, 2), 'utf8');
+    chmodSync(backupPath, 0o600);
+  } catch {
+    return { ok: false, error: 'Unable to create settings backup.' };
+  }
+  try {
+    const dir = app.getPath('userData');
+    const stale = readdirSync(dir)
+      .filter((file) => file.startsWith('settings.config-sync-backup-') && file.endsWith('.json'))
+      .sort()
+      .slice(0, -MAX_BACKUPS);
+    for (const file of stale) rmSync(join(dir, file), { force: true });
+  } catch {
+    // 轮转尽力而为；多留下一份旧备份不能导致导入失败。
+  }
+
+  const persisted =
+    latest['enso-settings'] && typeof latest['enso-settings'] === 'object'
+      ? (latest['enso-settings'] as Record<string, unknown>)
+      : {};
+  const currentState =
+    persisted.state && typeof persisted.state === 'object'
+      ? { ...(persisted.state as Record<string, unknown>) }
+      : {};
+  for (const field of CONFIG_SYNC_COMMIT_FIELDS) {
+    if (field in statePatch) currentState[field] = statePatch[field];
+  }
+  if ('editMode' in statePatch) delete currentState.hashlineEditEnabled;
+  const next = {
+    ...latest,
+    'enso-settings': {
+      ...persisted,
+      state: currentState,
+    },
+  };
+  if (!atomicWriteSettings(next)) {
+    return { ok: false, error: 'Unable to write settings.' };
+  }
+
+  cachedSettings = next;
+  isDirty = false;
+  providerModelRefresh?.sync();
+  notifyMemoryEmbeddingSettings(next);
+  notifyTrayToggleShortcut(next);
+  notifyDropShelf(next);
+  notifyAppLanguage(latest, next);
+  try {
+    broadcastToRenderers(IPC_CHANNELS.SETTINGS_CHANGED);
+  } catch {
+    // 持久化写入已成功；renderer 已失效也不能让导入失败。
+  }
+  void import('../services/agentHost')
+    .then(
+      async ({
+        pushApprovalReviewer,
+        pushCompactRoute,
+        pushMaxActiveCoworkers,
+        pushAutoRetryLimit,
+        pushLongCacheRetention,
+        pushPrivacyMasking,
+        pushShellLimits,
+        pushDisabledWorkflowPresets,
+        pushBuiltinTools,
+        pushModelDirectory,
+        pushWebSearchConfig,
+        pushImageGenerationConfig,
+      }) => {
+        pushApprovalReviewer(await readStoredOauthCredentialKeys());
+        pushCompactRoute(await readStoredOauthCredentialKeys());
+        pushMaxActiveCoworkers();
+        pushAutoRetryLimit();
+        pushLongCacheRetention();
+        pushPrivacyMasking();
+        pushShellLimits();
+        pushDisabledWorkflowPresets();
+        pushBuiltinTools();
+        pushModelDirectory();
+        pushWebSearchConfig();
+        pushImageGenerationConfig();
+      }
+    )
+    .catch(() => {});
+  return { ok: true, backupPath };
+}
+
+/**
+ * Gateway 的唯一设置写入口：只允许登记字段，保留 zustand 容器与其它字段，
+ * 并复用现有缓存、原子写和多窗口广播。
+ */
+export function patchSettingsState(
+  field: string,
+  value: unknown,
+  sender?: RendererContents,
+  broadcast: SettingsBroadcast = 'all-renderers'
+): SettingsPatchResult {
+  if (!SETTINGS_STATE_FIELDS.includes(field as SettingsStateField)) {
+    return { ok: false, error: `Unregistered settings field: ${field}` };
+  }
+  let targetField = field as SettingsStateField;
+  let targetValue = value;
+  if (targetField === 'hashlineEditEnabled') {
+    if (typeof value !== 'boolean') return { ok: false, error: 'Invalid legacy edit mode' };
+    targetField = 'editMode';
+    targetValue = resolveEditMode(undefined, value);
+  } else if (targetField === 'editMode' && !isEditMode(value)) {
+    return { ok: false, error: 'Invalid edit mode' };
+  } else if (targetField === 'fileOpenRules') {
+    const rules = parseFileOpenRules(value);
+    if (!rules) return { ok: false, error: 'Invalid file open rules' };
+    targetValue = rules;
+  } else if (targetField === 'contextMenuOpen') {
+    const config = parseContextMenuOpen(value);
+    if (!config) return { ok: false, error: 'Invalid context menu opening' };
+    targetValue = config;
+  }
+  const current = readSettings() ?? {};
+  const persisted =
+    current['enso-settings'] && typeof current['enso-settings'] === 'object'
+      ? (current['enso-settings'] as Record<string, unknown>)
+      : {};
+  const state =
+    persisted.state && typeof persisted.state === 'object'
+      ? (persisted.state as Record<string, unknown>)
+      : {};
+  const previous = state[targetField];
+  const nextState = { ...state, [targetField]: targetValue };
+  if (targetField === 'editMode') delete nextState.hashlineEditEnabled;
+  const next = {
+    ...current,
+    'enso-settings': {
+      ...persisted,
+      state: nextState,
+    },
+  };
+  return scheduleWrite(next, sender, broadcast)
+    ? { ok: true, previous, value: targetValue }
+    : { ok: false, error: `Failed to write settings field: ${field}` };
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+/** 当前设置 state 快照（本机配置 CLI 读取用） */
+export function readSettingsState(): Record<string, unknown> {
+  return settingsStateOf(readSettings());
+}
+
+/**
+ * 桌面与无头宿主在代理初始化后各调用一次，所有窗口共用同一调度服务。
+ *
+ * Desktop and headless hosts call this once after proxy initialization. All windows share the scheduling service.
+ */
+export function startProviderModelRefresh(): void {
+  providerModelRefresh ??= createProviderModelRefresh({
+    readSettingsState,
+    writeProviders: (providers) => {
+      if (!patchSettingsState('providers', providers).ok) {
+        console.warn('[provider-model-refresh] could not save models');
+      }
+    },
+    async fetchModels(config, signal) {
+      const { listModels } = await import('../services/providerApi');
+      return listModels(config, signal);
+    },
+  });
+  providerModelRefresh.sync();
+}
+
+/** 渲染端写 enso-settings 时补回其快照之后 Main 后台追加的模型；无需修正返回 undefined */
+function withRefreshedProviderModels(
+  current: Record<string, unknown> | null,
+  value: unknown
+): Record<string, unknown> | undefined {
+  const store = objectRecord(value);
+  const state = objectRecord(store?.state);
+  if (!store || !state) return;
+  const providers = keepRefreshedProviderModels(
+    settingsStateOf(current).providers,
+    state.providers
+  );
+  return providers && { ...store, state: { ...state, providers } };
+}
+
+/** 丢弃内存副本并以磁盘为准重读，再走与普通写入相同的通知与广播（本机配置 CLI 的 reload） */
+export function reloadSettingsFromDisk(): boolean {
+  if (pendingWrite) clearTimeout(pendingWrite);
+  if (maxWaitTimer) clearTimeout(maxWaitTimer);
+  pendingWrite = null;
+  maxWaitTimer = null;
+  isDirty = false;
+  cachedSettings = null;
+  const data = readSettings();
+  if (data !== null) return scheduleWrite(data, undefined, 'all-renderers');
+  providerModelRefresh?.sync();
+  return false;
+}
+
+const TRAY_SETTINGS_KEY = 'enso-tray';
+
+export function readTraySleepPolicy(): TraySleepPolicy {
+  return parseTraySleepPolicy(objectRecord(readSettings()?.[TRAY_SETTINGS_KEY])?.sleepPolicy);
+}
+
+export function writeTraySleepPolicy(policy: TraySleepPolicy): boolean {
+  return writeTrayState({ sleepPolicy: policy });
+}
+
+export function readTrayPreventDisplaySleep(): boolean {
+  return parseTrayPreventDisplaySleep(
+    objectRecord(readSettings()?.[TRAY_SETTINGS_KEY])?.preventDisplaySleep
+  );
+}
+
+export function readSshTimeoutSeconds(): number {
+  return normalizeSshTimeoutSeconds(settingsStateOf(readSettings()).sshTimeoutSeconds);
+}
+
+/**
+ * 从 Main 持久化设置读取本机打开规则，坏配置只回退默认行为，绝不采信请求中的动作或应用路径。
+ */
+export function readFileOpenRules(): FileOpenRule[] {
+  return normalizeFileOpenRules(settingsStateOf(readSettings()).fileOpenRules);
+}
+
+export function readLocale(): Locale {
+  const language = settingsStateOf(readSettings()).language;
+  return normalizeLocale(typeof language === 'string' ? language : undefined);
+}
+
+export function readContextMenuOpen(): ContextMenuOpen {
+  return normalizeContextMenuOpen(settingsStateOf(readSettings()).contextMenuOpen);
+}
+
+export function writeTrayPreventDisplaySleep(enabled: boolean): boolean {
+  return writeTrayState({ preventDisplaySleep: enabled });
+}
+
+function trayState(): Record<string, unknown> {
+  return objectRecord(readSettings()?.[TRAY_SETTINGS_KEY]) ?? {};
+}
+
+function writeTrayState(patch: Record<string, unknown>): boolean {
+  const current = readSettings() ?? {};
+  return scheduleWrite({
+    ...current,
+    [TRAY_SETTINGS_KEY]: { ...trayState(), ...patch },
+  });
+}
+
+export function writeTrayReenterAfterUpdate(reenter: boolean): boolean {
+  return writeTrayState({ reenterAfterUpdate: reenter });
+}
+
+export function consumeTrayReenterAfterUpdate(): boolean {
+  if (trayState().reenterAfterUpdate !== true) return false;
+  writeTrayReenterAfterUpdate(false);
+  return true;
+}
+
+/** 无 renderer 时由 Main 改会话元数据；形状与 zustand persist 的 enso-conversations 一致。 */
+export function patchConversationsState(
+  mutate: (state: {
+    conversations: Record<string, Record<string, unknown>>;
+    order: string[];
+    activeId: unknown;
+  }) => void,
+  exceptSenderId?: number
+): boolean {
+  const current = readSettings() ?? {};
+  const store = objectRecord(current['enso-conversations']) ?? {};
+  const state = objectRecord(store.state) ?? {};
+  const conversations: Record<string, Record<string, unknown>> = {};
+  for (const [id, value] of Object.entries(objectRecord(state.conversations) ?? {})) {
+    const row = objectRecord(value);
+    if (row) conversations[id] = row;
+  }
+  const order = Array.isArray(state.order)
+    ? state.order.filter((id): id is string => typeof id === 'string')
+    : [];
+  const nextState = { conversations, order, activeId: state.activeId };
+  mutate(nextState);
+  const patch = diffConversations(current[CONVERSATIONS_KEY], {
+    ...store,
+    state: { ...state, ...nextState },
+  });
+  return scheduleWrite({
+    ...current,
+    [CONVERSATIONS_KEY]: applyMainConversationsPatch(
+      current[CONVERSATIONS_KEY],
+      patch,
+      exceptSenderId
+    ),
+  });
+}
+
+/** 磁盘上的会话行；Main 侧派活、巡检都从这份权威值读 */
+export function readPersistedConversations(): Record<string, Record<string, unknown>> {
+  const conversations = objectRecord(
+    objectRecord(objectRecord(readSettings()?.[CONVERSATIONS_KEY])?.state)?.conversations
+  );
+  const rows: Record<string, Record<string, unknown>> = {};
+  for (const [id, value] of Object.entries(conversations ?? {})) {
+    const row = objectRecord(value);
+    if (row) rows[id] = row;
+  }
+  return rows;
+}
+
+export function readPersistedConversation(sessionId: string): Record<string, unknown> | null {
+  const store = objectRecord(readSettings()?.['enso-conversations']);
+  const conversations = objectRecord(objectRecord(store?.state)?.conversations);
+  return conversations ? objectRecord(conversations[sessionId]) : null;
+}
+
+/** 删除项目及其会话元数据；两个 zustand store 在同一次顶层按键合并中原子更新。 */
+export function removeProjectAndConversations(
+  projectId: string,
+  sender?: RendererContents,
+  broadcast: SettingsBroadcast = 'all-renderers'
+): SettingsPatchResult {
+  const current = readSettings() ?? {};
+  const settingsStore =
+    current['enso-settings'] && typeof current['enso-settings'] === 'object'
+      ? (current['enso-settings'] as Record<string, unknown>)
+      : {};
+  const settingsState =
+    settingsStore.state && typeof settingsStore.state === 'object'
+      ? (settingsStore.state as Record<string, unknown>)
+      : {};
+  const projects = Array.isArray(settingsState.projects) ? settingsState.projects : [];
+  const project = projects.find(
+    (entry) =>
+      entry && typeof entry === 'object' && (entry as Record<string, unknown>).id === projectId
+  );
+  if (!project) return { ok: false, error: `Project not found: ${projectId}` };
+
+  const conversationStore =
+    current['enso-conversations'] && typeof current['enso-conversations'] === 'object'
+      ? (current['enso-conversations'] as Record<string, unknown>)
+      : {};
+  const conversationState =
+    conversationStore.state && typeof conversationStore.state === 'object'
+      ? (conversationStore.state as Record<string, unknown>)
+      : {};
+  const conversations =
+    conversationState.conversations && typeof conversationState.conversations === 'object'
+      ? (conversationState.conversations as Record<string, unknown>)
+      : {};
+  const removedIds = Object.entries(conversations)
+    .filter(([, entry]) => {
+      const conversation =
+        entry && typeof entry === 'object' ? (entry as Record<string, unknown>) : null;
+      return conversation?.projectId === projectId;
+    })
+    .map(([id]) => id);
+  const removedSet = new Set(removedIds);
+  const nextConversations = Object.fromEntries(
+    Object.entries(conversations).filter(([id]) => !removedSet.has(id))
+  );
+  const nextOrder = Array.isArray(conversationState.order)
+    ? conversationState.order.filter((id) => typeof id !== 'string' || !removedSet.has(id))
+    : conversationState.order;
+  const next = {
+    ...current,
+    'enso-settings': {
+      ...settingsStore,
+      state: {
+        ...settingsState,
+        projects: projects.filter((entry) => entry !== project),
+      },
+    },
+    'enso-conversations': {
+      ...conversationStore,
+      state: {
+        ...conversationState,
+        conversations: nextConversations,
+        ...(nextOrder === undefined ? {} : { order: nextOrder }),
+        ...(typeof conversationState.activeId === 'string' &&
+        removedSet.has(conversationState.activeId)
+          ? { activeId: undefined }
+          : {}),
+      },
+    },
+  };
+  return scheduleWrite(next, sender, broadcast)
+    ? { ok: true, previous: { project, conversationIds: removedIds }, value: null }
+    : { ok: false, error: `Failed to remove project: ${projectId}` };
+}
+
+/** renderer 上报的确认号：非负整数以外一律按 0（等于没确认任何补丁） */
+function normalizeAckSeq(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
+export function registerSettingsHandlers(): void {
+  ipcMain.handle(IPC_CHANNELS.SETTINGS_READ, async (event) => {
+    const data = readSettings();
+    noteConversationsRead(event.sender, data?.[CONVERSATIONS_KEY]);
+    return data;
+  });
+
+  ipcMain.handle(IPC_CHANNELS.CONVERSATIONS_READ, async (event) => {
+    const data = readSettings() ?? {};
+    return readConversationsFor(event.sender, data[CONVERSATIONS_KEY]);
+  });
+
+  // 用户明确删除：先在 Main 删行并推补丁，随后该窗口的空表写回已无可删，不触发整表守卫
+  ipcMain.handle(IPC_CHANNELS.CONVERSATIONS_REMOVE, async (_event, ids: unknown) => {
+    if (!Array.isArray(ids)) return false;
+    const targets = new Set(ids.filter((id): id is string => typeof id === 'string'));
+    if (targets.size === 0) return true;
+    return patchConversationsState((state) => {
+      for (const id of targets) delete state.conversations[id];
+      state.order = state.order.filter((id) => !targets.has(id));
+    });
+  });
+
+  // 远端主界面的整表写回经中继，丢一帧就整条写回链卡住；新建的根会话在这里直接落盘并推给其它主界面
+  ipcMain.handle(IPC_CHANNELS.CONVERSATIONS_REGISTER, async (event, row: unknown) => {
+    if (!isMainRenderer(event.sender.id)) return false;
+    const record = objectRecord(row);
+    const id = record?.id;
+    if (
+      !record ||
+      typeof id !== 'string' ||
+      typeof record.projectId !== 'string' ||
+      record.parentId !== undefined ||
+      record.btwParentId !== undefined
+    ) {
+      return false;
+    }
+    const { getSourceAuthorityRegistry } = await import('./agent');
+    const authority = getSourceAuthorityRegistry()?.conversation(id);
+    if (
+      authority?.kind !== 'root' ||
+      authority.projectId !== record.projectId ||
+      authority.lifecycle === 'ended' ||
+      authority.bot
+    ) {
+      return false;
+    }
+    if (readPersistedConversation(id)) return true;
+    return patchConversationsState((state) => {
+      if (state.conversations[id]) return;
+      state.conversations[id] = record;
+      state.order = [id, ...state.order.filter((item) => item !== id)];
+    }, event.sender.id);
+  });
+
+  const conversationsMovePorts = async (): Promise<
+    (ConversationsMovePorts & ImportProjectSessionsPorts) | null
+  > => {
+    const { projectRootConversationIds } = await import('./conversationsMove');
+    const { getSourceAuthorityRegistry, releaseRootFromMain } = await import('./agent');
+    const { agentSessionIndex } = await import('./sessionIndex');
+    const { sessionWorktreeInUse, unbindSessionWorktree } = await import('./worktree');
+    const { removeScratchWorkspace } = await import('../services/sessionFileCleanup');
+    const registry = getSourceAuthorityRegistry();
+    if (!registry) return null;
+    const persistedRows = readPersistedConversations;
+    return {
+      sessionDir: join(app.getPath('userData'), 'agent', 'sessions'),
+      project: (projectId) => registry.project(projectId),
+      projectKind: (projectId) => registry.project(projectId)?.kind,
+      conversation: (conversationId) => registry.conversation(conversationId),
+      projectHasConversations: (projectId) =>
+        registry
+          .projection()
+          .conversations.some(
+            (conversation) =>
+              conversation.projectId === projectId && conversation.lifecycle !== 'ended'
+          ) ||
+        Object.values(persistedRows()).some(
+          (row) => row.projectId === projectId && !row.parentId && !row.btwParentId
+        ),
+      insertConversations: (targetProjectId, records) =>
+        registry.insertConversations(targetProjectId, records),
+      discardConversations: (conversationIds) => registry.discardConversations(conversationIds),
+      removeProject: (request) => registry.removeProject(request),
+      randomUuid: () => randomUUID(),
+      addConversations: (rows, placeBefore) =>
+        patchConversationsState((state) => {
+          Object.assign(state.conversations, rows);
+          for (const [id, before] of Object.entries(placeBefore)) {
+            const at = state.order.indexOf(before);
+            state.order.splice(at < 0 ? 0 : at, 0, id);
+          }
+        }),
+      rootConversationIds: (projectId) =>
+        projectRootConversationIds(registry.rendererProjection().conversations, projectId),
+      moveConversation: (conversationId, targetProjectId, options) =>
+        registry.moveConversation(conversationId, targetProjectId, options),
+      moveConversations: (requests, targetProjectId) =>
+        registry.moveConversations(requests, targetProjectId),
+      isRunning: (conversationId) =>
+        agentSessionIndex.workspaceTreeRunning(conversationId) ||
+        agentSessionIndex.btwTreeRunning(conversationId),
+      worktreeBusy: sessionWorktreeInUse,
+      source: (conversationId) => {
+        const conversation = registry.conversation(conversationId);
+        if (!conversation) return undefined;
+        const project = registry.project(conversation.projectId);
+        return {
+          projectId: conversation.projectId,
+          ...(project?.kind === 'scratch' ? { scratchRoot: project.canonicalPath } : {}),
+        };
+      },
+      readConversations: persistedRows,
+      patchProjectIds: (ids, targetProjectId, rootIds) => {
+        patchConversationsState((state) => {
+          for (const id of ids) {
+            const row = state.conversations[id];
+            if (row) row.projectId = targetProjectId;
+          }
+          for (const rootId of rootIds) {
+            const root = state.conversations[rootId];
+            if (root) {
+              delete root.worktree;
+              delete root.worktreeMissing;
+            }
+          }
+        });
+      },
+      unbindWorktree: unbindSessionWorktree,
+      releaseSessions: async (conversationId) => {
+        const ids = [conversationId, ...agentSessionIndex.btwSessionIds(conversationId)].filter(
+          (id) => agentSessionIndex.isAlive(id)
+        );
+        const results = await Promise.all(ids.map((id) => releaseRootFromMain(id)));
+        return results.every((result) => result.ok);
+      },
+      removeScratchWorkspace,
+    };
+  };
+
+  ipcMain.handle(IPC_CHANNELS.CONVERSATIONS_MOVE, async (_event, input: unknown) => {
+    const { handleConversationsMove } = await import('./conversationsMove');
+    const ports = await conversationsMovePorts();
+    if (!ports) return { ok: false, error: 'unavailable' };
+    return handleConversationsMove(input, ports);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.CONVERSATIONS_IMPORT_PROJECT, async (_event, input: unknown) => {
+    const { handleImportProjectSessions } = await import('./conversationsMove');
+    const ports = await conversationsMovePorts();
+    if (!ports) return { ok: false, error: 'unavailable' };
+    return handleImportProjectSessions(input, ports);
+  });
+
+  ipcMain.handle(
+    IPC_CHANNELS.CONVERSATIONS_IMPORT_PROJECT_PREVIEW,
+    async (_event, input: unknown) => {
+      const { handleImportProjectSessionsPreview } = await import('./conversationsMove');
+      const ports = await conversationsMovePorts();
+      if (!ports) return { ok: false, error: 'unavailable' };
+      return handleImportProjectSessionsPreview(input, ports);
+    }
+  );
+
+  ipcMain.handle(IPC_CHANNELS.PROJECT_REMOVE_EMPTY, async (event, input: unknown) => {
+    if (!isMainRenderer(event.sender.id)) return { ok: false, error: 'invalid' };
+    const { handleRemoveEmptyProject } = await import('./conversationsMove');
+    const ports = await conversationsMovePorts();
+    if (!ports) return { ok: false, error: 'unavailable' };
+    return handleRemoveEmptyProject(input, ports);
+  });
+
+  // 按键合并写：只更新单个顶层键,避免多 store 并发 read-modify-write 互相覆盖
+  ipcMain.handle(
+    IPC_CHANNELS.SETTINGS_WRITE_KEY,
+    async (event, name: unknown, value: unknown, ackSeq: unknown) => {
+      if (typeof name !== 'string') return false;
+      const current = readSettings() ?? {};
+      const next = { ...current };
+      const kept =
+        name === 'enso-settings' ? withRefreshedProviderModels(current, value) : undefined;
+      const merged =
+        name === CONVERSATIONS_KEY
+          ? mergeConversationsWrite(event.sender, current[name], value, normalizeAckSeq(ackSeq))
+          : (kept ?? value);
+      if (merged === undefined) delete next[name];
+      else next[name] = merged;
+      // 补回了后台模型时 sender 也要重读，否则它的旧快照下次又会写回
+      return scheduleWrite(
+        next,
+        event.sender,
+        kept ? 'all-renderers' : 'exclude-sender',
+        name === CONVERSATIONS_KEY && value !== undefined
+      );
+    }
+  );
+
+  ipcMain.handle(IPC_CHANNELS.SETTINGS_WRITE, async (event, data: unknown) => {
+    const record = objectRecord(data);
+    if (!record) return false;
+    const kept = withRefreshedProviderModels(readSettings(), record['enso-settings']);
+    return kept
+      ? scheduleWrite({ ...record, 'enso-settings': kept }, event.sender, 'all-renderers')
+      : scheduleWrite(record, event.sender);
+  });
+
+  app.on('before-quit', () => {
+    flushSettings();
+  });
+  app.on('will-quit', () => {
+    providerModelRefresh?.stop();
+    providerModelRefresh = undefined;
+    flushSettings();
+  });
+}

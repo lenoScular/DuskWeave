@@ -1,0 +1,170 @@
+import { readdir } from 'node:fs/promises';
+import path from 'node:path';
+import { app } from '@platform';
+import { aggregateUsage } from '@shared/usage/aggregate';
+import { mergeUsageSources } from '@shared/usage/ledger';
+import { type ModelPricing, mergePricingTable, type PricingTable } from '@shared/usage/pricing';
+import type { UsageRangeDays, UsageSummaryResult } from '@shared/usage/types';
+import { getModelsDevModels } from '../modelsDevCatalog';
+import { getRuntime } from '../oauthProviders';
+import { loadUsageModelPricing, loadUsageProjectAliases } from './aliases';
+import { loadLedger } from './ledgerStore';
+import { loadParsedSession, pruneParseCache, usageCacheDir } from './parseCache';
+import type { ParsedSession } from './parseSession';
+import { applyUsageProjectAliases } from './projectLabel';
+
+function sessionDir(): string {
+  return path.join(app.getPath('userData'), 'agent', 'sessions');
+}
+
+/**
+ * 逐文件按 mtime/size 复用解析结果（内存 + 磁盘缓存）；消失的文件顺手清掉其缓存。
+ * 全程 promise IO：冷启动 60MB 级会话目录不能卡住主进程事件循环。
+ */
+export async function loadSessions(dir: string, cacheDir: string): Promise<ParsedSession[]> {
+  let names: string[];
+  try {
+    names = (await readdir(dir)).filter((name) => name.endsWith('.jsonl'));
+  } catch {
+    return [];
+  }
+  const files = names.map((name) => path.join(dir, name));
+  const sessions: ParsedSession[] = [];
+  for (const file of files) {
+    const parsed = await loadParsedSession(file, cacheDir);
+    if (parsed) sessions.push(parsed);
+  }
+  await pruneParseCache(cacheDir, files);
+  return sessions;
+}
+
+interface CatalogCostModel {
+  id: string;
+  cost?: Partial<ModelPricing> | null;
+}
+
+function toPricing(cost: CatalogCostModel['cost']): ModelPricing | null {
+  if (!cost || typeof cost !== 'object') return null;
+  const pick = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+  const pricing = {
+    input: pick(cost.input),
+    output: pick(cost.output),
+    cacheRead: pick(cost.cacheRead),
+    cacheWrite: pick(cost.cacheWrite),
+  };
+  // 订阅计费的 catalog 条目四项全零：当「未定价」处理，否则 UI 会把它显示成误导性的 $0.00
+  const priced = pricing.input || pricing.output || pricing.cacheRead || pricing.cacheWrite;
+  return priced ? pricing : null;
+}
+
+function isFullyPriced(p: ModelPricing): boolean {
+  return p.input > 0 && p.output > 0 && p.cacheRead > 0 && p.cacheWrite > 0;
+}
+
+/** 同 id 多 provider：四项单价均非零者优先，否则保留先到的。纯函数，便于测试。 */
+export function buildPricingTable(models: readonly CatalogCostModel[]): PricingTable {
+  const table: PricingTable = {};
+  for (const model of models) {
+    if (typeof model.id !== 'string' || !model.id) continue;
+    const pricing = toPricing(model.cost);
+    if (!pricing) continue;
+    const existing = table[model.id];
+    if (!existing || (!isFullyPriced(existing) && isFullyPriced(pricing))) {
+      table[model.id] = pricing;
+    }
+  }
+  return table;
+}
+
+/**
+ * Gemini 3.8 Flash 单价核验于 2026-09-04：
+ * https://ai.google.dev/gemini-api/docs/latest-model 与 https://ai.google.dev/pricing。
+ * 促销价截至 2026-12-31；上游目录补齐后优先上游，并可删除本地补丁。
+ * `cacheWrite: 0` 是 PricingTable 无法表达按 token/小时的存储费而未估算，不代表免费。
+ */
+const GEMINI_3_8_STANDARD_PRICE_START = Date.UTC(2027, 0, 1);
+
+/** 补齐上游目录尚未收录的官方单价；同 ID 已有价格时始终以上游为准。 */
+export function supplementPricingTable(table: PricingTable, now = Date.now()): PricingTable {
+  if (table['gemini-3.8-flash']) return table;
+  const pricing =
+    now < GEMINI_3_8_STANDARD_PRICE_START
+      ? { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 }
+      : { input: 1.5, output: 7.5, cacheRead: 0.15, cacheWrite: 0 };
+  return { ...table, 'gemini-3.8-flash': pricing };
+}
+
+const PRICING_TTL_MS = 10 * 60 * 1000;
+let pricingCache: { table: PricingTable; loadedAt: number } | null = null;
+let pricingInflight: Promise<PricingTable> | null = null;
+
+/** catalog 原始单价表进程内复用；本地日期价格由每个调用者按自己的时间快照补充。 */
+function getPricingTable(now: number): Promise<PricingTable> {
+  if (pricingCache && now - pricingCache.loadedAt < PRICING_TTL_MS) {
+    return Promise.resolve(supplementPricingTable(pricingCache.table, now));
+  }
+  pricingInflight ??= (async () => {
+    try {
+      const runtime = await getRuntime();
+      const piTable = buildPricingTable(runtime.getModels() as readonly CatalogCostModel[]);
+      const devTable = buildPricingTable(getModelsDevModels());
+      const table = { ...devTable, ...piTable };
+      pricingCache = { table, loadedAt: now };
+      return table;
+    } catch {
+      return {};
+    } finally {
+      pricingInflight = null;
+    }
+  })();
+  return pricingInflight.then((table) => supplementPricingTable(table, now));
+}
+
+let sessionsInflight: Promise<ParsedSession[]> | null = null;
+
+/** 用量页同一份有效单价表（catalog + 本地补丁 + 用户覆盖），供成员用量 / 预算复用 */
+export async function getUsagePricing(now = Date.now()): Promise<PricingTable> {
+  return mergePricingTable(await getPricingTable(now), loadUsageModelPricing());
+}
+
+/** 单个会话文件的用量记录，复用用量页的解析缓存 */
+export function loadUsageSession(file: string): Promise<ParsedSession | null> {
+  return loadParsedSession(file, usageCacheDir(sessionDir()));
+}
+
+/** 连点周期 pill 只触发一次全量扫描 */
+function loadSessionsOnce(): Promise<ParsedSession[]> {
+  const dir = sessionDir();
+  sessionsInflight ??= loadSessions(dir, usageCacheDir(dir)).finally(() => {
+    sessionsInflight = null;
+  });
+  return sessionsInflight;
+}
+
+export async function getUsageSummary(days: UsageRangeDays): Promise<UsageSummaryResult> {
+  const now = Date.now();
+  try {
+    const dir = sessionDir();
+    const [sessions, ledger, pricing] = await Promise.all([
+      loadSessionsOnce(),
+      loadLedger(dir),
+      getPricingTable(now),
+    ]);
+    const aliases = loadUsageProjectAliases();
+    const { records, activity } = mergeUsageSources(
+      sessions.map((session) => applyUsageProjectAliases(session, aliases)),
+      ledger.map((session) => applyUsageProjectAliases(session, aliases))
+    );
+    return {
+      ok: true,
+      summary: aggregateUsage(
+        records,
+        activity,
+        mergePricingTable(pricing, loadUsageModelPricing()),
+        { days, now }
+      ),
+    };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}

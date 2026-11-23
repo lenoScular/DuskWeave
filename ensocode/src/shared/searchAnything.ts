@@ -1,0 +1,416 @@
+export const SEARCH_ANYTHING_BROWSER_LIMIT = 20;
+export const SEARCH_ANYTHING_SETTINGS_LIMIT = 20;
+export const SEARCH_ANYTHING_RECENT_BROWSER = 5;
+
+export interface BrowserSearchTab {
+  tabId: string;
+  conversationId: string;
+  title: string;
+  url: string;
+  at: number;
+  live: boolean;
+}
+
+export interface SettingsSearchEntry {
+  id: string;
+  category: string;
+  title: string;
+  description?: string;
+}
+
+export interface SettingsCatalogSnapshot {
+  providers?: Array<{ id: string; name: string }>;
+  skills?: Array<{ id: string; name: string }>;
+  mcpServers?: Array<{ id: string; name: string }>;
+  instructions?: Array<{ id: string; name: string }>;
+  sshConnections?: Array<{ id: string; name: string }>;
+}
+
+const TOKEN_RE = /[\p{Letter}\p{Number}]+/gu;
+const CJK_RE = /[\u3400-\u9fff]/u;
+
+function tokenize(text: string): string[] {
+  return text.toLowerCase().match(TOKEN_RE) ?? [];
+}
+
+function isCjkToken(token: string): boolean {
+  return CJK_RE.test(token);
+}
+
+function fieldMatches(text: string, tokens: string[]): boolean {
+  if (tokens.length === 0) return false;
+  const lower = text.toLowerCase();
+  const textTokens = tokenize(text);
+  return tokens.every((token) =>
+    isCjkToken(token) ? lower.includes(token) : textTokens.some((part) => part.startsWith(token))
+  );
+}
+
+export function mergeBrowserSearchTabs(
+  live: BrowserSearchTab[],
+  persisted: Array<{
+    tabId: string;
+    conversationId: string;
+    title: string;
+    url: string;
+    at?: number;
+  }>
+): BrowserSearchTab[] {
+  const byId = new Map<string, BrowserSearchTab>();
+  for (const tab of live) byId.set(tab.tabId, tab);
+  for (const tab of persisted) {
+    if (!tab.url) continue;
+    if (byId.has(tab.tabId)) continue;
+    byId.set(tab.tabId, {
+      tabId: tab.tabId,
+      conversationId: tab.conversationId,
+      title: tab.title,
+      url: tab.url,
+      at: tab.at ?? 0,
+      live: false,
+    });
+  }
+  return [...byId.values()];
+}
+
+export function recentBrowserTabs(
+  tabs: BrowserSearchTab[],
+  limit = SEARCH_ANYTHING_RECENT_BROWSER
+): BrowserSearchTab[] {
+  return [...tabs].sort((a, b) => b.at - a.at).slice(0, limit);
+}
+
+export function searchBrowserTabs(
+  tabs: BrowserSearchTab[],
+  query: string,
+  limit = SEARCH_ANYTHING_BROWSER_LIMIT
+): BrowserSearchTab[] {
+  const tokens = tokenize(query);
+  if (tokens.length === 0) return [];
+  const hits: Array<BrowserSearchTab & { rank: number }> = [];
+  for (const tab of tabs) {
+    const titleHit = fieldMatches(tab.title, tokens);
+    const urlHit = fieldMatches(tab.url, tokens);
+    if (!titleHit && !urlHit) continue;
+    hits.push({ ...tab, rank: titleHit ? 0 : 1 });
+  }
+  hits.sort((a, b) => a.rank - b.rank || b.at - a.at);
+  return hits.slice(0, limit).map(({ rank: _rank, ...tab }) => tab);
+}
+
+export function searchSettingsEntries(
+  entries: SettingsSearchEntry[],
+  query: string,
+  options: { translate?: (text: string) => string; limit?: number } = {}
+): SettingsSearchEntry[] {
+  const tokens = tokenize(query);
+  if (tokens.length === 0) return [];
+  // 界面显示的是译文，原文与译文都参与匹配
+  const matches = (text = '') =>
+    fieldMatches(text, tokens) ||
+    (!!options.translate && fieldMatches(options.translate(text), tokens));
+  const hits: Array<SettingsSearchEntry & { rank: number }> = [];
+  for (const entry of entries) {
+    const titleHit = matches(entry.title);
+    const otherHit = fieldMatches(entry.id, tokens) || matches(entry.description);
+    if (!titleHit && !otherHit) continue;
+    hits.push({ ...entry, rank: titleHit ? 0 : 1 });
+  }
+  hits.sort((a, b) => a.rank - b.rank || a.id.localeCompare(b.id));
+  return hits
+    .slice(0, options.limit ?? SEARCH_ANYTHING_SETTINGS_LIMIT)
+    .map(({ rank: _rank, ...entry }) => entry);
+}
+
+const STATIC_CATALOG: SettingsSearchEntry[] = [
+  { id: 'general.language', category: 'general', title: 'Language' },
+  {
+    id: 'general.windowsLocalShell',
+    category: 'general',
+    title: 'Windows local command shell',
+    description:
+      'Only the Windows local agent command tool. SSH and other platforms stay on bash. Takes effect on the next session.',
+  },
+  {
+    id: 'general.terminalShell',
+    category: 'general',
+    title: 'Terminal shell',
+    description: 'Applies to new side panel terminals. SSH projects keep the remote login shell.',
+  },
+  {
+    id: 'appearance.openChangesOnFileEdit',
+    category: 'appearance',
+    title: 'Open Changes when files are edited',
+  },
+  {
+    id: 'appearance.compactReadOnlyTools',
+    category: 'appearance',
+    title: 'Compact read-only tool calls',
+  },
+  {
+    id: 'appearance.expandLiveEdits',
+    category: 'appearance',
+    title: 'Expand file edits while running',
+  },
+  {
+    id: 'appearance.expandLiveReasoning',
+    category: 'appearance',
+    title: 'Expand reasoning while streaming',
+  },
+  {
+    id: 'appearance.autoCollapseTurns',
+    category: 'appearance',
+    title: 'Auto-collapse previous turns',
+  },
+  {
+    id: 'appearance.collapseCompletedActivity',
+    category: 'appearance',
+    title: 'Collapse activity after reply',
+  },
+  {
+    id: 'appearance.collapseLiveActivity',
+    category: 'appearance',
+    title: 'Collapse finished activity while replying',
+  },
+  {
+    id: 'appearance.liveActivityFoldDelaySec',
+    category: 'appearance',
+    title: 'Wait before folding',
+  },
+  {
+    id: 'appearance.pinUnfinishedTodos',
+    category: 'appearance',
+    title: 'Pin unfinished todos',
+  },
+  {
+    id: 'appearance.headerSessionTabs',
+    category: 'appearance',
+    title: 'Show active sessions in the title bar',
+  },
+  {
+    id: 'appearance.navRailSide',
+    category: 'appearance',
+    title: 'Turn marks',
+  },
+  {
+    id: 'appearance.chatTypography',
+    category: 'appearance',
+    title: 'Conversation typography',
+    description: 'Headings, tables and inline code scale with the body text',
+  },
+  {
+    id: 'general.notifyMainAgentOnly',
+    category: 'general',
+    title: 'Notify only for the main agent',
+    description:
+      'Skip coworker completion and failure notifications on this computer and the paired phone. Questions and approvals still notify.',
+  },
+  {
+    id: 'general.smartCompactEnabled',
+    category: 'general',
+    title: 'Context compaction strategy',
+    description:
+      'Standard uses default compact. Smart compaction uses Enso verified summary at compact time. Codex native compaction additionally stores an official Codex checkpoint on Codex models and uses smart compaction otherwise. Continuous memory records observations in the background so compact keeps more context; all fall back to default compact on failure. Switching strategy takes effect on the next session. The summary model and compaction mode apply to open conversations on the next compaction.',
+  },
+  {
+    id: 'general.compactReserveTokens',
+    category: 'general',
+    title: 'Compaction reserve tokens',
+    description:
+      'Compaction runs when context exceeds the model window minus this value. Larger values compact earlier. Do not set it close to the window of small-context models, or every request compacts first. Leave empty for the default.',
+  },
+  {
+    id: 'general.generationStallTimeout',
+    category: 'general',
+    title: 'Stop if no output',
+  },
+  {
+    id: 'general.autoRetryLimit',
+    category: 'general',
+    title: 'Auto-retry on transient errors',
+    description: 'Retry count after 429, 5xx or network errors; off, fixed count or unlimited',
+  },
+  {
+    id: 'general.longCacheRetention',
+    category: 'general',
+    title: 'Long prompt cache (1 hour)',
+    description:
+      'Keep the prompt cache for 1 hour instead of 5 minutes. Saves a lot when turns are more than 5 minutes apart, since the cache no longer expires and gets rewritten every turn, but cache writes cost 2× instead of 1.25×, so rapid follow-ups tens of seconds apart cost more. Anthropic models only. Applies from the next request.',
+  },
+  {
+    id: 'general.proxy',
+    category: 'general',
+    title: 'Network proxy',
+    description: 'Used by model requests, the built-in browser, and agent tools',
+  },
+  {
+    id: 'general.caCert',
+    category: 'general',
+    title: 'Custom CA certificate',
+    description:
+      'Trust an extra CA (PEM file) for model endpoints signed by a private CA. TLS verification stays on.',
+  },
+  { id: 'general.updates', category: 'general', title: 'Updates' },
+  {
+    id: 'general.ensoCommand',
+    category: 'general',
+    title: "'enso' terminal command",
+    description: 'Run `enso .` in a terminal to open the current folder in EnsoCode.',
+  },
+  {
+    id: 'general.finderQuickAction',
+    category: 'general',
+    title: 'Finder Quick Action',
+    description: 'Right-click a folder in Finder and choose Services > Open with EnsoCode.',
+  },
+  {
+    id: 'experimental.botMode',
+    category: 'experimental',
+    title: 'Bot mode',
+    description:
+      'Adds a Code | Bot switch to the sidebar. Create members with their own persona, model and tools, and chat with them alone or in groups.',
+  },
+  {
+    id: 'experimental.secretary',
+    category: 'experimental',
+    title: 'Secretary',
+    description:
+      'A global agent that watches your projects and sessions, creates sessions to do the work, and reports results back to you.',
+  },
+  {
+    id: 'bots.routeClassifier',
+    category: 'bots',
+    title: 'Group reply picker model',
+    description:
+      'When nobody is @-mentioned in a smart-routing group, this model picks which member replies.',
+  },
+  {
+    id: 'bots.assistantModel',
+    category: 'bots',
+    title: 'Bot assistant model',
+    description: 'Used for helper tasks such as auto-configuring member abilities.',
+  },
+  { id: 'secretary.root', category: 'secretary', title: 'Secretary' },
+  {
+    id: 'secretary.profile',
+    category: 'secretary',
+    title: 'Secretary profile',
+    description: 'Name, avatar, visible projects and patrol.',
+  },
+  {
+    id: 'secretary.dispatchLimit',
+    category: 'secretary',
+    title: 'Concurrent dispatch limit',
+    description:
+      'The most dispatched sessions the secretary may run at the same time. Once the limit is reached, new dispatches are refused.',
+  },
+  {
+    id: 'secretary.style',
+    category: 'secretary',
+    title: 'Style and interruptions',
+    description: 'What it calls you, reply language, style and system notifications.',
+  },
+  {
+    id: 'secretary.schedules',
+    category: 'secretary',
+    title: 'Scheduled tasks',
+    description: 'Daily brief, to-do reminders and one-off or recurring prompts.',
+  },
+  {
+    id: 'secretary.reset',
+    category: 'secretary',
+    title: 'Reset the secretary and start over',
+  },
+  { id: 'shortcuts.root', category: 'shortcuts', title: 'Shortcuts' },
+  { id: 'appearance.theme', category: 'appearance', title: 'Theme mode' },
+  {
+    id: 'appearance.themeGallery',
+    category: 'appearance',
+    title: 'Theme',
+    description: 'Built-in and plugin themes; each one is a set of color tokens',
+  },
+  {
+    id: 'appearance.accent',
+    category: 'appearance',
+    title: 'Accent color',
+    description: 'Used for running state, checkmarks and plan mode',
+  },
+  {
+    id: 'appearance.userCss',
+    category: 'appearance',
+    title: 'Custom CSS',
+    description: 'Inject user.css into every window; saved changes apply immediately',
+  },
+  { id: 'providers.root', category: 'providers', title: 'Model Providers' },
+  { id: 'presets.root', category: 'presets', title: 'Presets' },
+  { id: 'agents.root', category: 'agents', title: 'Agent types' },
+  {
+    id: 'agents.maxActiveCoworkers',
+    category: 'agents',
+    title: 'Max active coworkers',
+    description:
+      'How many coworkers one conversation can keep at once. Existing ones stay if you lower the limit; hire more only after dismissing. Subagents are not counted.',
+  },
+  { id: 'tools.root', category: 'tools', title: 'Built-in tools' },
+  {
+    id: 'tools.rtkEnabled',
+    category: 'tools',
+    title: 'RTK command compression',
+    description:
+      'Compress supported command output before it enters the model context. Takes effect on new conversations.',
+  },
+  {
+    id: 'tools.dcgEnabled',
+    category: 'tools',
+    title: 'Destructive command guard (dcg)',
+    description:
+      'Check bash and PowerShell commands with dcg before running. Matches such as git reset --hard or recursive deletes always require your confirmation, even in full-access mode. Takes effect on new conversations.',
+  },
+  {
+    id: 'tools.editMode',
+    category: 'tools',
+    title: 'File edit mode',
+    description:
+      'Choose how files are modified. Apply patch is the default. New and cold-restored sessions use this mode; already warm sessions keep their current mode.',
+  },
+  { id: 'skills.root', category: 'skills', title: 'Skills' },
+  { id: 'mcp.root', category: 'mcp', title: 'MCP Servers' },
+  { id: 'instructions.root', category: 'instructions', title: 'Instruction Files' },
+  {
+    id: 'phone.root',
+    category: 'phone',
+    title: 'Devices',
+    description: 'Generate a pairing code to let a phone or another desktop connect.',
+  },
+  { id: 'ssh.root', category: 'ssh', title: 'SSH' },
+  {
+    id: 'ssh.timeout',
+    category: 'ssh',
+    title: 'SSH timeout',
+    description:
+      'Time limit for connection tests, loading remote AGENTS.md, remote folder browsing and file panel actions. Agent tool commands are not affected.',
+  },
+];
+
+function named(
+  prefix: string,
+  category: string,
+  items: Array<{ id: string; name: string }> | undefined
+): SettingsSearchEntry[] {
+  return (items ?? []).map((item) => ({
+    id: `${prefix}.${item.id}`,
+    category,
+    title: item.name,
+  }));
+}
+
+export function buildSettingsCatalog(snapshot?: SettingsCatalogSnapshot): SettingsSearchEntry[] {
+  return [
+    ...STATIC_CATALOG,
+    ...named('providers', 'providers', snapshot?.providers),
+    ...named('skills', 'skills', snapshot?.skills),
+    ...named('mcp', 'mcp', snapshot?.mcpServers),
+    ...named('instructions', 'instructions', snapshot?.instructions),
+    ...named('ssh', 'ssh', snapshot?.sshConnections),
+  ];
+}

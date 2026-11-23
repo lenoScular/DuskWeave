@@ -1,0 +1,240 @@
+{
+	"version": 1,
+	"type": "vetta-design",
+	"canvas": {
+		"x": 189.7787829473382,
+		"y": 98.45325306649397,
+		"zoom": 0.7605559204060819
+	},
+	"frames": [
+		{
+			"id": "agent-editor",
+			"file": "frames/agent-editor.tsx",
+			"x": 4560,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "新建传奇与集群",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "新建传奇与集群"
+			}
+		},
+		{
+			"id": "crew-portraits",
+			"file": "frames/crew-portraits.tsx",
+			"x": 22800,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "暮色群像 · 初始集群肖像册",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "暮色群像 · 初始集群肖像册"
+			}
+		},
+		{
+			"id": "design-cluster",
+			"file": "frames/design-cluster.tsx",
+			"x": 21280,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "名册 · 设计集群编制",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "名册 · 设计集群编制"
+			}
+		},
+		{
+			"id": "design-role",
+			"file": "frames/design-role.tsx",
+			"x": 19760,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "人物档案 · 微澜",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "人物档案 · 微澜"
+			}
+		},
+		{
+			"id": "design",
+			"file": "frames/design.tsx",
+			"x": 7600,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "设计画布 · 会话成果",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "设计画布 · 会话成果"
+			}
+		},
+		{
+			"id": "image-compose",
+			"file": "frames/image-compose.tsx",
+			"x": 9120,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "会话 · 对话生图结果",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "会话 · 对话生图结果"
+			}
+		},
+		{
+			"id": "image-models",
+			"file": "frames/image-models.tsx",
+			"x": 10640,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "模型设置 · 生图模型",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "模型设置 · 生图模型"
+			}
+		},
+		{
+			"id": "index",
+			"file": "frames/index.tsx",
+			"x": 0,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "首次启动 · 欢迎来到暮色",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "首次启动 · 欢迎来到暮色"
+			}
+		},
+		{
+			"id": "invite",
+			"file": "frames/invite.tsx",
+			"x": 1520,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "邀请传奇与集群",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "邀请传奇与集群"
+			}
+		},
+		{
+			"id": "legends",
+			"file": "frames/legends.tsx",
+			"x": 16720,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "传奇名册 · 默认主控",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "传奇名册 · 默认主控"
+			}
+		},
+		{
+			"id": "member-card",
+			"file": "frames/member-card.tsx",
+			"x": 12160,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "角色卡 · 开发集群架构师",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "角色卡 · 开发集群架构师"
+			}
+		},
+		{
+			"id": "models",
+			"file": "frames/models.tsx",
+			"x": 6080,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "模型设置",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "模型设置"
+			}
+		},
+		{
+			"id": "roster",
+			"file": "frames/roster.tsx",
+			"x": 3040,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "名册 · 集群与传奇",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "名册 · 集群与传奇"
+			}
+		},
+		{
+			"id": "session-model",
+			"file": "frames/session-model.tsx",
+			"x": 18240,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "会话 · 模型与推理强度",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "会话 · 模型与推理强度"
+			}
+		},
+		{
+			"id": "session-preview",
+			"file": "frames/session-preview.tsx",
+			"x": 15200,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "会话示例 · 桥边初会",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "会话示例 · 桥边初会"
+			}
+		},
+		{
+			"id": "workspace-picker",
+			"file": "frames/workspace-picker.tsx",
+			"x": 13680,
+			"y": 0,
+			"width": 1440,
+			"height": 900,
+			"title": "项目 · 打开本地目录",
+			"meta": {
+				"width": 1440,
+				"height": 900,
+				"title": "项目 · 打开本地目录"
+			}
+		}
+	],
+	"defaultFrameSize": {
+		"width": 1440,
+		"height": 900
+	},
+	"interactionMode": "desktop"
+}

@@ -1,0 +1,341 @@
+import { supportedProjectThinkingLevels } from './modelThinking';
+import { THINKING_LEVELS, type ThinkingLevel } from './types/agent';
+import type {
+  ModelCapabilityOverrides,
+  ModelReasoningOverride,
+  ModelThinkingLevelOverride,
+} from './types/llm';
+import { MODEL_REASONING_OVERRIDES, MODEL_THINKING_LEVEL_OVERRIDES } from './types/llm';
+import type { ModelMeta } from './types/modelMeta';
+
+/** 能力解析与 ModelMeta 共用的目录条目。 */
+export interface CatalogModelEntry {
+  id: string;
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoning?: boolean;
+  thinkingLevelMap?: Record<string, string | null | undefined>;
+  /**
+   * 目录未提供档位信息。Pi 条目缺少映射时仍使用 Pi 默认支持集。
+   *
+   * The catalog omitted level information. Pi entries with no map still use Pi's default set.
+   */
+  thinkingLevelsUnknown?: true;
+}
+
+/** 自定义模型能力分层：行覆盖 > 精确 catalog id > 乐观默认 */
+export const CUSTOM_MODEL_RESOLVE_SOURCES = ['override', 'catalog', 'default'] as const;
+export type CustomModelResolveSource = (typeof CUSTOM_MODEL_RESOLVE_SOURCES)[number];
+
+export interface CustomModelFieldSources {
+  reasoning: CustomModelResolveSource;
+  thinkingLevel: CustomModelResolveSource;
+  contextWindow: CustomModelResolveSource;
+  maxTokens: CustomModelResolveSource;
+}
+
+export interface ResolvedCustomModelCapabilities {
+  reasoning: boolean;
+  thinkingLevelMap?: Record<string, string | null | undefined>;
+  /** 缺省 = 数据层未知；spawn 再套 128K，这里不填假数字 */
+  contextWindow?: number;
+  maxTokens?: number;
+  thinkingLevels: ThinkingLevel[];
+  source: CustomModelFieldSources;
+}
+
+const OPTIMISTIC_THINKING_LEVEL_MAP = { xhigh: 'xhigh', max: 'max' } as const;
+
+/**
+ * 第三方常在原模型 id 后挂的部署标记，剥掉仍是同一个模型。
+ * 不收 mini / pro / turbo / 1m 这类：剥掉会变成别的模型或更小的窗口。
+ */
+const DEPLOYMENT_MARKERS = new Set([
+  'fast',
+  'eco',
+  'flex',
+  'priority',
+  'highspeed',
+  'thinking',
+  'think',
+  'nothink',
+  'free',
+  'preview',
+  'latest',
+  'exp',
+  'beta',
+  'online',
+  'nitro',
+  'floor',
+  'exacto',
+  'batch',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+]);
+
+function canonicalModelId(id: string): string {
+  return id
+    .trim()
+    .toLowerCase()
+    .replace(/^models\//, '')
+    .replace(/[_\s]+/g, '-')
+    .replace(/(\d)\.(?=\d)/g, '$1-');
+}
+
+/** 去命名空间（openrouter 的 vendor/）与厂商点前缀（bedrock 的 us.anthropic.） */
+function leafModelKey(id: string): string {
+  const canonical = canonicalModelId(id);
+  return canonical.slice(canonical.lastIndexOf('/') + 1).replace(/^(?:[a-z]+\.)+(?=[a-z])/, '');
+}
+
+function stripDeploymentMarker(key: string): string | undefined {
+  const match = /^(.*[^-:])[-:]([a-z]+)$/.exec(key);
+  return match?.[1] && match[2] && DEPLOYMENT_MARKERS.has(match[2]) ? match[1] : undefined;
+}
+
+/** 模型家族 → 权重所有者的 provider；转售商记录的窗口常与原厂不一致 */
+const MODEL_OWNERS: readonly [RegExp, string][] = [
+  [/^claude-/, 'anthropic'],
+  [/^(?:gpt-|chatgpt-|codex-|o\d)/, 'openai'],
+  [/^(?:gemini-|gemma-)/, 'google'],
+  [/^grok-/, 'xai'],
+  [/^deepseek-/, 'deepseek'],
+  [/^kimi-/, 'moonshotai'],
+  [/^glm-/, 'zai'],
+  [/^minimax-/, 'minimax'],
+  [/^(?:mistral-|codestral-|devstral-|magistral-)/, 'mistral'],
+  [/^mimo-/, 'xiaomi'],
+];
+
+type CatalogKeyed = { id: string; provider?: string };
+
+/** 同档多条时：原厂 provider > 无命名空间 id > 目录顺序第一条 */
+function pickPreferred<T extends CatalogKeyed>(
+  catalog: readonly T[],
+  matches: (entry: T) => boolean,
+  owner: string | undefined
+): T | undefined {
+  let bare: T | undefined;
+  let first: T | undefined;
+  for (const entry of catalog) {
+    if (!matches(entry)) continue;
+    if (owner && entry.provider === owner) return entry;
+    if (!bare && canonicalModelId(entry.id) === leafModelKey(entry.id)) bare = entry;
+    first ??= entry;
+  }
+  return bare ?? first;
+}
+
+/**
+ * model id → catalog 条目。OAuth meta 与自定义 spawn 共用。
+ * 依次：精确 id → 归一后同命名空间 → 同叶子 id → 剥一个部署标记后同叶子 id；每档内原厂优先。
+ * 不做前缀猜测；只用于取能力数值，发请求的 id 不改写。
+ */
+export function findCatalogModelById<T extends CatalogKeyed>(
+  catalog: readonly T[],
+  modelId: string
+): T | undefined {
+  const canonical = canonicalModelId(modelId);
+  const leaf = leafModelKey(modelId);
+  const stripped = stripDeploymentMarker(leaf);
+  const owner = MODEL_OWNERS.find(([pattern]) => pattern.test(leaf))?.[1];
+  const tiers: ((entry: T) => boolean)[] = [
+    (entry) => entry.id === modelId,
+    (entry) => canonicalModelId(entry.id) === canonical,
+    (entry) => leafModelKey(entry.id) === leaf,
+  ];
+  if (stripped) tiers.push((entry) => leafModelKey(entry.id) === stripped);
+  for (const matches of tiers) {
+    const hit = pickPreferred(catalog, matches, owner);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+/** 非正 / 非有限视为缺失。未知不得用 128K 凑数。 */
+export function positiveFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+export function positiveContextWindow(
+  model: { contextWindow?: number } | undefined
+): number | undefined {
+  return positiveFiniteNumber(model?.contextWindow);
+}
+
+export function isModelReasoningOverride(value: unknown): value is ModelReasoningOverride {
+  return (
+    typeof value === 'string' && (MODEL_REASONING_OVERRIDES as readonly string[]).includes(value)
+  );
+}
+
+export function isModelThinkingLevelOverride(value: unknown): value is ModelThinkingLevelOverride {
+  return (
+    typeof value === 'string' &&
+    (MODEL_THINKING_LEVEL_OVERRIDES as readonly string[]).includes(value)
+  );
+}
+
+/** 只抽出已设置且合法的覆盖；空 / 非法 = 跟随，不往下一层传假值。 */
+export function pickModelCapabilityOverrides(
+  entry: ModelCapabilityOverrides | undefined
+): ModelCapabilityOverrides {
+  if (!entry) return {};
+  const overrides: ModelCapabilityOverrides = {};
+  if (isModelReasoningOverride(entry.reasoning)) overrides.reasoning = entry.reasoning;
+  if (isModelThinkingLevelOverride(entry.thinkingLevel)) {
+    overrides.thinkingLevel = entry.thinkingLevel;
+  }
+  const contextWindow = positiveFiniteNumber(entry.contextWindow);
+  if (contextWindow !== undefined) overrides.contextWindow = contextWindow;
+  const maxTokens = positiveFiniteNumber(entry.maxTokens);
+  if (maxTokens !== undefined) overrides.maxTokens = maxTokens;
+  return overrides;
+}
+
+/**
+ * 行覆盖把「最高支持档」写成 thinkingLevelMap：
+ * xhigh/max 显式声明；更低档用 null 剔除更高项目档（未声明的 xhigh/max 本身就不支持）。
+ */
+export function thinkingLevelMapForCap(
+  level: ThinkingLevel
+): Record<string, string | null> | undefined {
+  if (level === 'max') return { xhigh: 'xhigh', max: 'max' };
+  if (level === 'xhigh') return { xhigh: 'xhigh' };
+  if (level === 'high') return undefined;
+  const map: Record<string, string | null> = {};
+  const start = THINKING_LEVELS.indexOf(level) + 1;
+  for (let i = start; i < THINKING_LEVELS.length; i++) {
+    const higher = THINKING_LEVELS[i];
+    if (higher && higher !== 'max' && higher !== 'xhigh') map[higher] = null;
+  }
+  return Object.keys(map).length > 0 ? map : undefined;
+}
+
+export function resolveCustomModelCapabilities(
+  catalog: CatalogModelEntry | undefined,
+  overrides?: ModelCapabilityOverrides
+): ResolvedCustomModelCapabilities {
+  const picked = pickModelCapabilityOverrides(overrides);
+  const catalogHit = catalog !== undefined;
+
+  const reasoning = resolveReasoning(catalog, picked);
+  const thinking = resolveThinkingLevelMap(catalog, picked, reasoning.value);
+  const contextWindow = resolvePositive(
+    picked.contextWindow,
+    catalogHit ? positiveFiniteNumber(catalog?.contextWindow) : undefined,
+    catalogHit
+  );
+  const maxTokens = resolvePositive(
+    picked.maxTokens,
+    catalogHit ? positiveFiniteNumber(catalog?.maxTokens) : undefined,
+    catalogHit
+  );
+
+  const thinkingLevelMap = reasoning.value ? thinking.value : undefined;
+  return {
+    reasoning: reasoning.value,
+    ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+    ...(contextWindow.value !== undefined ? { contextWindow: contextWindow.value } : {}),
+    ...(maxTokens.value !== undefined ? { maxTokens: maxTokens.value } : {}),
+    thinkingLevels: supportedProjectThinkingLevels({
+      reasoning: reasoning.value,
+      thinkingLevelMap,
+    }),
+    source: {
+      reasoning: reasoning.source,
+      thinkingLevel: thinking.source,
+      contextWindow: contextWindow.source,
+      maxTokens: maxTokens.source,
+    },
+  };
+}
+
+function resolveReasoning(
+  catalog: CatalogModelEntry | undefined,
+  picked: ModelCapabilityOverrides
+): { value: boolean; source: CustomModelResolveSource } {
+  if (picked.reasoning === 'on') return { value: true, source: 'override' };
+  if (picked.reasoning === 'off') return { value: false, source: 'override' };
+  if (catalog && typeof catalog.reasoning === 'boolean') {
+    return { value: catalog.reasoning, source: 'catalog' };
+  }
+  return { value: true, source: 'default' };
+}
+
+function resolveThinkingLevelMap(
+  catalog: CatalogModelEntry | undefined,
+  picked: ModelCapabilityOverrides,
+  reasoningEnabled: boolean
+): {
+  value: Record<string, string | null | undefined> | undefined;
+  source: CustomModelResolveSource;
+} {
+  if (picked.thinkingLevel) {
+    return {
+      value: thinkingLevelMapForCap(picked.thinkingLevel),
+      source: 'override',
+    };
+  }
+  // 目录明确关闭推理时，手动开启仍沿用目录档位或 Pi 的默认四档。
+  //
+  // Manually enabling reasoning for a catalog-disabled model keeps its map or Pi's four defaults.
+  if (catalog && (!catalog.thinkingLevelsUnknown || catalog.reasoning === false)) {
+    return {
+      value: catalog.thinkingLevelMap,
+      source: 'catalog',
+    };
+  }
+  return {
+    value: reasoningEnabled ? { ...OPTIMISTIC_THINKING_LEVEL_MAP } : undefined,
+    source: 'default',
+  };
+}
+
+/** 把 queryModelMeta 的结果还原成 catalog 快照，供 UI 叠行覆盖并读 source。 */
+export function catalogFromModelMeta(meta: ModelMeta | undefined): CatalogModelEntry | undefined {
+  if (!meta || meta.source === 'unknown') return undefined;
+  return {
+    id: meta.modelId,
+    reasoning: meta.reasoning,
+    contextWindow: meta.contextWindow,
+    maxTokens: meta.maxTokens,
+    thinkingLevelMap: thinkingLevelMapFromProjectLevels(meta.reasoning, meta.thinkingLevels),
+    ...(meta.thinkingLevels === undefined ? { thinkingLevelsUnknown: true } : {}),
+  };
+}
+
+/** 设置行 UI：ModelEntry 覆盖 + 已查到的 ModelMeta → 分层结果（含 source） */
+export function resolveCustomModelView(
+  entry: ModelCapabilityOverrides | undefined,
+  meta: ModelMeta | undefined
+): ResolvedCustomModelCapabilities {
+  return resolveCustomModelCapabilities(catalogFromModelMeta(meta), entry);
+}
+
+function thinkingLevelMapFromProjectLevels(
+  reasoning: boolean | undefined,
+  levels: ThinkingLevel[] | undefined
+): Record<string, string | null> | undefined {
+  if (reasoning !== true || !levels) return undefined;
+  const map: Record<string, string | null> = {};
+  if (levels.includes('xhigh')) map.xhigh = 'xhigh';
+  if (levels.includes('max')) map.max = 'max';
+  for (const level of ['minimal', 'low', 'medium', 'high'] as const) {
+    if (!levels.includes(level)) map[level] = null;
+  }
+  return Object.keys(map).length > 0 ? map : undefined;
+}
+
+function resolvePositive(
+  override: number | undefined,
+  catalogValue: number | undefined,
+  catalogHit: boolean
+): { value: number | undefined; source: CustomModelResolveSource } {
+  if (override !== undefined) return { value: override, source: 'override' };
+  if (catalogHit) return { value: catalogValue, source: 'catalog' };
+  return { value: undefined, source: 'default' };
+}
